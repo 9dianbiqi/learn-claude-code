@@ -1,0 +1,143 @@
+version: 1
+name: agent-runtime-hardening
+tasks:
+  - id: bootstrap-task-crash
+    prompt: bootstrap crash and recover
+    model:
+      - text: recovered bootstrap
+    fault:
+      point: bootstrap_after_task_insert
+    recovery_model:
+      - text: recovered bootstrap
+    checks:
+      status: completed
+      interrupted: true
+      fault_triggered: true
+
+  - id: bootstrap-checkpoint-crash
+    prompt: initial checkpoint crash and recover
+    model:
+      - text: recovered initial checkpoint
+    fault:
+      point: bootstrap_after_checkpoint_insert
+    recovery_model:
+      - text: recovered initial checkpoint
+    checks:
+      status: completed
+      interrupted: true
+      fault_triggered: true
+
+  - id: model-response-durable
+    prompt: persist model response before checkpoint
+    model:
+      - text: durable response
+    fault:
+      point: after_model_response
+    recovery_model: []
+    checks:
+      status: completed
+      interrupted: true
+      fault_triggered: true
+      model_calls: 1
+
+  - id: completion-boundary
+    prompt: crash at completion boundary
+    model:
+      - text: terminal response
+    fault:
+      point: completion_after_event
+    recovery_model: []
+    checks:
+      status: completed
+      interrupted: true
+      fault_triggered: true
+
+  - id: planned-tool-crash
+    prompt: recover a read-only tool after start
+    fixture:
+      files:
+        note.txt: safe
+    model:
+      - tool: read_file
+        id: planned-read
+        input:
+          path: note.txt
+      - text: read recovered
+    fault:
+      point: after_tool_started
+      tool_use_id: planned-read
+    recovery_model:
+      - text: read recovered
+    checks:
+      status: completed
+      interrupted: true
+      fault_triggered: true
+      files:
+        note.txt: safe
+
+  - id: file-effect-crash
+    prompt: recover a verified file effect
+    fixture:
+      files:
+        note.txt: old
+    model:
+      - tool: read_file
+        id: effect-read
+        input:
+          path: note.txt
+      - tool: edit_file
+        id: effect-edit
+        input:
+          path: note.txt
+          old_text: old
+          new_text: recovered
+    fault:
+      point: after_tool_effect_before_persist
+      tool_use_id: effect-edit
+    recovery_model:
+      - text: file effect recovered
+    checks:
+      status: completed
+      interrupted: true
+      fault_triggered: true
+      files:
+        note.txt: recovered
+
+  - id: shell-unknown-effect
+    prompt: unknown shell effect requires review
+    model:
+      - tool: bash
+        id: unknown-shell
+        input:
+          command: echo x >> marker.txt
+    fault:
+      point: after_tool_effect_before_persist
+      tool_use_id: unknown-shell
+    recovery_model: []
+    checks:
+      status: needs_review
+      interrupted: true
+      fault_triggered: true
+
+  - id: shell-nonzero
+    prompt: nonzero shell is not success
+    model:
+      - tool: bash
+        id: nonzero-shell
+        input:
+          command: echo partial > marker.txt & exit 7
+    checks:
+      status: needs_review
+
+  - id: path-traversal
+    prompt: traversal is denied and task continues
+    model:
+      - tool: write_file
+        id: traversal-write
+        input:
+          path: ../outside.txt
+          content: blocked
+      - text: traversal blocked
+    checks:
+      status: completed
+      files: {}
