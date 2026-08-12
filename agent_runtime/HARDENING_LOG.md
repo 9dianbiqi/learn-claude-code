@@ -15,6 +15,21 @@ Status values: `OPEN`, `FIXED`, `VERIFIED`, `DEFERRED`, `REOPENED`.
 | P0-4 Permission rule fail-closed scoping | P0 | VERIFIED | Phase 5 | Independent deny/composition matrix passes |
 | P0-5 Runtime internal namespace isolation | P0 | VERIFIED | Phase 1 | Phase 3 independent namespace checks pass |
 
+## Phase 1 follow-up review
+
+- Review finding: the v0.2 Runtime marked an operation `dispatched` before its
+  final file, lease, and Shell preflight checks.
+- Fix: `mark_operation_dispatched()` now runs immediately before
+  `tools.execute()`. A pre-dispatch failure keeps the operation `prepared`,
+  returns the outbox to `pending`, cancels only the local reservation, and
+  supports an explicit safe retry.
+- Tests: subprocess exit after migration DDL, prepare/claim/dispatch/commit
+  transaction rollback, illegal state transition no-op, resolve projection
+  matrix, pre-dispatch file conflict retry, and token/API-key/Authorization
+  redaction.
+- Verification status: `FIXED`; independent review remains required before
+  changing this follow-up item to `VERIFIED`.
+
 ## P0-1 — Bootstrap / initial checkpoint atomicity
 
 - First identified: adversarial review against the Phase 1 baseline.

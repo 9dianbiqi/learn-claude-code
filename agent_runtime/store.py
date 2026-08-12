@@ -40,9 +40,14 @@ def _loads(value: str | None, default: Any = None) -> Any:
     return json.loads(value)
 
 
+_SENSITIVE_REASON = re.compile(
+    r"(?i)(token|secret|password|passwd|api[_-]?key|authorization|cookie)\s*[=:]\s*"
+    r"(?:(?:bearer|basic)\s+)?[^\s,;]+"
+)
+
+
 def _safe_reason(value: str) -> str:
-    return re.sub(
-        r"(?i)(token|secret|password|passwd|api[_-]?key|authorization|cookie)\s*[=:]\s*[^\s,;]+",
+    return _SENSITIVE_REASON.sub(
         lambda match: f"{match.group(1)}=[REDACTED]",
         str(value)[:256],
     )
@@ -330,13 +335,18 @@ class EventStore:
         messages_json = _checked_json(messages, MAX_CHECKPOINT_BYTES, "checkpoint messages")
         cursor_json = _checked_json(cursor, MAX_CHECKPOINT_BYTES, "checkpoint cursor")
         metadata = dict(unknown_effect or {})
-        metadata["reason"] = reason
+        safe_reason = _safe_reason(reason)
+        metadata["reason"] = safe_reason
         with self.transaction() as conn:
             task = conn.execute(
                 "SELECT status, version FROM tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
             call = conn.execute(
                 "SELECT status, version FROM tool_calls WHERE task_id = ? AND tool_use_id = ?",
+                (task_id, tool_use_id),
+            ).fetchone()
+            operation = conn.execute(
+                "SELECT operation_id, state FROM operations WHERE task_id = ? AND tool_use_id = ?",
                 (task_id, tool_use_id),
             ).fetchone()
             if task is None or call is None:
@@ -359,7 +369,7 @@ class EventStore:
                     "UPDATE tool_calls SET status = 'needs_review', error = ?, finished_at = ?, "
                     "execution_status = CASE WHEN execution_status = 'running' THEN 'unknown' ELSE execution_status END, "
                     "version = version + 1 WHERE task_id = ? AND tool_use_id = ?",
-                    (reason, now, task_id, tool_use_id),
+                    (safe_reason, now, task_id, tool_use_id),
                 )
             else:
                 call_updated = conn.execute(
@@ -370,20 +380,57 @@ class EventStore:
             if call_updated.rowcount != 1:
                 raise StaleState(f"Tool call changed during review transition: {tool_use_id}")
             if phase == "needs_review":
-                conn.execute(
-                    "UPDATE effect_reservations SET state = 'unknown', finished_at = ?, details_json = ? "
-                    "WHERE task_id = ? AND tool_use_id = ? AND state = 'running'",
-                    (
-                        now,
-                        _json({"reason": "review_requires_reconciliation", "tool_use_id": tool_use_id}),
+                if operation is not None and operation["state"] == "prepared":
+                    # No external effect can have happened before dispatch.
+                    # Keep the operation prepared, release the claimed outbox,
+                    # and cancel only the local reservation so review can
+                    # safely retry the same durable intent later.
+                    pre_dispatch_evidence = {
+                        "outcome": "not_happened",
+                        "phase": "pre_dispatch",
+                        "reason": safe_reason,
+                    }
+                    updated_operation = conn.execute(
+                        "UPDATE operations SET probe_evidence_json = ?, updated_at = ?, version = version + 1 "
+                        "WHERE operation_id = ? AND state = 'prepared'",
+                        (_json(pre_dispatch_evidence), now, operation["operation_id"]),
+                    )
+                    if updated_operation.rowcount != 1:
+                        raise StaleState(f"Operation changed during pre-dispatch review: {operation['operation_id']}")
+                    conn.execute(
+                        "UPDATE operation_outbox SET state = 'pending', claimed_by = NULL, claimed_until = NULL, "
+                        "last_error = ?, updated_at = ? WHERE operation_id = ?",
+                        (safe_reason, now, operation["operation_id"]),
+                    )
+                    conn.execute(
+                        "UPDATE effect_reservations SET state = 'cancelled', finished_at = ?, details_json = ? "
+                        "WHERE operation_id = ? AND state = 'running'",
+                        (now, _json(pre_dispatch_evidence), operation["operation_id"]),
+                    )
+                    current_operation = self._operation_row_conn(conn, str(operation["operation_id"]))
+                    self._append_operation_event_conn(
+                        conn,
                         task_id,
-                        tool_use_id,
-                    ),
-                )
+                        "operation_pre_dispatch_blocked",
+                        current_operation,
+                        "prepared",
+                        safe_reason,
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE effect_reservations SET state = 'unknown', finished_at = ?, details_json = ? "
+                        "WHERE task_id = ? AND tool_use_id = ? AND state = 'running'",
+                        (
+                            now,
+                            _json({"reason": "review_requires_reconciliation", "tool_use_id": tool_use_id}),
+                            task_id,
+                            tool_use_id,
+                        ),
+                    )
             task_updated = conn.execute(
                 "UPDATE tasks SET status = ?, checkpoint_id = ?, last_error = ?, updated_at = ?, "
                 "version = version + 1 WHERE task_id = ?",
-                (phase, checkpoint_id, reason, now, task_id),
+                (phase, checkpoint_id, safe_reason, now, task_id),
             )
             if task_updated.rowcount != 1:
                 raise StaleState(f"Task changed during review transition: {task_id}")
@@ -2074,8 +2121,11 @@ class EventStore:
             ).fetchone()
             if task_row is None:
                 raise KeyError(f"Task not found: {operation['task_id']}")
-            if operation["state"] != "unknown":
-                raise StaleState(f"Only unknown operations can be resolved: {operation_id}")
+            operation_state = str(operation["state"])
+            if action == "complete" and operation_state != "unknown":
+                raise StaleState(f"Only unknown operations can be completed during resolution: {operation_id}")
+            if action in {"retry", "abort"} and operation_state not in {"unknown", "prepared"}:
+                raise StaleState(f"Operation cannot be {action} from {operation_state}: {operation_id}")
             version = int(operation["version"])
             if expected_version is not None and version != int(expected_version):
                 raise StaleState(f"Operation version changed before resolution: {operation_id}")
@@ -2085,7 +2135,7 @@ class EventStore:
                     raise ValueError("retry requires evidence that the external effect did not happen")
                 conn.execute(
                     "UPDATE effect_reservations SET state = 'cancelled', finished_at = ?, details_json = ? "
-                    "WHERE operation_id = ? AND state = 'unknown'",
+                    "WHERE operation_id = ? AND state IN ('running', 'unknown')",
                     (now, _json(evidence_payload or {"reason": "manual_retry"}), operation_id),
                 )
                 conn.execute(
@@ -2111,9 +2161,9 @@ class EventStore:
                     """
                     UPDATE operations SET state = 'prepared', probe_evidence_json = ?,
                         updated_at = ?, version = version + 1
-                    WHERE operation_id = ? AND state = 'unknown' AND version = ?
+                    WHERE operation_id = ? AND state = ? AND version = ?
                     """,
-                    (_json(evidence_payload or {}), now, operation_id, version),
+                    (_json(evidence_payload or {}), now, operation_id, operation_state, version),
                 )
                 if updated.rowcount != 1:
                     raise StaleState(f"Operation changed during retry: {operation_id}")
@@ -2171,7 +2221,7 @@ class EventStore:
                 updated = conn.execute(
                     "UPDATE operations SET state = ?, result_json = ?, result_digest = ?, "
                     "probe_evidence_json = ?, completed_at = ?, "
-                    "updated_at = ?, version = version + 1 WHERE operation_id = ? AND state = 'unknown' AND version = ?",
+                    "updated_at = ?, version = version + 1 WHERE operation_id = ? AND state = ? AND version = ?",
                     (
                         target_state,
                         manual_result_json,
@@ -2180,6 +2230,7 @@ class EventStore:
                         now,
                         now,
                         operation_id,
+                        operation_state,
                         version,
                     ),
                 )

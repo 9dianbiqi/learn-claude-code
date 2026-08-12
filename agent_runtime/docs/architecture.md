@@ -143,7 +143,10 @@ as a generic exactly-once guarantee.
 An operation is prepared together with its outbox and compatibility
 effect_reservations row. The current lease claims the outbox, then the Runtime
 marks the operation dispatched immediately before crossing the external tool
-boundary. Commit, failure, unknown, and reconciliation transitions use
+boundary. A validation failure before that boundary keeps the operation
+prepared, releases the outbox claim, and can be explicitly retried without
+claiming that an external effect is unknown. Commit, failure, unknown, and
+reconciliation transitions use
 state-plus-version compare-and-swap, lease/fencing validation, compatibility
 projection updates, and an append-only event in one SQLite transaction.
 

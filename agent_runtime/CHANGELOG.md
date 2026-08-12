@@ -10,8 +10,11 @@
   reconciliation evidence, and operation trace metrics.
 - Integrated file and Shell effects with prepared/dispatched/committed/unknown
   recovery semantics.
+- Follow-up hardening moved the dispatched boundary to immediately before tool
+  execution, preserving prepared operations for pre-dispatch failures.
 - Added db-migrate, schema-aware db-check, operation inspection, and Phase 1
-  migration/ledger regression tests.
+  migration/ledger regression tests, including subprocess and transaction
+  rollback fault matrices plus trace/event redaction coverage.
 - Phase 1 does not provide OS sandboxing or generic exactly-once Shell
   execution.
 

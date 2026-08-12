@@ -135,7 +135,10 @@ class TraceReporter:
 
 
 _SENSITIVE_KEY = re.compile(r"(?:token|secret|password|passwd|api[_-]?key|authorization|cookie)", re.IGNORECASE)
-_SENSITIVE_VALUE = re.compile(r"(?i)(token|secret|password|api[_-]?key)\s*[=:]\s*[^\s,;]+")
+_SENSITIVE_VALUE = re.compile(
+    r"(?i)(token|secret|password|passwd|api[_-]?key|authorization|cookie)\s*[=:]\s*"
+    r"(?:(?:bearer|basic)\s+)?[^\s,;]+"
+)
 
 
 def _redact(value: Any, key: str | None = None) -> Any:

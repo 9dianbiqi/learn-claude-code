@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -264,3 +267,58 @@ def test_migration_boundary_faults_leave_a_valid_pre_or_post_state(tmp_path: Pat
         SchemaManager(database, fault_injector=inject).migrate()
     version = SchemaManager(database).inspect().current_version
     assert version == (4 if point == "after_migration_backup" else 5)
+
+
+def test_migration_subprocess_exit_after_ddl_reopens_as_complete_v4(tmp_path: Path):
+    database = _v4_database(tmp_path, ("completed", "unknown"))
+    source_root = Path(__file__).resolve().parents[2]
+    script = """
+import os
+import sys
+
+from agent_runtime.migrations import SchemaManager
+
+
+def crash(point, **_):
+    if point == "after_migration_ddl":
+        os._exit(23)
+
+
+SchemaManager(sys.argv[1], fault_injector=crash).migrate()
+"""
+    env = os.environ.copy()
+    current_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = str(source_root) + (
+        os.pathsep + current_pythonpath if current_pythonpath else ""
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(database)],
+        cwd=source_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 23, completed.stderr
+
+    # SQLite must recover the interrupted transaction to one complete schema,
+    # not expose half-created v5 tables or columns.
+    status = SchemaManager(database).inspect()
+    assert status.current_version in {4, 5}
+    assert not status.integrity_check
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        if status.current_version == 4:
+            assert connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'operations'"
+            ).fetchone() is None
+            assert "operation_id" not in {
+                row[1] for row in connection.execute("PRAGMA table_info(tool_calls)").fetchall()
+            }
+        else:
+            assert connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'operations'"
+            ).fetchone() is not None
+            assert connection.execute(
+                "SELECT COUNT(*) FROM operations"
+            ).fetchone()[0] == 2

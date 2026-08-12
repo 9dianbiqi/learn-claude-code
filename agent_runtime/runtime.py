@@ -587,14 +587,13 @@ class Runtime:
                 reason = "Operation requires reconciliation before another dispatch"
                 self._mark_needs_review(task_id, call.id, reason)
                 raise NeedsReview(call.id, reason)
-            self.store.claim_operation(operation["operation_id"], claim_ttl=self.lease_ttl)
+            operation = self.store.claim_operation(operation["operation_id"], claim_ttl=self.lease_ttl)
             # This compatibility fault point is deliberately before the
             # dispatched boundary. A crash here leaves a prepared operation
             # that the next owner may safely claim; once dispatched, recovery
             # must never infer that the external effect did not happen.
             self.store.append_event(task_id, "tool_started", {"tool_use_id": call.id, "name": call.name})
             self._fault("after_tool_started", task_id=task_id, tool_use_id=call.id)
-            operation = self.store.mark_operation_dispatched(operation["operation_id"])
         except EffectBlocked as exc:
             reason = str(exc)
             self._mark_needs_review(task_id, call.id, reason)
@@ -604,21 +603,19 @@ class Runtime:
             current = self.tools.file_state(call.input["path"])
             if not self._same_state(current, before_state):
                 reason = "File changed after precondition check and before write"
-                self.store.mark_operation_unknown(
-                    operation["operation_id"],
-                    reason,
-                    evidence=ReconcileEvidence("before_hash", reason, {"before": before_state}),
-                )
                 self._mark_needs_review(task_id, call.id, reason)
                 raise NeedsReview(call.id, reason)
         self._assert_lease_for_effect(task_id, call.id, "before_tool_effect")
         if call.name == "bash" and float(self.tools.shell_timeout) >= self.lease_ttl:
             reason = "Shell timeout is not below the repository lease TTL"
-            self.store.mark_operation_unknown(operation["operation_id"], reason)
             self._mark_needs_review(task_id, call.id, reason)
             raise NeedsReview(call.id, reason)
         if call.name in {"write_file", "edit_file"} and before_state is not None:
             self.tools.set_expected_before(call.input["path"], before_state)
+        # This is the irreversible execution boundary. Every validation,
+        # lease, and file precondition check above must finish before this
+        # state transition; any failure before it remains safely prepared.
+        operation = self.store.mark_operation_dispatched(operation["operation_id"])
         try:
             raw_output = self.tools.execute(call.name, call.input)
         except FileConflict as exc:
