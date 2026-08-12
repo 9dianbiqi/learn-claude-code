@@ -1,0 +1,103 @@
+version: 1
+name: mvp-fixed-tasks
+tasks:
+  - id: inspect-file
+    prompt: Read note.txt and report it.
+    fixture:
+      files:
+        note.txt: hello runtime
+    model:
+      - tool: read_file
+        id: inspect-read
+        input:
+          path: note.txt
+        usage:
+          input_tokens: 20
+          output_tokens: 5
+      - text: note.txt contains hello runtime.
+        usage:
+          input_tokens: 8
+          output_tokens: 7
+    checks:
+      status: completed
+      files:
+        note.txt: hello runtime
+
+  - id: edit-file
+    prompt: Read note.txt and replace old with new.
+    fixture:
+      files:
+        note.txt: old
+    model:
+      - tool: read_file
+        id: edit-read
+        input:
+          path: note.txt
+      - tool: edit_file
+        id: edit-write
+        input:
+          path: note.txt
+          old_text: old
+          new_text: new
+      - text: edited note.txt.
+    checks:
+      status: completed
+      files:
+        note.txt: new
+
+  - id: create-file
+    prompt: Create generated.txt with a stable value.
+    fixture:
+      files: {}
+    model:
+      - tool: write_file
+        id: create-write
+        input:
+          path: generated.txt
+          content: generated
+      - text: created generated.txt.
+    checks:
+      status: completed
+      files:
+        generated.txt: generated
+
+  - id: deny-escape
+    prompt: Attempt an out of bounds write and report the result.
+    fixture:
+      files: {}
+    model:
+      - tool: write_file
+        id: escape-write
+        input:
+          path: ../outside.txt
+          content: must not be written
+      - text: The unsafe operation was blocked.
+    checks:
+      status: completed
+      files: {}
+
+  - id: recover-edit-after-effect
+    prompt: Read note.txt and replace old with recovered.
+    fixture:
+      files:
+        note.txt: old
+    model:
+      - tool: read_file
+        id: recover-read
+        input:
+          path: note.txt
+      - tool: edit_file
+        id: recover-edit
+        input:
+          path: note.txt
+          old_text: old
+          new_text: recovered
+    fault:
+      point: after_tool_effect_before_persist
+      tool_use_id: recover-edit
+    recovery_model:
+      - text: recovered after restart.
+    checks:
+      status: completed
+      files:
+        note.txt: recovered

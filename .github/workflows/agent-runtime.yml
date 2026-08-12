@@ -1,0 +1,76 @@
+name: Agent Runtime
+
+on:
+  push:
+    paths:
+      - "agent_runtime/**"
+      - "evals/**"
+      - "requirements.txt"
+      - ".github/workflows/agent-runtime.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "agent_runtime/**"
+      - "evals/**"
+      - "requirements.txt"
+      - ".github/workflows/agent-runtime.yml"
+  workflow_dispatch:
+
+jobs:
+  deterministic-acceptance:
+    name: Runtime / ${{ matrix.os }} / Python 3.11
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      PYTHONUTF8: "1"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pytest
+
+      - name: Compile Runtime
+        run: python -m compileall -q agent_runtime
+
+      - name: Run Runtime tests
+        run: python -m pytest agent_runtime/tests -q --tb=short -p no:cacheprovider
+
+      - name: Run MVP Eval
+        run: >-
+          python -m agent_runtime eval
+          --suite evals/mvp.yaml
+          --runs .agent_runtime_ci/mvp
+          --output .agent_runtime_ci/mvp-report.json
+
+      - name: Run Hardening Eval
+        run: >-
+          python -m agent_runtime eval
+          --suite evals/hardening.yaml
+          --runs .agent_runtime_ci/hardening
+          --output .agent_runtime_ci/hardening-report.json
+
+      - name: Run deterministic demo
+        run: >-
+          python -m agent_runtime.demos.run_demo
+          --output-root .agent_runtime_ci/demo
+
+      - name: Upload Eval and demo evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-runtime-${{ runner.os }}-evidence
+          path: .agent_runtime_ci/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
