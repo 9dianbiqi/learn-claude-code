@@ -7,8 +7,9 @@ task: SQLite checkpoints, an append-only event log, tool-call deduplication,
 effect reservations, repository leases, permission policies, file conflict
 detection, traces, and deterministic regression evaluation.
 
-The v0.1 baseline is intentionally local and single-repository. It is not a
-distributed workflow engine and does not claim generic exactly-once execution.
+The v0.2 development line remains intentionally local and single-repository.
+It is not a distributed workflow engine and does not claim generic exactly-once
+execution.
 
 ## Why this exists
 
@@ -68,9 +69,10 @@ acquire repository lease
 -> load/create checkpoint
 -> persist model response
 -> persist tool plan and permission decision
--> reserve non-read-only effect
+-> prepare operation + pending outbox + effect reservation
+-> claim outbox and mark operation dispatched
 -> execute tool
--> persist result or needs_review
+-> commit result/evidence or mark unknown
 -> append tool_result checkpoint
 -> continue or complete
 ```
@@ -90,6 +92,33 @@ model, database tables, and recovery matrix.
 - Read-before-edit, before/after SHA-256 checks, and atomic file replacement.
 - Explicit `needs_review` reconciliation through `retry`, `complete`, or `abort`.
 - JSON trace summaries/exports and deterministic MVP/Hardening evaluation suites.
+
+## v0.2 Phase 1: Schema Migration and Effect Ledger
+
+Phase 1 upgrades fresh databases directly to schema v5 and provides an
+explicit, audited v4-to-v5 migration. Normal Runtime startup never silently
+upgrades an existing database:
+
+    python -m agent_runtime db-migrate --repo $sandbox --dry-run
+    python -m agent_runtime db-migrate --repo $sandbox
+    python -m agent_runtime db-check --repo $sandbox
+
+The migration performs an integrity check, blocks while an unexpired repository
+lease exists, creates a SQLite backup through the backup API, records its
+filename and SHA-256, converts stale running reservations to unknown, and
+commits DDL, backfill, schema metadata, and audit data in one transaction.
+
+Non-read-only calls are represented by an Effect Ledger operation:
+
+    prepared -> dispatched -> committed
+           \-> cancelled       \-> failed
+    dispatched -> unknown -> committed / prepared / cancelled
+
+read_file and glob remain replay-safe tool-call records without operations.
+File writes are reconcilable; Shell is opaque. A committed operation is
+deduplicated from its durable result. An unknown opaque operation is blocked
+until an operator uses resolve-call; arbitrary Shell commands are not claimed
+to be exactly-once.
 
 ## Requirements
 
@@ -166,7 +195,7 @@ Resume a non-terminal task:
 python -m agent_runtime resume TASK_ID --repo $sandbox
 ```
 
-Operator-oriented v0.1.1 commands:
+Operator-oriented commands:
 
 ```powershell
 python -m agent_runtime list --repo $sandbox
@@ -175,6 +204,7 @@ python -m agent_runtime pending --repo $sandbox
 python -m agent_runtime events TASK_ID --repo $sandbox --limit 20
 python -m agent_runtime doctor --repo $sandbox
 python -m agent_runtime db-check --repo $sandbox
+python -m agent_runtime db-migrate --repo $sandbox --dry-run
 ```
 
 `pending` prints the exact approval, denial, or reconciliation commands for
@@ -264,7 +294,7 @@ Release-oriented changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## Scope boundaries
 
-Deferred beyond v0.1:
+Deferred beyond Phase 1:
 
 - worktree-based parallel execution;
 - background scheduling and Cron;
@@ -274,6 +304,7 @@ Deferred beyond v0.1:
 - OpenTelemetry and visual dashboards;
 - network-filesystem coordination;
 - generic distributed exactly-once guarantees;
+- OS-level Shell sandboxing (Docker, Bubblewrap, Restricted Token);
 - production-scale database retention and migrations.
 
 SQLite is intended for a local filesystem. Shell execution is policy-controlled
@@ -285,14 +316,16 @@ system sandbox.
 ```text
 agent_runtime/
   runtime.py       durable loop and recovery
-  store.py         SQLite schema, transactions, leases, reservations
+  store.py         SQLite projections, transactions, leases, and ledger API
+  migrations.py    explicit v4-to-v5 schema migration and backup framework
+  effects.py       EffectSemantics and operation specifications
   permissions.py   allow/ask/deny evaluation
   tools.py         repository tools and file safety
   trace.py         metrics and JSONL export
   eval_runner.py   deterministic fixed-task evaluation
   demos/           reproducible no-API demonstrations
   docs/            architecture and walkthroughs
-  tests/           fault, security, recovery, and trace tests
+  tests/           fault, security, recovery, migration, ledger, and trace tests
 evals/
   mvp.yaml
   hardening.yaml

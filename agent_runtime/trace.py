@@ -17,6 +17,7 @@ class TraceReporter:
         events = self.store.list_events(task_id)
         models = self.store.list_model_calls(task_id)
         tools = self.store.list_tool_calls(task_id)
+        operations = self.store.list_operations(task_id)
         permission_counts = {"allow": 0, "ask": 0, "deny": 0}
         for event in events:
             if event["type"] == "permission_decision":
@@ -41,6 +42,9 @@ class TraceReporter:
         review_calls = [call for call in tools if call.get("status") == "needs_review"]
         correct_reviews = sum(1 for call in review_calls if call.get("effect") in {"unknown_write", "file_write"})
         invariant_violations = self.store.scan_invariants(task_id)
+        operation_deduplications = sum(
+            event["type"] == "operation_deduplicated" for event in events
+        )
         return {
             "task_id": task_id,
             "status": task["status"],
@@ -64,6 +68,20 @@ class TraceReporter:
             "stale_lease_execution_attempts": sum(
                 event["type"] == "stale_lease_execution_attempt" for event in events
             ),
+            "operation_count": len(operations),
+            "operation_attempts": sum(int(operation.get("attempt_count") or 0) for operation in operations),
+            "committed_operations": sum(operation.get("state") == "committed" for operation in operations),
+            "unknown_operations": sum(operation.get("state") == "unknown" for operation in operations),
+            "reconciled_operations": sum(
+                event["type"] == "operation_reconciled" for event in events
+            ),
+            "operation_deduplications": operation_deduplications,
+            "idempotency_conflicts": sum(
+                event["type"] == "operation_idempotency_conflict" for event in events
+            ),
+            "blocked_outbox_count": sum(
+                operation.get("outbox_state") == "blocked" for operation in operations
+            ),
         }
 
     def export_jsonl(self, task_id: str, output_path: str | Path) -> int:
@@ -80,6 +98,37 @@ class TraceReporter:
             ):
                 for record in records:
                     handle.write(json.dumps(_redact({"record_type": record_type, **record}), ensure_ascii=False, sort_keys=True) + "\n")
+            for operation in self.store.list_operations(task_id):
+                safe_operation = {
+                    key: operation.get(key)
+                    for key in (
+                        "operation_id",
+                        "task_id",
+                        "tool_use_id",
+                        "adapter",
+                        "semantics",
+                        "effect_scope",
+                        "args_hash",
+                        "state",
+                        "result_digest",
+                        "attempt_count",
+                        "version",
+                        "created_at",
+                        "updated_at",
+                        "dispatched_at",
+                        "completed_at",
+                        "outbox_state",
+                        "delivery_attempts",
+                    )
+                }
+                handle.write(
+                    json.dumps(
+                        _redact({"record_type": "operation", **safe_operation}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
             for checkpoint in self.store.list_checkpoints(task_id):
                 handle.write(json.dumps(_redact({"record_type": "checkpoint", **checkpoint}), ensure_ascii=False, sort_keys=True) + "\n")
         return len(events)

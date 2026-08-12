@@ -948,3 +948,24 @@ baseline commit containing the intended `agent_runtime/`, `evals/`,
 and workspace changes; propose commit message `feat(agent-runtime): freeze
 v0.1 hardened runtime baseline`; and propose tag `agent-runtime-v0.1`. No Git
 operation is executed by this review.
+## v0.2.0.dev1 Phase 1 - Schema Migration and Effect Ledger
+
+Phase 1 adds an explicit v4-to-v5 migration framework and a durable
+operations/operation_outbox ledger. Fresh databases are created directly at
+v5; normal Runtime startup does not silently mutate an existing v4 database.
+Migration preflight checks SQLite integrity and unexpired leases, creates and
+verifies a SQLite backup, preserves the legacy effect_reservations barrier,
+converts stale running reservations to unknown, and commits DDL, backfill,
+metadata, and audit projections as one transaction.
+
+The operation state machine is prepared -> dispatched -> committed, with
+cancelled, failed, and unknown recovery branches. Every ledger transition uses
+state-plus-version CAS and lease/fencing validation. Events contain only
+operation_id, tool_use_id, semantics, adapter, attempt, state, and a bounded
+reason; request and effect result payloads stay out of operation audit events.
+
+File effects are reconcilable from before/after SHA-256 evidence. An unknown
+file effect can be completed when the post hash matches; a before-hash match
+requires an explicit retry. Shell remains opaque and enters needs_review after
+an ambiguous boundary. Phase 1 does not implement an OS sandbox or claim
+generic Shell exactly-once execution.

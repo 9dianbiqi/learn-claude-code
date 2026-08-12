@@ -10,6 +10,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from .effects import (
+    OperationSpec,
+    ReconcileEvidence,
+    semantics_for_effect,
+    stable_dedupe_key,
+)
 from .models import ModelResponse, RunResult, ToolCall
 from .permissions import PermissionDecision, PermissionEngine
 from .store import EffectBlocked, EventStore, InvariantViolation, LeaseLost, StaleState
@@ -212,6 +218,20 @@ class Runtime:
                 return RunResult(task_id, "aborted", error="Aborted during review")
             if action not in {"retry", "complete"}:
                 raise ValueError("action must be retry, complete, or abort")
+            operation = self.store.get_operation_for_tool_call(task_id, tool_use_id)
+            if operation is not None:
+                evidence = ReconcileEvidence(
+                    "safe_to_retry" if action == "retry" else "operator_confirmed",
+                    "operator supplied the explicit resolve-call decision",
+                    {"source": "operator", "action": action},
+                )
+                self.store.resolve_operation(
+                    operation["operation_id"],
+                    action,
+                    evidence,
+                    expected_version=int(operation["version"]),
+                )
+                return self._resume_task(task_id, lease_acquired=True)
             self.store.resolve_review(task_id, tool_use_id, action, int(call["version"]), int(task["version"]))
             return self._resume_task(task_id, lease_acquired=True)
         finally:
@@ -393,9 +413,27 @@ class Runtime:
     def _execute_call(self, task_id: str, turn: int, call: ToolCall) -> str:
         args_hash = canonical_args_hash(call.name, call.input)
         existing = self.store.get_tool_call(task_id, call.id)
+        operation = None
         if existing is not None:
             if existing["args_hash"] != args_hash:
                 raise RuntimeError(f"Tool call ID reused with different arguments: {call.id}")
+            operation = self.store.get_operation_for_tool_call(task_id, call.id)
+            if operation is not None and operation["state"] == "committed":
+                output = self._operation_output(operation, existing)
+                self.store.append_event(
+                    task_id,
+                    "operation_deduplicated",
+                    {
+                        "operation_id": operation["operation_id"],
+                        "tool_use_id": call.id,
+                        "semantics": operation["semantics"],
+                        "adapter": operation["adapter"],
+                        "attempt": operation["attempt_count"],
+                        "state": "committed",
+                        "reason": "committed operation already has a durable result",
+                    },
+                )
+                return output
             if existing["status"] in {"succeeded", "denied"}:
                 self.store.append_event(task_id, "tool_deduplicated", {"tool_use_id": call.id})
                 return existing.get("output") or "Permission denied."
@@ -412,7 +450,11 @@ class Runtime:
                 reason = existing.get("error") or "Manual review required"
                 self._pending_review = ("needs_review", call.id, reason)
                 raise NeedsReview(call.id, reason)
-            if existing["status"] == "running":
+            if operation is not None and operation["state"] in {"dispatched", "unknown"}:
+                recovered = self._reconcile_running_call(task_id, existing)
+                if recovered is not None:
+                    return recovered
+            elif existing["status"] == "running":
                 recovered = self._reconcile_running_call(task_id, existing)
                 if recovered is not None:
                     return recovered
@@ -465,82 +507,138 @@ class Runtime:
             before_state, expected_after = self._prepare_file_call(task_id, call)
             self.store.update_tool_call(task_id, call.id, before_state=before_state, expected_after=expected_after)
 
-        self.store.start_tool_call(task_id, call.id, decision.risk, started_at=time.time())
-        self.store.append_event(task_id, "tool_started", {"tool_use_id": call.id, "name": call.name})
-        self._fault("after_tool_started", task_id=task_id, tool_use_id=call.id)
+        if decision.risk == "read_only":
+            self.store.start_tool_call(task_id, call.id, decision.risk, started_at=time.time())
+            self.store.append_event(task_id, "tool_started", {"tool_use_id": call.id, "name": call.name})
+            self._fault("after_tool_started", task_id=task_id, tool_use_id=call.id)
+            self._assert_lease_for_effect(task_id, call.id, "before_tool_effect")
+            try:
+                raw_output = self.tools.execute(call.name, call.input)
+            except Exception as exc:
+                reason = f"{type(exc).__name__}: {exc}"
+                self.store.update_tool_call(
+                    task_id, call.id, status="failed", error=reason, execution_status="error", finished_at=time.time()
+                )
+                self.store.append_event(task_id, "tool_failed", {"tool_use_id": call.id, "reason": reason})
+                raise
+            output = raw_output.output if isinstance(raw_output, ShellResult) else str(raw_output)
+            self._fault("after_tool_effect_before_persist", task_id=task_id, tool_use_id=call.id)
+            if call.name == "read_file":
+                state = self.tools.file_state(call.input["path"])
+                if state["exists"]:
+                    self.store.upsert_file_observation(
+                        task_id,
+                        state["path"],
+                        True,
+                        state["sha256"],
+                        call.id,
+                        state.get("identity"),
+                    )
+            fields: dict[str, Any] = {"status": "succeeded", "output": output, "finished_at": time.time()}
+            if isinstance(raw_output, ShellResult):
+                fields.update({
+                    "returncode": raw_output.returncode,
+                    "stdout": raw_output.stdout,
+                    "stderr": raw_output.stderr,
+                    "timed_out": int(raw_output.timed_out),
+                    "execution_status": raw_output.status,
+                })
+            self.store.update_tool_call(task_id, call.id, **fields)
+            self.store.append_event(task_id, "tool_succeeded", {
+                "tool_use_id": call.id, "name": call.name, "output_chars": len(output),
+            })
+            self._fault("after_tool_persist", task_id=task_id, tool_use_id=call.id)
+            return output
+
+        semantics = semantics_for_effect(decision.risk)
+        adapter = "file" if decision.risk == "file_write" else "legacy"
+        spec = OperationSpec(
+            task_id=task_id,
+            tool_use_id=call.id,
+            adapter=adapter,
+            semantics=semantics,
+            effect_scope=str(self.repo_root),
+            dedupe_key=stable_dedupe_key(task_id, call.id),
+            idempotency_key=None,
+            args_hash=args_hash,
+            request={"name": call.name, "input": call.input},
+        )
+        try:
+            operation = self.store.prepare_operation(
+                spec,
+                deadline_at=time.time() + float(self.tools.shell_timeout if call.name == "bash" else self.lease_ttl),
+            )
+            if operation["state"] == "committed":
+                output = self._operation_output(operation, existing)
+                self.store.append_event(task_id, "operation_deduplicated", {
+                    "operation_id": operation["operation_id"],
+                    "tool_use_id": call.id,
+                    "semantics": operation["semantics"],
+                    "adapter": operation["adapter"],
+                    "attempt": operation["attempt_count"],
+                    "state": "committed",
+                    "reason": "committed operation already has a durable result",
+                })
+                return output
+            if operation["state"] in {"dispatched", "unknown"}:
+                recovered = self._reconcile_running_call(task_id, existing)
+                if recovered is not None:
+                    return recovered
+                reason = "Operation requires reconciliation before another dispatch"
+                self._mark_needs_review(task_id, call.id, reason)
+                raise NeedsReview(call.id, reason)
+            self.store.claim_operation(operation["operation_id"], claim_ttl=self.lease_ttl)
+            # This compatibility fault point is deliberately before the
+            # dispatched boundary. A crash here leaves a prepared operation
+            # that the next owner may safely claim; once dispatched, recovery
+            # must never infer that the external effect did not happen.
+            self.store.append_event(task_id, "tool_started", {"tool_use_id": call.id, "name": call.name})
+            self._fault("after_tool_started", task_id=task_id, tool_use_id=call.id)
+            operation = self.store.mark_operation_dispatched(operation["operation_id"])
+        except EffectBlocked as exc:
+            reason = str(exc)
+            self._mark_needs_review(task_id, call.id, reason)
+            raise NeedsReview(call.id, reason) from exc
+
         if call.name in {"write_file", "edit_file"} and before_state is not None:
             current = self.tools.file_state(call.input["path"])
             if not self._same_state(current, before_state):
                 reason = "File changed after precondition check and before write"
+                self.store.mark_operation_unknown(
+                    operation["operation_id"],
+                    reason,
+                    evidence=ReconcileEvidence("before_hash", reason, {"before": before_state}),
+                )
                 self._mark_needs_review(task_id, call.id, reason)
                 raise NeedsReview(call.id, reason)
         self._assert_lease_for_effect(task_id, call.id, "before_tool_effect")
         if call.name == "bash" and float(self.tools.shell_timeout) >= self.lease_ttl:
             reason = "Shell timeout is not below the repository lease TTL"
+            self.store.mark_operation_unknown(operation["operation_id"], reason)
             self._mark_needs_review(task_id, call.id, reason)
             raise NeedsReview(call.id, reason)
         if call.name in {"write_file", "edit_file"} and before_state is not None:
             self.tools.set_expected_before(call.input["path"], before_state)
-        if decision.risk != "read_only":
-            blockers = self.store.list_blocking_reservations(str(self.repo_root))
-            if blockers:
-                blocker = blockers[0]
-                reason = (
-                    "Repository effect reservation blocks a new side effect: "
-                    f"reservation={blocker['reservation_id']} state={blocker['state']}"
-                )
-                self._mark_needs_review(task_id, call.id, reason)
-                raise NeedsReview(call.id, reason)
-        reservation_id: int | None = None
-        if decision.risk != "read_only":
-            try:
-                reservation_id = self.store.reserve_effect(
-                    task_id,
-                    call.id,
-                    self.owner_id,
-                    int(self._lease_token or 0),
-                    decision.risk,
-                    started_at=time.time(),
-                    deadline_at=time.time() + float(self.tools.shell_timeout if call.name == "bash" else self.lease_ttl),
-                )
-            except EffectBlocked as exc:
-                reason = str(exc)
-                self._mark_needs_review(task_id, call.id, reason)
-                raise NeedsReview(call.id, reason) from exc
         try:
             raw_output = self.tools.execute(call.name, call.input)
         except FileConflict as exc:
-            if reservation_id is not None:
-                self.store.finish_effect_reservation(reservation_id, "unknown", {"reason": str(exc)}, allow_stale=True)
             reason = str(exc)
+            self.store.mark_operation_unknown(operation["operation_id"], reason)
             self._mark_needs_review(task_id, call.id, reason)
             raise NeedsReview(call.id, reason)
         except Exception as exc:
-            if reservation_id is not None:
-                self.store.finish_effect_reservation(
-                    reservation_id, "unknown", {"reason": f"{type(exc).__name__}: {exc}"}, allow_stale=True
-                )
             reason = f"{type(exc).__name__}: {exc}"
-            if reservation_id is not None:
-                self._mark_needs_review(task_id, call.id, reason)
-                raise NeedsReview(call.id, reason)
-            self.store.update_tool_call(task_id, call.id, status="failed", error=reason,
-                                        execution_status="error", finished_at=time.time())
-            self.store.append_event(task_id, "tool_failed", {"tool_use_id": call.id, "reason": reason})
-            raise
-        try:
-            self._assert_lease_for_effect(task_id, call.id, "after_tool_effect")
-        except LeaseLost:
-            if reservation_id is not None:
-                self.store.finish_effect_reservation(
-                    reservation_id, "unknown", {"reason": "lease_lost_after_effect"}, allow_stale=True
-                )
-            raise
+            self.store.mark_operation_unknown(
+                operation["operation_id"],
+                reason,
+                tool_fields={"error": reason, "execution_status": "error"},
+            )
+            self._mark_needs_review(task_id, call.id, reason)
+            raise NeedsReview(call.id, reason)
+        self._assert_lease_for_effect(task_id, call.id, "after_tool_effect")
         self._fault("after_tool_effect_before_persist", task_id=task_id, tool_use_id=call.id)
 
         output = raw_output.output if isinstance(raw_output, ShellResult) else str(raw_output)
-        effect_persisted = False
-
         if isinstance(raw_output, ShellResult):
             shell_fields = {
                 "returncode": raw_output.returncode,
@@ -554,40 +652,66 @@ class Runtime:
                 reason = "Shell timed out; side effects are unknown" if raw_output.timed_out else (
                     f"Shell exited with return code {raw_output.returncode}; side effects are unknown"
                 )
-                if reservation_id is not None:
-                    self.store.finish_effect_reservation(reservation_id, "unknown", {
-                        "reason": reason,
-                        "returncode": raw_output.returncode,
-                        "timed_out": raw_output.timed_out,
-                    }, allow_stale=True)
-                self.store.update_tool_call(task_id, call.id, **shell_fields)
+                self.store.mark_operation_unknown(
+                    operation["operation_id"],
+                    reason,
+                    evidence=ReconcileEvidence(
+                        "unknown",
+                        reason,
+                        {"returncode": raw_output.returncode, "timed_out": raw_output.timed_out},
+                    ),
+                    tool_fields=shell_fields,
+                )
                 self._mark_needs_review(task_id, call.id, reason)
                 raise NeedsReview(call.id, reason)
             shell_fields["effect_confirmation"] = "process_returncode:0;side_effect_unknown"
-            if reservation_id is not None:
-                self.store.complete_effect(
-                    reservation_id,
-                    task_id,
-                    call.id,
-                    {**shell_fields, "status": "succeeded", "finished_at": time.time()},
-                    {"side_effect_unknown": True, "returncode": raw_output.returncode},
-                    event_payload={"name": call.name, "output_chars": len(output)},
-                )
-                effect_persisted = True
-
-        if call.name == "read_file":
-            state = self.tools.file_state(call.input["path"])
-            if state["exists"]:
-                self.store.upsert_file_observation(task_id, state["path"], True, state["sha256"], call.id, state.get("identity"))
+            self.store.commit_operation(
+                operation["operation_id"],
+                result=output,
+                evidence={"outcome": "returned_zero", "side_effect_unknown": True},
+                tool_fields={**shell_fields, "status": "succeeded", "finished_at": time.time()},
+                reason="opaque shell returned zero",
+            )
         elif call.name in {"write_file", "edit_file"}:
             current = self.tools.file_state(call.input["path"])
             if not self._same_state(current, expected_after):
                 reason = "File state differs from expected post-write hash"
+                self.store.mark_operation_unknown(
+                    operation["operation_id"],
+                    reason,
+                    evidence=ReconcileEvidence("ambiguous", reason, {"current": current}),
+                )
                 self._mark_needs_review(task_id, call.id, reason)
                 raise NeedsReview(call.id, reason)
-            if reservation_id is not None:
+            self.store.commit_operation(
+                operation["operation_id"],
+                result=output,
+                evidence={"outcome": "post_hash_match", "path": current["path"], "sha256": current["sha256"]},
+                tool_fields={
+                    "status": "succeeded",
+                    "output": output,
+                    "finished_at": time.time(),
+                    "effect_confirmed": 1,
+                    "effect_confirmation": json.dumps(
+                        {"path": current["path"], "sha256": current["sha256"]}, sort_keys=True
+                    ),
+                },
+                observation={
+                    "path": current["path"],
+                    "exists_now": True,
+                    "sha256": current["sha256"],
+                    "identity": current.get("identity"),
+                },
+                reason="file post-write hash matched",
+            )
+            # Keep the v0.1.1 completion hook observable for integrations
+            # that instrumented complete_effect. The ledger commit above is
+            # authoritative; this compatibility call cannot replay a write
+            # because its reservation is already completed.
+            reservation = self.store.get_effect_reservation(task_id, call.id)
+            if reservation is not None:
                 self.store.complete_effect(
-                    reservation_id,
+                    int(reservation["reservation_id"]),
                     task_id,
                     call.id,
                     {
@@ -595,18 +719,22 @@ class Runtime:
                         "output": output,
                         "finished_at": time.time(),
                         "effect_confirmed": 1,
-                        "effect_confirmation": json.dumps({"path": current["path"], "sha256": current["sha256"]}, sort_keys=True),
                     },
-                    {"path": current["path"], "sha256": current["sha256"], "identity": current.get("identity")},
-                    event_payload={"name": call.name, "output_chars": len(output)},
+                    {"post_hash": True},
+                    {
+                        "path": current["path"],
+                        "exists_now": True,
+                        "sha256": current["sha256"],
+                        "identity": current.get("identity"),
+                    },
                 )
-                effect_persisted = True
-
-        if not effect_persisted:
-            self.store.update_tool_call(task_id, call.id, status="succeeded", output=output, finished_at=time.time())
-            self.store.append_event(task_id, "tool_succeeded", {
-                "tool_use_id": call.id, "name": call.name, "output_chars": len(output),
-            })
+        else:
+            self.store.commit_operation(
+                operation["operation_id"],
+                result=output,
+                evidence={"outcome": "returned"},
+                tool_fields={"status": "succeeded", "output": output, "finished_at": time.time()},
+            )
         self._fault("after_tool_persist", task_id=task_id, tool_use_id=call.id)
         return output
 
@@ -638,7 +766,96 @@ class Runtime:
             raise NeedsReview(call.id, reason)
         return before, expected
 
+    @staticmethod
+    def _operation_output(operation: dict[str, Any], call: dict[str, Any] | None = None) -> str:
+        result = operation.get("result")
+        if isinstance(result, dict) and "output" in result:
+            return str(result["output"])
+        if isinstance(result, str):
+            return result
+        if call is not None and call.get("output") is not None:
+            return str(call["output"])
+        return "[deduplicated committed operation]"
+
     def _reconcile_running_call(self, task_id: str, call: dict[str, Any]) -> str | None:
+        operation_id = call.get("operation_id")
+        operation = self.store.get_operation(operation_id) if operation_id else None
+        if operation is not None:
+            if operation["state"] == "committed":
+                self.store.append_event(
+                    task_id,
+                    "operation_deduplicated",
+                    {
+                        "operation_id": operation["operation_id"],
+                        "tool_use_id": call["tool_use_id"],
+                        "semantics": operation["semantics"],
+                        "adapter": operation["adapter"],
+                        "attempt": operation["attempt_count"],
+                        "state": "committed",
+                        "reason": "committed operation already has a durable result",
+                    },
+                )
+                return self._operation_output(operation, call)
+            if operation["state"] == "prepared":
+                return None
+            if operation["state"] == "dispatched":
+                try:
+                    self.store.mark_operation_unknown(
+                        operation["operation_id"],
+                        "Interrupted dispatched operation requires reconciliation",
+                    )
+                except StaleState:
+                    pass
+                operation = self.store.get_operation(operation["operation_id"]) or operation
+            if operation["state"] in {"failed", "cancelled"}:
+                raise RuntimeError(f"Operation is terminal and cannot execute again: {operation['operation_id']}")
+            if operation["state"] == "unknown":
+                if operation["adapter"] == "file" and call.get("before_state") and call.get("expected_after"):
+                    current = self.tools.file_state(call["args"]["path"])
+                    if self._same_state(current, call["expected_after"]):
+                        output = "[recovered] file already matches expected post-write hash"
+                        self.store.commit_operation(
+                            operation["operation_id"],
+                            result=output,
+                            evidence=ReconcileEvidence(
+                                "post_hash_match",
+                                "file already matched the expected post-write hash",
+                                {"path": current["path"], "sha256": current["sha256"]},
+                            ),
+                            tool_fields={
+                                "status": "succeeded",
+                                "output": output,
+                                "finished_at": time.time(),
+                                "effect_confirmed": 1,
+                                "effect_confirmation": json.dumps(
+                                    {"path": current["path"], "sha256": current["sha256"]}, sort_keys=True
+                                ),
+                            },
+                            observation={
+                                "path": current["path"],
+                                "exists_now": True,
+                                "sha256": current["sha256"],
+                                "identity": current.get("identity"),
+                            },
+                            allow_unknown=True,
+                            reason="reconciled file post-write hash",
+                            emit_tool_event=False,
+                        )
+                        self.store.append_event(
+                            task_id,
+                            "tool_recovered_succeeded",
+                            {"tool_use_id": call["tool_use_id"], "operation_id": operation["operation_id"]},
+                        )
+                        return output
+                    if self._same_state(current, call["before_state"]):
+                        reason = "File still matches the before hash; explicit retry confirmation is required"
+                    else:
+                        reason = "Interrupted file write has an ambiguous current hash"
+                else:
+                    reason = "Interrupted opaque effect has unknown external outcome"
+                self._mark_needs_review(task_id, call["tool_use_id"], reason)
+                raise NeedsReview(call["tool_use_id"], reason)
+
         effect = call.get("effect") or "unknown_write"
         reservation = self.store.get_effect_reservation(task_id, call["tool_use_id"])
         if reservation is not None:

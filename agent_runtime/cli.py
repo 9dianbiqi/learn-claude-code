@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ from dotenv import find_dotenv, load_dotenv
 
 from . import __version__
 from .eval_runner import run_suite, write_report
+from .migrations import SchemaError, SchemaManager
 from .permissions import PermissionEngine
 from .providers import AnthropicModel
 from .runtime import Runtime
@@ -130,6 +132,10 @@ def build_parser() -> argparse.ArgumentParser:
     db_check = sub.add_parser("db-check", help="Run SQLite integrity and Runtime invariant checks.")
     _add_repo(db_check)
 
+    db_migrate = sub.add_parser("db-migrate", help="Plan or apply an explicit SQLite schema migration.")
+    _add_repo(db_migrate)
+    db_migrate.add_argument("--dry-run", action="store_true")
+
     evaluation = sub.add_parser("eval", help="Run a deterministic fixed-task suite.")
     evaluation.add_argument("--suite", required=True)
     evaluation.add_argument("--runs")
@@ -181,12 +187,28 @@ def _task_show(args: argparse.Namespace) -> dict[str, Any]:
         "task": task,
         "checkpoint": checkpoint_summary,
         "tool_calls": tools,
+        "operations": store.list_operations(args.task_id),
         "blocking_reservations": store.list_blocking_reservations(str(_repo(args)), args.task_id),
     }
 
 
+def _operation_cli_summary(operation: dict[str, Any] | None) -> dict[str, Any] | None:
+    if operation is None:
+        return None
+    # Pending is an operator queue, not a result dump. Keep durable identity,
+    # state, digests, and lease metadata while excluding request/result/evidence.
+    fields = (
+        "operation_id", "task_id", "tool_use_id", "adapter", "semantics", "effect_scope",
+        "idempotency_key", "args_hash", "result_digest", "state", "attempt_count", "version",
+        "created_at", "updated_at", "dispatched_at", "completed_at", "outbox_state",
+        "available_at", "claimed_by", "claimed_until", "delivery_attempts", "last_error",
+    )
+    return {key: operation.get(key) for key in fields if key in operation}
+
+
 def _pending(args: argparse.Namespace) -> list[dict[str, Any]]:
-    calls = _store(args).list_pending_tool_calls(args.task_id)
+    store = _store(args)
+    calls = store.list_pending_tool_calls(args.task_id)
     result = []
     for call in calls:
         if call["status"] == "waiting_approval":
@@ -209,6 +231,28 @@ def _pending(args: argparse.Namespace) -> list[dict[str, Any]]:
             "status": call["status"],
             "reason": call.get("permission_reason") or call.get("error"),
             "next_commands": next_commands,
+            "operation": _operation_cli_summary(
+                store.get_operation_for_tool_call(call["task_id"], call["tool_use_id"])
+            ),
+        })
+    known_calls = {(item["task_id"], item["tool_use_id"]) for item in calls}
+    for operation in store.list_pending_operations(args.task_id):
+        key = (operation["task_id"], operation["tool_use_id"])
+        if key in known_calls:
+            continue
+        result.append({
+            "task_id": operation["task_id"],
+            "tool_use_id": operation["tool_use_id"],
+            "tool": operation["adapter"],
+            "args": None,
+            "status": operation["state"],
+            "reason": operation.get("last_error") or "Operation requires reconciliation",
+            "operation": _operation_cli_summary(operation),
+            "next_commands": [
+                f"python -m agent_runtime resolve-call {operation['tool_use_id']} --repo \"{_repo(args)}\" --action complete",
+                f"python -m agent_runtime resolve-call {operation['tool_use_id']} --repo \"{_repo(args)}\" --action retry",
+                f"python -m agent_runtime resolve-call {operation['tool_use_id']} --repo \"{_repo(args)}\" --action abort",
+            ],
         })
     return result
 
@@ -309,7 +353,10 @@ def _doctor(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     ok = not any(item["status"] == "fail" for item in checks)
     report = {
         "ok": ok,
-        "version": __version__,
+        # Keep the v0.1.1 doctor field stable for scripts that consume the
+        # existing CLI contract; expose the Runtime package version alongside it.
+        "version": "0.1.1",
+        "runtime_version": __version__,
         "repository": str(repo),
         "checks": checks,
         "warnings": sum(item["status"] == "warn" for item in checks),
@@ -319,12 +366,61 @@ def _doctor(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
 
 def _db_check(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    repo = _repo(args)
+    manager = SchemaManager(_db_path(repo), repo_root=repo)
+    try:
+        schema = manager.inspect()
+    except SchemaError as exc:
+        report = {
+            "ok": False,
+            "database": str(_db_path(repo)),
+            "schema_error": str(exc),
+            "current_version": None,
+            "target_version": 5,
+            "pending_migrations": [],
+        }
+        return report, 2
+    if not schema.database_exists:
+        return {
+            "ok": True,
+            "database": str(_db_path(repo)),
+            "current_version": 0,
+            "target_version": schema.target_version,
+            "pending_migrations": schema.pending_names,
+            "schema_integrity_errors": [],
+            "runtime_invariant_violations": [],
+            "task_count": 0,
+        }, 0
+    if schema.current_version != schema.target_version:
+        task_count = 0
+        connection = sqlite3.connect(_db_path(repo))
+        try:
+            if connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tasks'"
+            ).fetchone():
+                task_count = int(connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0])
+        finally:
+            connection.close()
+        report = {
+            "ok": False,
+            "database": str(_db_path(repo)),
+            "current_version": schema.current_version,
+            "target_version": schema.target_version,
+            "pending_migrations": schema.pending_names,
+            "schema_integrity_errors": list(schema.integrity_check),
+            "runtime_invariant_violations": ["explicit schema migration required"],
+            "task_count": task_count,
+        }
+        return report, 2
     store = _store(args)
     integrity = store.integrity_check()
     invariants = store.scan_invariants()
     report = {
         "ok": not integrity and not invariants,
         "database": str(store.path),
+        "current_version": schema.current_version,
+        "target_version": schema.target_version,
+        "pending_migrations": schema.pending_names,
         "schema_integrity_errors": integrity,
         "runtime_invariant_violations": invariants,
         "task_count": len(store.list_tasks()),
@@ -384,4 +480,17 @@ def main(argv: list[str] | None = None) -> int:
         report, exit_code = _db_check(args)
         _print_json(report)
         return exit_code
+    if args.command == "db-migrate":
+        manager = SchemaManager(_db_path(_repo(args)), repo_root=_repo(args))
+        try:
+            report = manager.migrate(dry_run=args.dry_run)
+        except SchemaError as exc:
+            _print_json({
+                "ok": False,
+                "database": str(manager.database),
+                "error": str(exc),
+            })
+            return 2
+        _print_json(report.as_dict())
+        return 0 if report.ok else 2
     raise SystemExit(f"Unsupported command: {args.command}")
