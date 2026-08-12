@@ -96,7 +96,7 @@ def test_abort_is_terminal_and_does_not_replay_shell_effect(tmp_path: Path):
 
     with pytest.raises(RuntimeError, match="terminal"):
         Runtime(tmp_path, ScriptedModel([]), approval_callback=lambda *_: True).resume(task_id)
-    assert marker.read_text(encoding="utf-8").splitlines() == ["x "]
+    assert [line.rstrip() for line in marker.read_text(encoding="utf-8").splitlines()] == ["x"]
 
 
 def test_completed_resume_is_rejected(tmp_path: Path):

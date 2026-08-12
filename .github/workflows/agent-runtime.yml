@@ -71,5 +71,6 @@ jobs:
         with:
           name: agent-runtime-${{ runner.os }}-evidence
           path: .agent_runtime_ci/
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14
