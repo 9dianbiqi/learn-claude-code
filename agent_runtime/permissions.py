@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .security import command_mentions_sensitive_path, glob_targets_sensitive, is_sensitive_relative
+
 try:
     import yaml
 except ImportError:  # pragma: no cover - requirements include PyYAML
@@ -124,9 +126,23 @@ class PermissionEngine:
                     "Runtime internal namespace is reserved",
                     self.classify_effect(tool_name, args),
                 )
+            if is_sensitive_relative(relative):
+                return PermissionDecision(
+                    "deny",
+                    "invariant.sensitive-path",
+                    "Sensitive credential material is protected by default",
+                    self.classify_effect(tool_name, args),
+                )
         else:
             relative = ""
 
+        if tool_name == "glob" and glob_targets_sensitive(args.get("pattern", "")):
+            return PermissionDecision(
+                "deny",
+                "invariant.sensitive-path",
+                "Sensitive credential material is protected by default",
+                "read_only",
+            )
         if tool_name == "glob" and self._pattern_touches_internal(args.get("pattern", "")):
             return PermissionDecision(
                 "deny",
@@ -142,6 +158,13 @@ class PermissionEngine:
                     "deny",
                     "invariant.runtime-internal-path",
                     "Runtime internal namespace is reserved",
+                    "unknown_write",
+                )
+            if command_mentions_sensitive_path(command):
+                return PermissionDecision(
+                    "deny",
+                    "invariant.sensitive-path",
+                    "Shell access to sensitive credential material is denied",
                     "unknown_write",
                 )
             for pattern in self._hard_deny:

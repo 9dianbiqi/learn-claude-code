@@ -882,6 +882,45 @@ coordination, a full OS-level Shell sandbox, OpenTelemetry, visual dashboards,
 network-filesystem coordination, generic distributed exactly-once guarantees,
 and production-scale schema migration/retention.
 
+## v0.1.1 operator safety and usability validation (2026-08-12)
+
+This bounded follow-up preserved the durable v0.1 execution semantics and added
+operator-facing safety, documentation, and CI coverage. No real model or
+Controlled Live task was required for this validation.
+
+### Changes
+
+- Added hard, non-overridable protection for `.env*`, `.git/**`, `.netrc`,
+  private-key formats, and credential/secret file families across file, glob,
+  and Shell paths. ToolExecutor repeats the check as defense in depth.
+- Added `list`, `show`, `pending`, `events`, `doctor`, and `db-check`; task/tool
+  identifiers and reconciliation actions are now scoped required arguments.
+- Added SQLite `integrity_check`, Runtime invariant health output, pending-call
+  discovery, actionable operator commands, disk/temp/config/policy preflight,
+  and an explicit package version (`0.1.1`).
+- Added a no-API three-scenario demo, architecture/recovery documentation,
+  changelog, and a Windows/Ubuntu GitHub Actions acceptance matrix.
+
+### Local validation
+
+- Compile: `python -m compileall -q agent_runtime` passed.
+- Runtime suite: `131 passed, 2 skipped`; the two skips remain the Windows
+  symlink-privilege branches.
+- New v0.1.1 security/CLI suite: `18 passed`.
+- MVP Eval: `5/5`, recovery `1/1`, duplicate confirmed effects `0`, permission
+  bypasses `0`, invariant violations `0`.
+- Hardening Eval: `9/9`, recovery `7/7`, duplicate confirmed effects `0`,
+  permission bypasses `0`, invariant violations `0`.
+- Deterministic demo: normal edit `completed`; crash recovery `completed` with
+  `effect_attempts=1`; external hash conflict `needs_review` with external
+  content preserved.
+- CLI smoke: version, list, show, events, pending, `db-check`, and `doctor`
+  passed against a generated demo database; SQLite integrity and Runtime
+  invariant violations were both empty.
+- CI workflow YAML was parsed locally and its component commands were run
+  locally. Remote GitHub-hosted Windows/Ubuntu results remain pending until the
+  branch is pushed and Actions executes.
+
 ### New findings
 
 - Critical: `0`.

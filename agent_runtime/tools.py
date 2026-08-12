@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .security import command_mentions_sensitive_path, is_sensitive_relative
+
 
 TOOL_SCHEMAS = [
     {
@@ -146,6 +148,9 @@ class ToolExecutor:
             raise ValueError(f"Path escapes repository: {raw_path}")
         if self._is_internal_path(candidate):
             raise ValueError(f"Path is reserved for runtime internals: {raw_path}")
+        relative = candidate.relative_to(self.repo_root).as_posix()
+        if is_sensitive_relative(relative):
+            raise ValueError(f"Sensitive path is protected by default: {raw_path}")
         return candidate
 
     def set_expected_before(self, raw_path: str, state: dict[str, Any]) -> None:
@@ -260,6 +265,8 @@ class ToolExecutor:
         lowered = (command or "").casefold()
         if self.INTERNAL_NAMESPACE.casefold() in lowered or re.search(r"\.agent[_*?\[]|agent[_-]?runtime", lowered):
             raise ValueError("Runtime internal namespace is reserved")
+        if command_mentions_sensitive_path(lowered):
+            raise ValueError("Shell access to sensitive credential material is denied")
         try:
             completed = subprocess.run(
                 command,

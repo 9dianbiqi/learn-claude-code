@@ -311,6 +311,15 @@ class EventStore:
         finally:
             conn.close()
 
+    def integrity_check(self) -> list[str]:
+        """Return SQLite integrity errors; an empty list means the database is healthy."""
+        conn = self._connect()
+        try:
+            results = [str(row[0]) for row in conn.execute("PRAGMA integrity_check").fetchall()]
+        finally:
+            conn.close()
+        return [] if results == ["ok"] else results
+
     def create_task(self, task_id: str, repo_root: str, prompt: str, model: str) -> None:
         if len(prompt.encode("utf-8")) > MAX_CHECKPOINT_BYTES:
             raise ValueError(f"task prompt exceeds {MAX_CHECKPOINT_BYTES} bytes")
@@ -999,6 +1008,26 @@ class EventStore:
         rows = self._fetchall("SELECT * FROM tool_calls WHERE task_id = ? ORDER BY tool_call_row_id", (task_id,))
         result = []
         for row in rows:
+            item = dict(row)
+            item["args"] = _loads(item.pop("args_json"), {})
+            item["before_state"] = _loads(item.pop("before_state_json"), None)
+            item["expected_after"] = _loads(item.pop("expected_after_json"), None)
+            result.append(item)
+        return result
+
+    def list_pending_tool_calls(self, task_id: str | None = None) -> list[dict[str, Any]]:
+        query = (
+            "SELECT c.*, t.repo_root, t.status AS task_status FROM tool_calls c "
+            "JOIN tasks t ON t.task_id = c.task_id "
+            "WHERE c.status IN ('waiting_approval', 'needs_review')"
+        )
+        params: tuple[Any, ...] = ()
+        if task_id is not None:
+            query += " AND c.task_id = ?"
+            params = (task_id,)
+        query += " ORDER BY c.tool_call_row_id"
+        result: list[dict[str, Any]] = []
+        for row in self._fetchall(query, params):
             item = dict(row)
             item["args"] = _loads(item.pop("args_json"), {})
             item["before_state"] = _loads(item.pop("before_state_json"), None)
