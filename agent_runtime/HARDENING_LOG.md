@@ -90,9 +90,12 @@ follow-up reproduction and fix.
 - After-fix evidence: the two-test fencing subset passed `20/20` repetitions
   (`40 passed, 0 failed`); Runtime tests passed `180 passed, 2 skipped`.
 
-CI evidence for the post-fix commit will be appended after the PR branch is
-updated. P2 generic event-payload-at-rest redaction remains `DEFERRED` under
-the existing contract documented above.
+CI evidence for commit `d1b937a09d4d8b19b69c8d211f3fa23fdb26dfce`: Agent
+Runtime push run `31686341539` and pull-request run `31686344680` both passed,
+including Windows jobs `94403176801` and `94403188227`; the Test workflow
+(`31686344638`) and CI workflow (`31686344584`) also passed. The PR required
+check rollup was `7/7 pass`. P2 generic event-payload-at-rest redaction
+remains `DEFERRED` under the existing contract documented above.
 
 ## P0-1 — Bootstrap / initial checkpoint atomicity
 
