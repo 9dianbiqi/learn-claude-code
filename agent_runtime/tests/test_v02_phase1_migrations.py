@@ -54,7 +54,7 @@ def _v4_database(tmp_path: Path, states: tuple[str, ...] = ("completed", "unknow
                 tool_use_id,
                 json.dumps(args, ensure_ascii=False, sort_keys=True),
                 _args_hash("write_file", args),
-                "succeeded" if state == "completed" else "needs_review",
+                "succeeded" if state == "completed" else "running" if state == "running" else "needs_review",
                 "done" if state == "completed" else None,
                 1 if state == "completed" else 0,
             ),
@@ -74,6 +74,27 @@ def _v4_database(tmp_path: Path, states: tuple[str, ...] = ("completed", "unknow
     connection.commit()
     connection.close()
     return database
+
+
+def _database_snapshot(database: Path) -> tuple[tuple[object, ...], ...]:
+    with sqlite3.connect(database) as connection:
+        tables = [
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+        ]
+        schema = tuple(
+            connection.execute(
+                "SELECT type, name, sql FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+            ).fetchall()
+        )
+        rows: list[tuple[object, ...]] = [schema]
+        for table in tables:
+            quoted = '"' + table.replace('"', '""') + '"'
+            rows.append((table, tuple(connection.execute(f"SELECT * FROM {quoted} ORDER BY rowid").fetchall())))
+        return tuple(rows)
 
 
 def test_fresh_store_creates_v5_directly(tmp_path: Path):
@@ -132,6 +153,82 @@ def test_stale_running_reservation_is_migrated_to_unknown_and_blocked(tmp_path: 
     assert operation["state"] == "unknown"
     assert operation["outbox_state"] == "blocked"
     assert reservation["state"] == "unknown"
+
+
+@pytest.mark.parametrize("tool_status", ["needs_review", "failed", "planned", "running", "pending"])
+def test_invalid_completed_reservation_is_rejected_before_v5_changes(tmp_path: Path, tool_status: str):
+    database = _v4_database(tmp_path, ("completed",))
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE tool_calls SET status = ?", (tool_status,))
+        connection.commit()
+    before = _database_snapshot(database)
+
+    with pytest.raises(MigrationValidationError):
+        SchemaManager(database).migrate()
+
+    assert SchemaManager(database).inspect().current_version == 4
+    assert _database_snapshot(database) == before
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'operations'"
+        ).fetchone() is None
+        assert "operation_id" not in {
+            row[1] for row in connection.execute("PRAGMA table_info(tool_calls)").fetchall()
+        }
+
+
+@pytest.mark.parametrize("reservation_state,tool_status", [("running", "needs_review"), ("running", "planned")])
+def test_invalid_running_reservation_tool_projection_is_rejected(tmp_path: Path, reservation_state: str, tool_status: str):
+    database = _v4_database(tmp_path, (reservation_state,))
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE tool_calls SET status = ?", (tool_status,))
+        connection.commit()
+
+    with pytest.raises(MigrationValidationError):
+        SchemaManager(database).migrate()
+    assert SchemaManager(database).inspect().current_version == 4
+
+
+def test_unknown_reservation_on_incompatible_task_is_rejected(tmp_path: Path):
+    database = _v4_database(tmp_path, ("unknown",))
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE tasks SET status = 'waiting_approval'")
+        connection.commit()
+
+    with pytest.raises(MigrationValidationError):
+        SchemaManager(database).migrate()
+    assert SchemaManager(database).inspect().current_version == 4
+
+
+def test_completed_reservation_with_succeeded_tool_migrates(tmp_path: Path):
+    database = _v4_database(tmp_path, ("completed",))
+    report = SchemaManager(database).migrate()
+
+    assert report.ok
+    assert SchemaManager(database).inspect().current_version == 5
+    store = EventStore(database)
+    assert store.get_tool_call("task-0", "tool-0")["status"] == "succeeded"
+    assert store.get_effect_reservation("task-0", "tool-0")["state"] == "completed"
+    assert store.list_operations()[0]["state"] == "committed"
+
+
+def test_invalid_legacy_rows_stay_v4_after_reopen_and_retry(tmp_path: Path):
+    database = _v4_database(tmp_path, ("completed",))
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE tool_calls SET status = 'needs_review'")
+        connection.commit()
+    before = _database_snapshot(database)
+
+    for _ in range(2):
+        with pytest.raises(MigrationValidationError):
+            SchemaManager(database).migrate()
+        assert SchemaManager(database).inspect().current_version == 4
+        assert _database_snapshot(database) == before
+        with sqlite3.connect(database) as connection:
+            assert connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'operations'"
+            ).fetchone() is None
 
 
 def test_active_lease_blocks_migration(tmp_path: Path):

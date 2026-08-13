@@ -30,6 +30,17 @@ Status values: `OPEN`, `FIXED`, `VERIFIED`, `DEFERRED`, `REOPENED`.
 - Verification status: `FIXED`; independent review remains required before
   changing this follow-up item to `VERIFIED`.
 
+### PR #2 migration review follow-up
+
+- The v4-to-v5 migration now validates legacy reservation/tool projections
+  before changing v4 rows or applying v5 DDL. Invalid completed/running
+  reservation histories fail closed and remain readable v4 databases.
+- P2 deferred: the current contract requires sensitive fields to be redacted
+  in operation events and exported Trace/JSONL. It does not define a blanket
+  prohibition on every generic event payload being stored in plaintext in the
+  local Runtime DB. Generic event-payload-at-rest redaction remains a v0.2
+  hardening item and is not part of this merge-blocker fix.
+
 ## P0-1 — Bootstrap / initial checkpoint atomicity
 
 - First identified: adversarial review against the Phase 1 baseline.

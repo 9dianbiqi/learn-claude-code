@@ -454,6 +454,10 @@ def _validate_legacy_rows(conn: sqlite3.Connection) -> dict[tuple[str, str], tup
         raise MigrationValidationError(f"v4 database is missing required tables: {missing}")
     task_rows = conn.execute("SELECT task_id, status FROM tasks").fetchall()
     task_statuses = {str(row["task_id"]): str(row["status"]) for row in task_rows}
+    valid_tool_statuses = {
+        "planned", "running", "waiting_approval", "needs_review",
+        "succeeded", "failed", "denied", "aborted",
+    }
     calls = conn.execute("SELECT * FROM tool_calls ORDER BY tool_call_row_id").fetchall()
     by_key: dict[tuple[str, str], sqlite3.Row] = {}
     for call in calls:
@@ -462,6 +466,10 @@ def _validate_legacy_rows(conn: sqlite3.Connection) -> dict[tuple[str, str], tup
             raise MigrationValidationError(f"legacy tool call references missing task: {key[0]}")
         if key in by_key:
             raise MigrationValidationError(f"duplicate legacy tool call: {key[0]}/{key[1]}")
+        if str(call["status"]) not in valid_tool_statuses:
+            raise MigrationValidationError(
+                f"legacy tool call has invalid status: {key[0]}/{key[1]}"
+            )
         args = _loads(call["args_json"], {})
         if not isinstance(args, dict):
             raise MigrationValidationError(f"legacy args are not an object: {key[0]}/{key[1]}")
@@ -495,6 +503,12 @@ def _validate_legacy_rows(conn: sqlite3.Connection) -> dict[tuple[str, str], tup
             raise MigrationValidationError(
                 f"legacy unresolved reservation belongs to terminal task: {key[0]}/{key[1]}"
             )
+        if str(reservation["state"]) == "unknown" and task_statuses[key[0]] not in {
+            "created", "running", "needs_review"
+        }:
+            raise MigrationValidationError(
+                f"legacy unknown reservation belongs to incompatible task: {key[0]}/{key[1]}"
+            )
         effect_name = str(by_key[key]["effect"] or "")
         tool_name = str(by_key[key]["name"])
         if effect_name == "read_only" or tool_name in {"read_file", "glob"}:
@@ -506,7 +520,19 @@ def _validate_legacy_rows(conn: sqlite3.Connection) -> dict[tuple[str, str], tup
                 f"legacy file tool has incompatible effect classification: {key[0]}/{key[1]}"
             )
         groups.setdefault(key, []).append(reservation)
-    return {key: (by_key[key], rows) for key, rows in groups.items()}
+    grouped = {key: (by_key[key], rows) for key, rows in groups.items()}
+    for key, (call, reservations) in grouped.items():
+        reservation_states = {str(row["state"]) for row in reservations}
+        tool_status = str(call["status"])
+        if "completed" in reservation_states and tool_status != "succeeded":
+            raise MigrationValidationError(
+                f"legacy completed reservation has non-succeeded tool: {key[0]}/{key[1]}"
+            )
+        if "running" in reservation_states and tool_status != "running":
+            raise MigrationValidationError(
+                f"legacy running reservation has non-running tool: {key[0]}/{key[1]}"
+            )
+    return grouped
 
 
 def _backfill_v5(conn: sqlite3.Connection) -> None:
@@ -1047,6 +1073,11 @@ class SchemaManager:
             if any(item["status"] == "fail" for item in checks):
                 raise MigrationBlocked(f"Migration preflight failed: {checks}")
 
+            # Validate the complete legacy projection before changing any v4
+            # rows or applying v5 DDL. The backfill repeats this shared check
+            # after the stale-running conversion, but no invalid history may
+            # reach that phase.
+            _validate_legacy_rows(conn)
             now = _now()
             conn.execute(
                 "UPDATE effect_reservations SET state = 'unknown', finished_at = ?, details_json = ? "
