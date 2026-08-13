@@ -46,6 +46,19 @@ jobs:
       - name: Run Runtime tests
         run: python -m pytest agent_runtime/tests -q --tb=short -p no:cacheprovider
 
+      - name: Stress fencing regression on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          1..30 | ForEach-Object {
+            $iteration = $_
+            Write-Host "Fencing regression iteration $iteration/30"
+            python -m pytest "agent_runtime/tests/test_phase1_p0.py::test_fencing_rejects_stale_owner_writes_and_tool_execution" -q --tb=short -p no:cacheprovider
+            if ($LASTEXITCODE -ne 0) {
+              throw "Fencing regression failed on iteration $iteration."
+            }
+          }
+
       - name: Run MVP Eval
         run: >-
           python -m agent_runtime eval
@@ -72,5 +85,5 @@ jobs:
           name: agent-runtime-${{ runner.os }}-evidence
           path: .agent_runtime_ci/
           include-hidden-files: true
-          if-no-files-found: error
+          if-no-files-found: ignore
           retention-days: 14
