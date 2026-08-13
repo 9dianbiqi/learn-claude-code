@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from .effects import EffectSemantics, OperationSpec, ReconcileEvidence, sha256_json
-from .migrations import SCHEMA_VERSION, SchemaManager
+from .migrations import SCHEMA_VERSION, SchemaManager, _legacy_projection_violations
 
 
 MAX_CHECKPOINT_BYTES = 4 * 1024 * 1024
@@ -2309,152 +2309,17 @@ class EventStore:
             current = conn.execute("SELECT MAX(version) AS version FROM schema_migrations").fetchone()["version"]
             if current is None or int(current) != SCHEMA_VERSION:
                 violations.append(f"schema version mismatch: {current!r} != {SCHEMA_VERSION}")
-            task_filter = " WHERE task_id = ?" if task_id else ""
-            params = (task_id,) if task_id else ()
-            tasks = conn.execute(f"SELECT * FROM tasks{task_filter}", params).fetchall()
-            for task in tasks:
-                prefix = f"task {task['task_id']}"
-                checkpoint = conn.execute(
-                    "SELECT * FROM checkpoints WHERE checkpoint_id = ?", (task["checkpoint_id"],)
-                ).fetchone() if task["checkpoint_id"] is not None else None
-                if checkpoint is None:
-                    violations.append(f"{prefix}: missing checkpoint pointer")
-                elif checkpoint["task_id"] != task["task_id"]:
-                    violations.append(f"{prefix}: checkpoint belongs to another task")
-                elif task["status"] == "completed" and checkpoint["phase"] != "completed":
-                    violations.append(f"{prefix}: completed task has phase {checkpoint['phase']}")
-                elif task["status"] == "aborted" and checkpoint["phase"] != "aborted":
-                    violations.append(f"{prefix}: aborted task has phase {checkpoint['phase']}")
-                elif task["status"] == "failed" and checkpoint["phase"] != "failed":
-                    violations.append(f"{prefix}: failed task has phase {checkpoint['phase']}")
-                if checkpoint is not None and checkpoint["phase"] not in {
-                    "input_ready", "model_responded", "tool_results_appended", "waiting_approval",
-                    "needs_review", "completed", "failed", "aborted",
-                }:
-                    violations.append(f"{prefix}: invalid checkpoint phase {checkpoint['phase']}")
-                calls = conn.execute("SELECT status FROM tool_calls WHERE task_id = ?", (task["task_id"],)).fetchall()
-                invalid_statuses = {row["status"] for row in calls} - {
-                    "planned", "running", "waiting_approval", "needs_review", "succeeded", "failed", "denied", "aborted"
-                }
-                if invalid_statuses:
-                    violations.append(f"{prefix}: invalid tool status {sorted(invalid_statuses)}")
-                if task["status"] == "aborted" and any(row["status"] in {"planned", "running"} for row in calls):
-                    violations.append(f"{prefix}: aborted task has executable tool call")
-                if task["status"] == "completed" and any(row["status"] in {"planned", "running"} for row in calls):
-                    violations.append(f"{prefix}: completed task has executable tool call")
-                call_statuses = {row["status"] for row in calls}
-                event_types = {
-                    row["type"] for row in conn.execute("SELECT type FROM events WHERE task_id = ?", (task["task_id"],))
-                }
-                if task["status"] == "completed" and "task_completed" not in event_types:
-                    violations.append(f"{prefix}: completed task missing task_completed event")
-                if task["status"] == "aborted" and "task_aborted" not in event_types:
-                    violations.append(f"{prefix}: aborted task missing task_aborted event")
-                if task["status"] in {"needs_review", "waiting_approval"}:
-                    expected_phase = task["status"]
-                    if checkpoint is None or checkpoint["phase"] != expected_phase:
-                        violations.append(f"{prefix}: {task['status']} task has incompatible checkpoint")
-                    checkpoint_saved = False
-                    if checkpoint is not None:
-                        for event in conn.execute(
-                            "SELECT payload_json FROM events WHERE task_id = ? AND type = 'checkpoint_saved'",
-                            (task["task_id"],),
-                        ):
-                            payload = _loads(event["payload_json"], {})
-                            if payload.get("checkpoint_id") == checkpoint["checkpoint_id"] and payload.get("phase") == expected_phase:
-                                checkpoint_saved = True
-                                break
-                    if not checkpoint_saved:
-                        violations.append(f"{prefix}: review checkpoint missing checkpoint_saved event")
-                    expected_event = "task_needs_review" if expected_phase == "needs_review" else "task_waiting_approval"
-                    matching_review_event = False
-                    for event in conn.execute(
-                        "SELECT payload_json FROM events WHERE task_id = ? AND type = ? ORDER BY event_id DESC",
-                        (task["task_id"], expected_event),
-                    ):
-                        payload = _loads(event["payload_json"], {})
-                        if checkpoint is not None and payload.get("checkpoint_id") == checkpoint["checkpoint_id"]:
-                            matching_review_event = True
-                            break
-                    if not matching_review_event:
-                        violations.append(f"{prefix}: missing {expected_event} transition event")
-                    if expected_phase == "needs_review":
-                        if not any(status == "needs_review" for status in call_statuses):
-                            violations.append(f"{prefix}: needs_review task has no needs_review tool call")
-                        if any(status in {"planned", "running", "waiting_approval"} for status in call_statuses):
-                            violations.append(f"{prefix}: needs_review task has executable tool call")
-                    elif "waiting_approval" not in call_statuses:
-                        violations.append(f"{prefix}: waiting_approval task has no waiting tool call")
-                    if any(status in {"planned", "running"} for status in call_statuses):
-                        violations.append(f"{prefix}: review task has executable tool call")
-                elif checkpoint is not None and checkpoint["phase"] in {"needs_review", "waiting_approval"}:
-                    checkpoint_saved = False
-                    for event in conn.execute(
-                        "SELECT payload_json FROM events WHERE task_id = ? AND type = 'checkpoint_saved'",
-                        (task["task_id"],),
-                    ):
-                        payload = _loads(event["payload_json"], {})
-                        if payload.get("checkpoint_id") == checkpoint["checkpoint_id"] and payload.get("phase") == checkpoint["phase"]:
-                            checkpoint_saved = True
-                            break
-                    if not checkpoint_saved:
-                        violations.append(f"{prefix}: review checkpoint missing checkpoint_saved event")
-                    resolved = False
-                    for event in conn.execute(
-                        "SELECT type, payload_json FROM events WHERE task_id = ? "
-                        "AND type IN ('permission_approved', 'permission_denied', 'review_resolved')",
-                        (task["task_id"],),
-                    ):
-                        payload = _loads(event["payload_json"], {})
-                        if payload.get("checkpoint_id") == checkpoint["checkpoint_id"]:
-                            resolved = True
-                            break
-                    if not resolved:
-                        violations.append(f"{prefix}: running task has unresolved review checkpoint")
-                for event in conn.execute(
-                    "SELECT payload_json FROM events WHERE task_id = ? AND type = 'checkpoint_saved'",
-                    (task["task_id"],),
-                ):
-                    payload = _loads(event["payload_json"], {})
-                    checkpoint_id = payload.get("checkpoint_id")
-                    if checkpoint_id is None or conn.execute(
-                        "SELECT 1 FROM checkpoints WHERE checkpoint_id = ? AND task_id = ?",
-                        (checkpoint_id, task["task_id"]),
-                    ).fetchone() is None:
-                        violations.append(f"{prefix}: checkpoint_saved points to missing checkpoint")
+            violations.extend(
+                _legacy_projection_violations(
+                    conn,
+                    task_id,
+                    allow_prepared_operations=True,
+                )
+            )
             leases = conn.execute("SELECT * FROM leases").fetchall()
             for lease in leases:
                 if not lease["owner_id"] or int(lease["fencing_token"]) < 1:
                     violations.append(f"lease {lease['repo_root']}: invalid owner or fencing token")
-            reservations = conn.execute("SELECT * FROM effect_reservations").fetchall()
-            valid_reservation_states = {"running", "completed", "unknown", "cancelled"}
-            for reservation in reservations:
-                if reservation["state"] not in valid_reservation_states:
-                    violations.append(f"reservation {reservation['reservation_id']}: invalid state")
-                if int(reservation["fencing_token"]) < 1 or not reservation["owner_id"]:
-                    violations.append(f"reservation {reservation['reservation_id']}: invalid owner or fencing token")
-                task = conn.execute("SELECT status, repo_root FROM tasks WHERE task_id = ?", (reservation["task_id"],)).fetchone()
-                if task is None:
-                    violations.append(f"reservation {reservation['reservation_id']}: missing task")
-                elif reservation["state"] in {"running", "unknown"} and task["status"] in {"completed", "failed", "aborted"}:
-                    violations.append(f"reservation {reservation['reservation_id']}: unresolved on terminal task")
-                elif reservation["state"] == "unknown" and task["status"] not in {"created", "running", "needs_review"}:
-                    violations.append(f"reservation {reservation['reservation_id']}: unknown on incompatible task")
-                tool = conn.execute(
-                    "SELECT status FROM tool_calls WHERE task_id = ? AND tool_use_id = ?",
-                    (reservation["task_id"], reservation["tool_use_id"]),
-                ).fetchone()
-                if tool is None:
-                    violations.append(f"reservation {reservation['reservation_id']}: missing tool call")
-                elif reservation["state"] == "completed" and tool["status"] != "succeeded":
-                    violations.append(f"reservation {reservation['reservation_id']}: completed without succeeded tool")
-                elif reservation["state"] == "running" and tool["status"] != "running":
-                    operation = conn.execute(
-                        "SELECT operation_id, state FROM operations WHERE operation_id = ?",
-                        (reservation["operation_id"],),
-                    ).fetchone() if reservation["operation_id"] is not None else None
-                    if operation is None or operation["state"] != "prepared" or tool["status"] != "planned":
-                        violations.append(f"reservation {reservation['reservation_id']}: running without running tool")
             operations = conn.execute(
                 "SELECT o.*, b.state AS outbox_state FROM operations o "
                 "LEFT JOIN operation_outbox b ON b.operation_id = o.operation_id"

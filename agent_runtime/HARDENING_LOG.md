@@ -41,6 +41,59 @@ Status values: `OPEN`, `FIXED`, `VERIFIED`, `DEFERRED`, `REOPENED`.
   local Runtime DB. Generic event-payload-at-rest redaction remains a v0.2
   hardening item and is not part of this merge-blocker fix.
 
+### PR #2 final blocker closure
+
+The preceding independent review recorded `REJECT FOR MERGE` for two remaining
+blockers. That historical result is retained; this section records the
+follow-up reproduction and fix.
+
+#### Legacy projection validation
+
+- Pre-fix reproduction at the PR head: six schema-valid v4 fixtures migrated
+  successfully and then produced immediate v5 invariant violations. The
+  fixtures were a completed task without a checkpoint, a failed task without a
+  checkpoint, an aborted task without a checkpoint, a `needs_review` task with
+  a succeeded tool, a `waiting_approval` task with a succeeded tool, and a
+  completed task with a planned tool.
+- Root cause: `_validate_legacy_rows()` checked only a subset of
+  reservation/tool relationships. It did not validate the task, checkpoint,
+  event, and review projection that `scan_invariants()` already enforced.
+- Fix: the shared `_legacy_projection_violations()` validator now covers task
+  status, task/checkpoint ownership and phase, terminal/review events,
+  checkpoint-saved pointers, executable terminal/review tools, orphan events,
+  tool statuses, and reservation/tool/task projections. Migration invokes it
+  before stale-running mutation, DDL, backfill, or schema-version update;
+  `scan_invariants()` uses the same validator with only the v5 prepared
+  operation exception.
+- After-fix evidence: all six fixtures reject twice; schema remains v4, the
+  complete SQLite snapshot is unchanged, no v5 tables/columns appear, and
+  `PRAGMA integrity_check` is `ok`. A legal completed+succeeded fixture
+  migrates to v5 and scans with zero violations. A mixed legal v4 projection
+  parity fixture also migrates and scans with zero violations.
+- Tests: migration targeted `33 passed`; migration fault/rollback subset
+  `6 passed`; the six adversarial cases are included in the targeted count.
+
+#### Windows fencing test determinism
+
+- Pre-fix CI reproduction: Windows Runtime run `31678898092` failed the two
+  fencing tests at `started.wait(2)` and `effect_started.wait(2)` while the
+  other Runtime tests passed (`2 failed, 173 passed`). Local repeated runs
+  showed the Runtime behavior was correct; the test depended on scheduler and
+  wall-clock lease timing.
+- Root cause: the tests used `sleep()` both to wait for the effect boundary and
+  to make the lease expire. Under Windows CI load the owner thread was not
+  guaranteed to reach the event before the fixed two-second wait.
+- Fix: tests now synchronize at Runtime fault hooks/events, inject lease expiry
+  directly in the disposable test database, release the blocked model/effect
+  through events, and assert the owner thread terminates. No Runtime fencing,
+  takeover, stale-write, or effect barrier semantics were changed.
+- After-fix evidence: the two-test fencing subset passed `20/20` repetitions
+  (`40 passed, 0 failed`); Runtime tests passed `180 passed, 2 skipped`.
+
+CI evidence for the post-fix commit will be appended after the PR branch is
+updated. P2 generic event-payload-at-rest redaction remains `DEFERRED` under
+the existing contract documented above.
+
 ## P0-1 — Bootstrap / initial checkpoint atomicity
 
 - First identified: adversarial review against the Phase 1 baseline.

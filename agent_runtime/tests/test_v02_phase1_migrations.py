@@ -40,6 +40,30 @@ def _v4_database(tmp_path: Path, states: tuple[str, ...] = ("completed", "unknow
         task_id = f"task-{index}"
         tool_use_id = f"tool-{index}"
         now = float(index + 1)
+        task_status = {
+            "completed": "completed",
+            "failed": "failed",
+            "unknown": "needs_review",
+            "cancelled": "aborted",
+            "running": "running",
+            "waiting": "waiting_approval",
+        }.get(state, "running")
+        tool_status = {
+            "completed": "succeeded",
+            "failed": "failed",
+            "unknown": "needs_review",
+            "cancelled": "aborted",
+            "running": "running",
+            "waiting": "waiting_approval",
+        }.get(state, "running")
+        checkpoint_phase = {
+            "completed": "completed",
+            "failed": "failed",
+            "unknown": "needs_review",
+            "cancelled": "aborted",
+            "running": "input_ready",
+            "waiting": "waiting_approval",
+        }.get(state, "input_ready")
         connection.execute(
             "INSERT INTO tasks(task_id, repo_root, prompt, model, status, created_at, updated_at) "
             "VALUES (?, ?, ?, ?, 'running', ?, ?)",
@@ -54,23 +78,84 @@ def _v4_database(tmp_path: Path, states: tuple[str, ...] = ("completed", "unknow
                 tool_use_id,
                 json.dumps(args, ensure_ascii=False, sort_keys=True),
                 _args_hash("write_file", args),
-                "succeeded" if state == "completed" else "running" if state == "running" else "needs_review",
+                tool_status,
                 "done" if state == "completed" else None,
                 1 if state == "completed" else 0,
             ),
         )
+        checkpoint = connection.execute(
+            "INSERT INTO checkpoints(task_id, phase, messages_json, cursor_json, created_at) "
+            "VALUES (?, ?, '[]', '{}', ?)",
+            (task_id, checkpoint_phase, now),
+        )
+        checkpoint_id = int(checkpoint.lastrowid)
         connection.execute(
-            "INSERT INTO effect_reservations(task_id, tool_use_id, owner_id, owner_pid, fencing_token, effect, "
-            "state, started_at, finished_at, details_json) VALUES (?, ?, 'legacy', 1, 1, 'file_write', ?, ?, ?, ?)",
+            "UPDATE tasks SET status = ?, checkpoint_id = ?, version = 1 WHERE task_id = ?",
+            (task_status, checkpoint_id, task_id),
+        )
+        connection.execute(
+            "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'task_created', ?, ?)",
+            (task_id, json.dumps({"prompt": "prompt"}, sort_keys=True), now),
+        )
+        if state == "completed":
+            connection.execute(
+                "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'task_completed', ?, ?)",
+                (task_id, json.dumps({"checkpoint_id": checkpoint_id}, sort_keys=True), now),
+            )
+        elif state == "cancelled":
+            connection.execute(
+                "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'task_aborted', ?, ?)",
+                (task_id, json.dumps({"checkpoint_id": checkpoint_id}, sort_keys=True), now),
+            )
+        elif state == "failed":
+            connection.execute(
+                "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'task_failed', ?, ?)",
+                (task_id, json.dumps({"checkpoint_id": checkpoint_id}, sort_keys=True), now),
+            )
+        elif state == "waiting":
+            connection.execute(
+                "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'task_waiting_approval', ?, ?)",
+                (
+                    task_id,
+                    json.dumps({"checkpoint_id": checkpoint_id, "tool_use_id": tool_use_id}, sort_keys=True),
+                    now,
+                ),
+            )
+        elif state == "unknown":
+            connection.execute(
+                "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'task_needs_review', ?, ?)",
+                (
+                    task_id,
+                    json.dumps({"checkpoint_id": checkpoint_id, "tool_use_id": tool_use_id}, sort_keys=True),
+                    now,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'tool_needs_review', ?, ?)",
+                (task_id, json.dumps({"tool_use_id": tool_use_id}, sort_keys=True), now),
+            )
+        connection.execute(
+            "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'checkpoint_saved', ?, ?)",
             (
                 task_id,
-                tool_use_id,
-                state,
+                json.dumps({"checkpoint_id": checkpoint_id, "phase": checkpoint_phase}, sort_keys=True),
                 now,
-                now + 0.1,
-                json.dumps({"legacy": True}),
             ),
         )
+        if state != "waiting":
+            reservation_state = "cancelled" if state == "failed" else state
+            connection.execute(
+                "INSERT INTO effect_reservations(task_id, tool_use_id, owner_id, owner_pid, fencing_token, effect, "
+                "state, started_at, finished_at, details_json) VALUES (?, ?, 'legacy', 1, 1, 'file_write', ?, ?, ?, ?)",
+                (
+                    task_id,
+                    tool_use_id,
+                    reservation_state,
+                    now,
+                    None if state == "running" else now + 0.1,
+                    json.dumps({"legacy": True}),
+                ),
+            )
     connection.commit()
     connection.close()
     return database
@@ -211,6 +296,7 @@ def test_completed_reservation_with_succeeded_tool_migrates(tmp_path: Path):
     assert store.get_tool_call("task-0", "tool-0")["status"] == "succeeded"
     assert store.get_effect_reservation("task-0", "tool-0")["state"] == "completed"
     assert store.list_operations()[0]["state"] == "committed"
+    assert store.scan_invariants() == []
 
 
 def test_invalid_legacy_rows_stay_v4_after_reopen_and_retry(tmp_path: Path):
@@ -229,6 +315,60 @@ def test_invalid_legacy_rows_stay_v4_after_reopen_and_retry(tmp_path: Path):
             assert connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'operations'"
             ).fetchone() is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "completed_task_missing_checkpoint",
+        "failed_task_missing_checkpoint",
+        "aborted_task_missing_checkpoint",
+        "needs_review_task_with_succeeded_tool",
+        "waiting_approval_task_with_succeeded_tool",
+        "completed_task_with_planned_tool",
+    ],
+)
+def test_all_legacy_task_projection_cases_fail_closed(tmp_path: Path, case: str):
+    states = {
+        "completed_task_missing_checkpoint": ("completed",),
+        "failed_task_missing_checkpoint": ("failed",),
+        "aborted_task_missing_checkpoint": ("cancelled",),
+        "needs_review_task_with_succeeded_tool": ("unknown",),
+        "waiting_approval_task_with_succeeded_tool": ("waiting",),
+        "completed_task_with_planned_tool": ("completed",),
+    }
+    database = _v4_database(tmp_path, states[case])
+    with sqlite3.connect(database) as connection:
+        if case.endswith("missing_checkpoint"):
+            connection.execute("UPDATE tasks SET checkpoint_id = NULL")
+        elif case == "needs_review_task_with_succeeded_tool":
+            connection.execute("UPDATE tool_calls SET status = 'succeeded', output = 'done'")
+        elif case == "waiting_approval_task_with_succeeded_tool":
+            connection.execute("UPDATE tool_calls SET status = 'succeeded', output = 'done'")
+        elif case == "completed_task_with_planned_tool":
+            connection.execute("UPDATE tool_calls SET status = 'planned', output = NULL")
+        connection.commit()
+    before = _database_snapshot(database)
+
+    for _ in range(2):
+        with pytest.raises(MigrationValidationError):
+            SchemaManager(database).migrate()
+        assert SchemaManager(database).inspect().current_version == 4
+        assert _database_snapshot(database) == before
+        with sqlite3.connect(database) as connection:
+            assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            assert connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'operations'"
+            ).fetchone() is None
+
+
+def test_legacy_projection_parity_has_no_post_migration_invariant_gap(tmp_path: Path):
+    database = _v4_database(tmp_path, ("completed", "failed", "cancelled", "unknown", "waiting", "running"))
+    report = SchemaManager(database).migrate()
+    assert report.ok
+    store = EventStore(database)
+    assert store.scan_invariants() == []
+    assert store.integrity_check() == []
 
 
 def test_active_lease_blocks_migration(tmp_path: Path):

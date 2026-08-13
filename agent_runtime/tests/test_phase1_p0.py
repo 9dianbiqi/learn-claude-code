@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -23,6 +24,15 @@ def _crash_at(expected: str):
             raise InjectedCrash(point)
 
     return inject
+
+
+def _expire_lease(runtime: Runtime) -> None:
+    """Inject lease expiry without making a test depend on wall-clock sleep."""
+    with sqlite3.connect(runtime.store.path) as connection:
+        connection.execute(
+            "UPDATE leases SET expires_at = 0 WHERE repo_root = ?",
+            (str(runtime.repo_root),),
+        )
 
 
 @pytest.mark.parametrize(
@@ -161,6 +171,7 @@ def test_aborted_tool_call_cannot_enter_execute_path(tmp_path: Path):
 
 def test_fencing_rejects_stale_owner_writes_and_tool_execution(tmp_path: Path):
     started = threading.Event()
+    release_model = threading.Event()
 
     class SlowModel:
         name = "slow"
@@ -168,22 +179,33 @@ def test_fencing_rejects_stale_owner_writes_and_tool_execution(tmp_path: Path):
 
         def complete(self, messages, tools):
             started.set()
-            time.sleep(0.35)
+            release_model.wait(10)
             return ModelResponse(text="old-owner")
 
     first = Runtime(tmp_path, SlowModel(), owner_id="owner-a", lease_ttl=0.1)
+    task_id = "task-stale-model-owner"
+    messages = [{"role": "user", "content": "first"}]
+    first.store.bootstrap_task(
+        task_id,
+        str(first.repo_root),
+        "first",
+        first.model_name,
+        messages,
+        {"turn": 0},
+    )
+    first._acquire(task_id)
     first_result: dict[str, object] = {}
 
     def run_first():
         try:
-            first_result["result"] = first.run("first")
+            first_result["result"] = first._run_task(task_id, messages, turn=0, lease_acquired=True)
         except Exception as exc:  # noqa: BLE001 - assertion covers stale-owner failure
             first_result["error"] = exc
 
     thread = threading.Thread(target=run_first)
     thread.start()
-    assert started.wait(2)
-    time.sleep(0.15)
+    assert started.wait(10)
+    _expire_lease(first)
 
     second = Runtime(
         tmp_path,
@@ -191,27 +213,48 @@ def test_fencing_rejects_stale_owner_writes_and_tool_execution(tmp_path: Path):
         owner_id="owner-b",
         lease_ttl=0.5,
     )
-    second_result = second.run("second")
-    thread.join(timeout=3)
+    try:
+        second_result = second.run("second")
+    finally:
+        release_model.set()
+    thread.join(timeout=10)
 
     assert second_result.status == "completed"
+    assert not thread.is_alive()
     assert isinstance(first_result.get("error"), LeaseLost)
 
 
 def test_stale_owner_is_fenced_around_tool_effect(tmp_path: Path):
     (tmp_path / "note.txt").write_text("safe", encoding="utf-8")
     effect_started = threading.Event()
+    release_effect = threading.Event()
+
+    def mark_effect_boundary(point: str, **_: object) -> None:
+        if point == "after_tool_started":
+            effect_started.set()
+
     first = Runtime(
         tmp_path,
         ScriptedModel([ModelResponse(tool_calls=[ToolCall("slow-read", "read_file", {"path": "note.txt"})])]),
         owner_id="owner-a",
         lease_ttl=0.5,
+        fault_injector=mark_effect_boundary,
     )
+    task_id = "task-stale-effect-owner"
+    messages = [{"role": "user", "content": "slow read"}]
+    first.store.bootstrap_task(
+        task_id,
+        str(first.repo_root),
+        "slow read",
+        first.model_name,
+        messages,
+        {"turn": 0},
+    )
+    first._acquire(task_id)
     original_execute = first.tools.execute
 
     def slow_execute(name: str, args: dict):
-        effect_started.set()
-        time.sleep(0.8)
+        release_effect.wait(10)
         return original_execute(name, args)
 
     first.tools.execute = slow_execute
@@ -219,15 +262,14 @@ def test_stale_owner_is_fenced_around_tool_effect(tmp_path: Path):
 
     def run_first():
         try:
-            first_result["result"] = first.run("slow read")
+            first_result["result"] = first._run_task(task_id, messages, turn=0, lease_acquired=True)
         except Exception as exc:  # noqa: BLE001 - assertion covers stale-owner failure
             first_result["error"] = exc
 
     thread = threading.Thread(target=run_first)
     thread.start()
-    assert effect_started.wait(2)
-    task_id = first.store.list_tasks()[0]["task_id"]
-    time.sleep(0.6)
+    assert effect_started.wait(10)
+    _expire_lease(first)
 
     second = Runtime(
         tmp_path,
@@ -235,9 +277,13 @@ def test_stale_owner_is_fenced_around_tool_effect(tmp_path: Path):
         owner_id="owner-b",
         lease_ttl=0.5,
     )
-    assert second.run("take over").status == "completed"
-    thread.join(timeout=3)
+    try:
+        assert second.run("take over").status == "completed"
+    finally:
+        release_effect.set()
+    thread.join(timeout=10)
 
+    assert not thread.is_alive()
     assert isinstance(first_result.get("error"), LeaseLost)
     assert first.store.get_tool_call(task_id, "slow-read")["status"] == "running"
 
