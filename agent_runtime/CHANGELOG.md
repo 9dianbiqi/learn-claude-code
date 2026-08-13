@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.2.0.dev1 - Phase 1 Effect Ledger
+
+- Added explicit, checksum-verified SQLite SchemaManager migrations.
+- Added direct fresh v5 schema creation and audited v4-to-v5 backfill.
+- Added SQLite backup, integrity, lease preflight, dry-run, rollback, and
+  migration fault-injection boundaries.
+- Added EffectSemantics, operations, operation_outbox, CAS/fencing transitions,
+  reconciliation evidence, and operation trace metrics.
+- Integrated file and Shell effects with prepared/dispatched/committed/unknown
+  recovery semantics.
+- Follow-up hardening moved the dispatched boundary to immediately before tool
+  execution, preserving prepared operations for pre-dispatch failures.
+- Added db-migrate, schema-aware db-check, operation inspection, and Phase 1
+  migration/ledger regression tests, including subprocess and transaction
+  rollback fault matrices plus trace/event redaction coverage.
+- Phase 1 does not provide OS sandboxing or generic exactly-once Shell
+  execution.
+
 ## v0.1.1 — operator safety and usability
 
 - Added hard default protection for `.env*`, `.git/**`, private-key formats,

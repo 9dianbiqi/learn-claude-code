@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import re
 import sqlite3
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from .effects import EffectSemantics, OperationSpec, ReconcileEvidence, sha256_json
+from .migrations import SCHEMA_VERSION, SchemaManager, _legacy_projection_violations
 
-SCHEMA_VERSION = 4
+
 MAX_CHECKPOINT_BYTES = 4 * 1024 * 1024
 MAX_MODEL_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_EVENT_PAYLOAD_BYTES = 1 * 1024 * 1024
@@ -34,6 +38,19 @@ def _loads(value: str | None, default: Any = None) -> Any:
     if value is None:
         return default
     return json.loads(value)
+
+
+_SENSITIVE_REASON = re.compile(
+    r"(?i)(token|secret|password|passwd|api[_-]?key|authorization|cookie)\s*[=:]\s*"
+    r"(?:(?:bearer|basic)\s+)?[^\s,;]+"
+)
+
+
+def _safe_reason(value: str) -> str:
+    return _SENSITIVE_REASON.sub(
+        lambda match: f"{match.group(1)}=[REDACTED]",
+        str(value)[:256],
+    )
 
 
 class LeaseLost(RuntimeError):
@@ -99,167 +116,10 @@ class EventStore:
             conn.close()
 
     def _initialize(self) -> None:
-        with self.transaction() as conn:
-            migration_table = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
-            ).fetchone()
-            if migration_table is not None:
-                current = conn.execute("SELECT MAX(version) AS version FROM schema_migrations").fetchone()["version"]
-                if current is not None and int(current) > SCHEMA_VERSION:
-                    raise RuntimeError(f"Unsupported runtime schema version: {current}")
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS schema_migrations (
-                    version INTEGER PRIMARY KEY,
-                    applied_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS tasks (
-                    task_id TEXT PRIMARY KEY,
-                    repo_root TEXT NOT NULL,
-                    prompt TEXT NOT NULL,
-                    model TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    checkpoint_id INTEGER,
-                    last_error TEXT,
-                    version INTEGER NOT NULL DEFAULT 0,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS checkpoints (
-                    checkpoint_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id TEXT NOT NULL REFERENCES tasks(task_id),
-                    phase TEXT NOT NULL,
-                    messages_json TEXT NOT NULL,
-                    cursor_json TEXT NOT NULL,
-                    created_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS model_calls (
-                    model_call_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id TEXT NOT NULL REFERENCES tasks(task_id),
-                    turn INTEGER NOT NULL,
-                    status TEXT NOT NULL,
-                    request_json TEXT NOT NULL,
-                    response_json TEXT,
-                    stop_reason TEXT,
-                    input_tokens INTEGER,
-                    output_tokens INTEGER,
-                    started_at REAL NOT NULL,
-                    finished_at REAL,
-                    error TEXT
-                );
-                CREATE TABLE IF NOT EXISTS tool_calls (
-                    tool_call_row_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id TEXT NOT NULL REFERENCES tasks(task_id),
-                    tool_use_id TEXT NOT NULL,
-                    turn INTEGER NOT NULL,
-                    name TEXT NOT NULL,
-                    args_json TEXT NOT NULL,
-                    args_hash TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    permission TEXT,
-                    permission_rule TEXT,
-                    permission_reason TEXT,
-                    effect TEXT,
-                    before_state_json TEXT,
-                    expected_after_json TEXT,
-                    output TEXT,
-                    error TEXT,
-                    returncode INTEGER,
-                    stdout TEXT,
-                    stderr TEXT,
-                    timed_out INTEGER NOT NULL DEFAULT 0,
-                    execution_status TEXT,
-                    execution_attempts INTEGER NOT NULL DEFAULT 0,
-                    effect_attempts INTEGER NOT NULL DEFAULT 0,
-                    effect_confirmed INTEGER NOT NULL DEFAULT 0,
-                    effect_confirmation TEXT,
-                    effect_key TEXT,
-                    version INTEGER NOT NULL DEFAULT 0,
-                    started_at REAL,
-                    finished_at REAL,
-                    UNIQUE(task_id, tool_use_id)
-                );
-                CREATE TABLE IF NOT EXISTS file_observations (
-                    observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id TEXT NOT NULL REFERENCES tasks(task_id),
-                    path TEXT NOT NULL,
-                    exists_now INTEGER NOT NULL,
-                    sha256 TEXT,
-                    identity_json TEXT,
-                    observed_at REAL NOT NULL,
-                    source_tool_use_id TEXT,
-                    UNIQUE(task_id, path)
-                );
-                CREATE TABLE IF NOT EXISTS events (
-                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id TEXT NOT NULL REFERENCES tasks(task_id),
-                    type TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS leases (
-                    repo_root TEXT PRIMARY KEY,
-                    task_id TEXT NOT NULL REFERENCES tasks(task_id),
-                    owner_id TEXT NOT NULL,
-                    heartbeat_at REAL NOT NULL,
-                    expires_at REAL NOT NULL,
-                    fencing_token INTEGER NOT NULL DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS effect_reservations (
-                    reservation_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    task_id TEXT NOT NULL REFERENCES tasks(task_id),
-                    tool_use_id TEXT NOT NULL,
-                    owner_id TEXT NOT NULL,
-                    owner_pid INTEGER NOT NULL,
-                    fencing_token INTEGER NOT NULL,
-                    effect TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    started_at REAL NOT NULL,
-                    deadline_at REAL,
-                    finished_at REAL,
-                    details_json TEXT,
-                    CHECK (state IN ('running', 'completed', 'unknown', 'cancelled'))
-                );
-                CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id, event_id);
-                CREATE INDEX IF NOT EXISTS idx_checkpoints_task ON checkpoints(task_id, checkpoint_id);
-                CREATE INDEX IF NOT EXISTS idx_model_calls_task ON model_calls(task_id, model_call_id);
-                CREATE INDEX IF NOT EXISTS idx_tool_calls_task ON tool_calls(task_id, tool_call_row_id);
-                CREATE INDEX IF NOT EXISTS idx_effect_reservations_task_tool
-                    ON effect_reservations(task_id, tool_use_id, reservation_id);
-                CREATE INDEX IF NOT EXISTS idx_effect_reservations_state
-                    ON effect_reservations(state, task_id);
-                CREATE UNIQUE INDEX IF NOT EXISTS uq_effect_reservation_running
-                    ON effect_reservations(task_id, tool_use_id) WHERE state = 'running';
-                """
-            )
-            def ensure_column(table: str, column: str, definition: str) -> None:
-                columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-                if column not in columns:
-                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
-            ensure_column("tasks", "version", "INTEGER NOT NULL DEFAULT 0")
-            lease_columns = {row["name"] for row in conn.execute("PRAGMA table_info(leases)").fetchall()}
-            if "fencing_token" not in lease_columns:
-                conn.execute("ALTER TABLE leases ADD COLUMN fencing_token INTEGER NOT NULL DEFAULT 0")
-            for column, definition in (
-                ("returncode", "INTEGER"),
-                ("stdout", "TEXT"),
-                ("stderr", "TEXT"),
-                ("timed_out", "INTEGER NOT NULL DEFAULT 0"),
-                ("execution_status", "TEXT"),
-                ("execution_attempts", "INTEGER NOT NULL DEFAULT 0"),
-                ("effect_attempts", "INTEGER NOT NULL DEFAULT 0"),
-                ("effect_confirmed", "INTEGER NOT NULL DEFAULT 0"),
-                ("effect_confirmation", "TEXT"),
-                ("effect_key", "TEXT"),
-                ("version", "INTEGER NOT NULL DEFAULT 0"),
-            ):
-                ensure_column("tool_calls", column, definition)
-            ensure_column("file_observations", "identity_json", "TEXT")
-            conn.execute(
-                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                (SCHEMA_VERSION, _now()),
-            )
+        # Normal Runtime startup is intentionally not a migration command.
+        # Fresh databases are created directly at the latest schema; an old
+        # database raises SchemaUpgradeRequired and must go through db-migrate.
+        SchemaManager(self.path).ensure_latest()
 
     def _assert_lease_conn(self, conn: sqlite3.Connection) -> None:
         if self._lease_context is None:
@@ -475,13 +335,18 @@ class EventStore:
         messages_json = _checked_json(messages, MAX_CHECKPOINT_BYTES, "checkpoint messages")
         cursor_json = _checked_json(cursor, MAX_CHECKPOINT_BYTES, "checkpoint cursor")
         metadata = dict(unknown_effect or {})
-        metadata["reason"] = reason
+        safe_reason = _safe_reason(reason)
+        metadata["reason"] = safe_reason
         with self.transaction() as conn:
             task = conn.execute(
                 "SELECT status, version FROM tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
             call = conn.execute(
                 "SELECT status, version FROM tool_calls WHERE task_id = ? AND tool_use_id = ?",
+                (task_id, tool_use_id),
+            ).fetchone()
+            operation = conn.execute(
+                "SELECT operation_id, state FROM operations WHERE task_id = ? AND tool_use_id = ?",
                 (task_id, tool_use_id),
             ).fetchone()
             if task is None or call is None:
@@ -504,7 +369,7 @@ class EventStore:
                     "UPDATE tool_calls SET status = 'needs_review', error = ?, finished_at = ?, "
                     "execution_status = CASE WHEN execution_status = 'running' THEN 'unknown' ELSE execution_status END, "
                     "version = version + 1 WHERE task_id = ? AND tool_use_id = ?",
-                    (reason, now, task_id, tool_use_id),
+                    (safe_reason, now, task_id, tool_use_id),
                 )
             else:
                 call_updated = conn.execute(
@@ -515,20 +380,57 @@ class EventStore:
             if call_updated.rowcount != 1:
                 raise StaleState(f"Tool call changed during review transition: {tool_use_id}")
             if phase == "needs_review":
-                conn.execute(
-                    "UPDATE effect_reservations SET state = 'unknown', finished_at = ?, details_json = ? "
-                    "WHERE task_id = ? AND tool_use_id = ? AND state = 'running'",
-                    (
-                        now,
-                        _json({"reason": "review_requires_reconciliation", "tool_use_id": tool_use_id}),
+                if operation is not None and operation["state"] == "prepared":
+                    # No external effect can have happened before dispatch.
+                    # Keep the operation prepared, release the claimed outbox,
+                    # and cancel only the local reservation so review can
+                    # safely retry the same durable intent later.
+                    pre_dispatch_evidence = {
+                        "outcome": "not_happened",
+                        "phase": "pre_dispatch",
+                        "reason": safe_reason,
+                    }
+                    updated_operation = conn.execute(
+                        "UPDATE operations SET probe_evidence_json = ?, updated_at = ?, version = version + 1 "
+                        "WHERE operation_id = ? AND state = 'prepared'",
+                        (_json(pre_dispatch_evidence), now, operation["operation_id"]),
+                    )
+                    if updated_operation.rowcount != 1:
+                        raise StaleState(f"Operation changed during pre-dispatch review: {operation['operation_id']}")
+                    conn.execute(
+                        "UPDATE operation_outbox SET state = 'pending', claimed_by = NULL, claimed_until = NULL, "
+                        "last_error = ?, updated_at = ? WHERE operation_id = ?",
+                        (safe_reason, now, operation["operation_id"]),
+                    )
+                    conn.execute(
+                        "UPDATE effect_reservations SET state = 'cancelled', finished_at = ?, details_json = ? "
+                        "WHERE operation_id = ? AND state = 'running'",
+                        (now, _json(pre_dispatch_evidence), operation["operation_id"]),
+                    )
+                    current_operation = self._operation_row_conn(conn, str(operation["operation_id"]))
+                    self._append_operation_event_conn(
+                        conn,
                         task_id,
-                        tool_use_id,
-                    ),
-                )
+                        "operation_pre_dispatch_blocked",
+                        current_operation,
+                        "prepared",
+                        safe_reason,
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE effect_reservations SET state = 'unknown', finished_at = ?, details_json = ? "
+                        "WHERE task_id = ? AND tool_use_id = ? AND state = 'running'",
+                        (
+                            now,
+                            _json({"reason": "review_requires_reconciliation", "tool_use_id": tool_use_id}),
+                            task_id,
+                            tool_use_id,
+                        ),
+                    )
             task_updated = conn.execute(
                 "UPDATE tasks SET status = ?, checkpoint_id = ?, last_error = ?, updated_at = ?, "
                 "version = version + 1 WHERE task_id = ?",
-                (phase, checkpoint_id, reason, now, task_id),
+                (phase, checkpoint_id, safe_reason, now, task_id),
             )
             if task_updated.rowcount != 1:
                 raise StaleState(f"Task changed during review transition: {task_id}")
@@ -723,7 +625,7 @@ class EventStore:
             if task is None or call is None:
                 raise KeyError(f"Review item not found: {tool_use_id}")
             reservation = conn.execute(
-                "SELECT reservation_id, state FROM effect_reservations "
+                "SELECT reservation_id, operation_id, state FROM effect_reservations "
                 "WHERE task_id = ? AND tool_use_id = ? ORDER BY reservation_id DESC LIMIT 1",
                 (task_id, tool_use_id),
             ).fetchone()
@@ -866,6 +768,40 @@ class EventStore:
                     ),
                 )
                 reservation_state = "cancelled"
+            operation = conn.execute(
+                "SELECT * FROM operations WHERE task_id = ? AND tool_use_id = ?",
+                (task_id, tool_use_id),
+            ).fetchone()
+            if operation is not None and operation["state"] in {"prepared", "dispatched", "unknown"}:
+                operation_updated = conn.execute(
+                    "UPDATE operations SET state = 'cancelled', completed_at = ?, updated_at = ?, version = version + 1 "
+                    "WHERE operation_id = ? AND state = ? AND version = ?",
+                    (now, now, operation["operation_id"], operation["state"], int(operation["version"])),
+                )
+                if operation_updated.rowcount != 1:
+                    raise StaleState(f"Operation changed before abort: {operation['operation_id']}")
+                conn.execute(
+                    "UPDATE operation_outbox SET state = 'cancelled', claimed_by = NULL, claimed_until = NULL, "
+                    "last_error = ?, updated_at = ? WHERE operation_id = ?",
+                    (_safe_reason(reason), now, operation["operation_id"]),
+                )
+                conn.execute(
+                    "UPDATE effect_reservations SET state = 'cancelled', finished_at = ?, details_json = ? "
+                    "WHERE operation_id = ? AND state IN ('running', 'unknown')",
+                    (now, _json({"reason": "manual_abort", "operation_id": operation["operation_id"]}), operation["operation_id"]),
+                )
+                current_operation = conn.execute(
+                    "SELECT * FROM operations WHERE operation_id = ?", (operation["operation_id"],)
+                ).fetchone()
+                if current_operation is not None:
+                    self._append_operation_event_conn(
+                        conn,
+                        task_id,
+                        "operation_reconciled",
+                        current_operation,
+                        "cancelled",
+                        "operator aborted operation",
+                    )
             updated = conn.execute(
                 "UPDATE tool_calls SET status = 'aborted', output = ?, error = ?, finished_at = ?, version = version + 1 "
                 "WHERE task_id = ? AND tool_use_id = ? AND status = 'needs_review'"
@@ -1067,7 +1003,7 @@ class EventStore:
             "status", "permission", "permission_rule", "permission_reason", "effect",
             "before_state", "expected_after", "output", "error", "started_at", "finished_at",
             "returncode", "stdout", "stderr", "timed_out", "execution_status",
-            "effect_confirmed", "effect_confirmation",
+            "effect_confirmed", "effect_confirmation", "operation_id",
         }
         expected_version = fields.pop("expected_version", None)
         unknown = set(fields) - allowed
@@ -1214,7 +1150,9 @@ class EventStore:
         query = (
             "SELECT r.* FROM effect_reservations r "
             "JOIN tasks t ON t.task_id = r.task_id "
-            "WHERE t.repo_root = ? AND r.state IN ('running', 'unknown')"
+            "LEFT JOIN operations o ON o.operation_id = r.operation_id "
+            "WHERE t.repo_root = ? AND r.state IN ('running', 'unknown') "
+            "AND (o.operation_id IS NULL OR o.state IN ('dispatched', 'unknown'))"
         )
         params: list[Any] = [repo_root]
         if task_id is not None:
@@ -1278,12 +1216,17 @@ class EventStore:
         details_json = _checked_json(details or {}, MAX_EVENT_PAYLOAD_BYTES, "reservation details")
         with self.transaction() as conn:
             reservation = conn.execute(
-                "SELECT task_id, tool_use_id, owner_id, fencing_token, state FROM effect_reservations "
+                "SELECT task_id, tool_use_id, operation_id, owner_id, fencing_token, state FROM effect_reservations "
                 "WHERE reservation_id = ?",
                 (int(reservation_id),),
             ).fetchone()
             if reservation is None or reservation["task_id"] != task_id or reservation["tool_use_id"] != tool_use_id:
                 raise StaleState(f"Effect reservation is missing: {reservation_id}")
+            if reservation["state"] == "completed" and reservation["operation_id"] is not None:
+                # v0.2's operation commit is authoritative. This no-op
+                # compatibility projection lets v0.1.1 instrumentation call
+                # complete_effect without reopening a committed reservation.
+                return
             if reservation["state"] != "running" and not (allow_unknown and reservation["state"] == "unknown"):
                 raise StaleState(f"Effect reservation is no longer running: {reservation_id}")
             if self._lease_context is None:
@@ -1346,6 +1289,1018 @@ class EventStore:
                 ),
             )
 
+    @staticmethod
+    def _decode_operation(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        item = dict(row)
+        for column, target, default in (
+            ("request_json", "request", {}),
+            ("result_json", "result", None),
+            ("probe_evidence_json", "probe_evidence", None),
+        ):
+            if column in item:
+                item[target] = _loads(item.pop(column), default)
+        return item
+
+    @staticmethod
+    def _operation_event_payload(operation: sqlite3.Row | dict[str, Any], state: str,
+                                 reason: str | None = None) -> dict[str, Any]:
+        item = dict(operation)
+        payload: dict[str, Any] = {
+            "operation_id": item.get("operation_id"),
+            "tool_use_id": item.get("tool_use_id"),
+            "semantics": item.get("semantics"),
+            "adapter": item.get("adapter"),
+            "attempt": int(item.get("attempt_count") or 0),
+            "state": state,
+        }
+        if reason:
+            # Events are an audit index, not a result channel. Keep only a
+            # bounded reason and never copy request/output/evidence fields.
+            payload["reason"] = _safe_reason(reason)
+        return payload
+
+    def _append_operation_event_conn(
+        self,
+        conn: sqlite3.Connection,
+        task_id: str,
+        event_type: str,
+        operation: sqlite3.Row | dict[str, Any],
+        state: str,
+        reason: str | None = None,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+            (
+                task_id,
+                event_type,
+                _checked_json(
+                    self._operation_event_payload(operation, state, reason),
+                    MAX_EVENT_PAYLOAD_BYTES,
+                    "event payload",
+                ),
+                _now(),
+            ),
+        )
+
+    def _operation_lease_conn(self, conn: sqlite3.Connection, task_id: str) -> tuple[str, int]:
+        if self._lease_context is None:
+            raise LeaseLost("Operation transition requires a bound lease")
+        self._assert_lease_conn(conn)
+        repo_root, owner_id, fencing_token = self._lease_context
+        task = conn.execute("SELECT repo_root FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+        if task is None or str(task["repo_root"]) != repo_root:
+            raise LeaseLost("Operation repository does not match the bound lease")
+        return owner_id, int(fencing_token)
+
+    def _operation_row_conn(self, conn: sqlite3.Connection, operation_id: str) -> sqlite3.Row:
+        row = conn.execute(
+            "SELECT * FROM operations WHERE operation_id = ?", (operation_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Operation not found: {operation_id}")
+        return row
+
+    def get_operation(self, operation_id: str) -> dict[str, Any] | None:
+        return self._decode_operation(
+            self._fetchone("SELECT * FROM operations WHERE operation_id = ?", (operation_id,))
+        )
+
+    def get_operation_by_dedupe_key(self, dedupe_key: str) -> dict[str, Any] | None:
+        return self._decode_operation(
+            self._fetchone("SELECT * FROM operations WHERE dedupe_key = ?", (dedupe_key,))
+        )
+
+    def get_operation_for_tool_call(self, task_id: str, tool_use_id: str) -> dict[str, Any] | None:
+        return self._decode_operation(
+            self._fetchone(
+                """
+                SELECT o.* FROM operations o
+                WHERE o.task_id = ? AND o.tool_use_id = ?
+                """,
+                (task_id, tool_use_id),
+            )
+        )
+
+    def list_operations(self, task_id: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT o.*, b.state AS outbox_state, b.available_at, b.claimed_by, b.claimed_until, b.delivery_attempts, b.last_error FROM operations o LEFT JOIN operation_outbox b ON b.operation_id = o.operation_id"
+        params: tuple[Any, ...] = ()
+        if task_id is not None:
+            query += " WHERE o.task_id = ?"
+            params = (task_id,)
+        query += " ORDER BY o.created_at, o.operation_id"
+        return [self._decode_operation(row) for row in self._fetchall(query, params)]  # type: ignore[list-item]
+
+    def list_pending_operations(self, task_id: str | None = None) -> list[dict[str, Any]]:
+        query = (
+            "SELECT o.*, b.state AS outbox_state, b.available_at, b.claimed_by, "
+            "b.claimed_until, b.delivery_attempts, b.last_error "
+            "FROM operations o JOIN operation_outbox b ON b.operation_id = o.operation_id "
+            "WHERE (o.state IN ('prepared', 'dispatched', 'unknown') "
+            "OR b.state IN ('pending', 'claimed', 'blocked'))"
+        )
+        params: list[Any] = []
+        if task_id is not None:
+            query += " AND o.task_id = ?"
+            params.append(task_id)
+        query += " ORDER BY o.updated_at, o.operation_id"
+        return [self._decode_operation(row) for row in self._fetchall(query, tuple(params))]  # type: ignore[list-item]
+
+    @staticmethod
+    def _operation_effect(spec: OperationSpec) -> str:
+        if spec.adapter == "file":
+            return "file_write"
+        if spec.semantics == EffectSemantics.IDEMPOTENT:
+            return "idempotent"
+        return "unknown_write"
+
+    def prepare_operation(
+        self,
+        spec: OperationSpec | None = None,
+        *,
+        owner_pid: int | None = None,
+        deadline_at: float | None = None,
+        **fields: Any,
+    ) -> dict[str, Any]:
+        """Atomically prepare an effect, its outbox row, reservation, and audit event."""
+        if spec is None:
+            try:
+                raw_semantics = fields.pop("semantics")
+                spec = OperationSpec(
+                    task_id=str(fields.pop("task_id")),
+                    tool_use_id=str(fields.pop("tool_use_id")),
+                    adapter=str(fields.pop("adapter")),
+                    semantics=raw_semantics if isinstance(raw_semantics, EffectSemantics)
+                    else EffectSemantics(str(raw_semantics)),
+                    effect_scope=str(fields.pop("effect_scope")),
+                    dedupe_key=str(fields.pop("dedupe_key")),
+                    idempotency_key=fields.pop("idempotency_key", None),
+                    args_hash=str(fields.pop("args_hash")),
+                    request=dict(fields.pop("request")),
+                )
+            except KeyError as exc:
+                raise TypeError(f"missing OperationSpec field: {exc.args[0]}") from exc
+        if fields:
+            raise TypeError(f"unknown prepare_operation fields: {sorted(fields)}")
+        if not isinstance(spec.semantics, EffectSemantics):
+            spec = OperationSpec(
+                spec.task_id,
+                spec.tool_use_id,
+                spec.adapter,
+                EffectSemantics(str(spec.semantics)),
+                spec.effect_scope,
+                spec.dedupe_key,
+                spec.idempotency_key,
+                spec.args_hash,
+                spec.request,
+            )
+        if spec.semantics == EffectSemantics.REPLAY_SAFE:
+            raise ValueError("read-only effects do not create operations")
+        if not spec.dedupe_key or not spec.args_hash or not spec.adapter:
+            raise ValueError("operation dedupe_key, args_hash, and adapter are required")
+        request_json = _checked_json(spec.request, MAX_CHECKPOINT_BYTES, "operation request")
+        now = _now()
+        operation_id = "op_" + hashlib.sha256(
+            f"{spec.task_id}\0{spec.tool_use_id}".encode("utf-8")
+        ).hexdigest()[:48]
+        if spec.idempotency_key is not None:
+            conflict = self._fetchone(
+                "SELECT * FROM operations WHERE effect_scope = ? AND idempotency_key = ?",
+                (spec.effect_scope, spec.idempotency_key),
+            )
+            if conflict is not None and str(conflict["dedupe_key"]) != spec.dedupe_key:
+                with self.transaction() as audit_conn:
+                    self._operation_lease_conn(audit_conn, spec.task_id)
+                    requested = {
+                        "operation_id": operation_id,
+                        "tool_use_id": spec.tool_use_id,
+                        "semantics": spec.semantics.value,
+                        "adapter": spec.adapter,
+                        "attempt_count": 0,
+                    }
+                    self._append_operation_event_conn(
+                        audit_conn,
+                        spec.task_id,
+                        "operation_idempotency_conflict",
+                        requested,
+                        "prepared",
+                        f"idempotency key is already bound to operation {conflict['operation_id']}",
+                    )
+                raise StaleState(
+                    f"Idempotency key already exists in effect scope: {spec.effect_scope}"
+                )
+        with self.transaction() as conn:
+            owner_id, fencing_token = self._operation_lease_conn(conn, spec.task_id)
+            existing = conn.execute(
+                "SELECT * FROM operations WHERE dedupe_key = ?", (spec.dedupe_key,)
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["task_id"]) != spec.task_id
+                    or str(existing["tool_use_id"]) != spec.tool_use_id
+                    or str(existing["args_hash"]) != spec.args_hash
+                    or str(existing["adapter"]) != spec.adapter
+                    or str(existing["semantics"]) != spec.semantics.value
+                ):
+                    raise StaleState(f"Operation dedupe key conflicts: {spec.dedupe_key}")
+                if existing["state"] == "committed":
+                    self._append_operation_event_conn(
+                        conn,
+                        spec.task_id,
+                        "operation_deduplicated",
+                        existing,
+                        "committed",
+                        "committed operation already has a durable result",
+                    )
+                return self._decode_operation(existing)  # type: ignore[return-value]
+
+            call = conn.execute(
+                "SELECT * FROM tool_calls WHERE task_id = ? AND tool_use_id = ?",
+                (spec.task_id, spec.tool_use_id),
+            ).fetchone()
+            if call is None:
+                raise InvariantViolation(f"Missing tool call for operation: {spec.tool_use_id}")
+            if str(call["args_hash"]) != spec.args_hash:
+                raise StaleState(f"Tool call args hash changed: {spec.tool_use_id}")
+            if call["operation_id"] is not None and str(call["operation_id"]) != operation_id:
+                raise StaleState(f"Tool call is bound to another operation: {spec.tool_use_id}")
+            task = conn.execute(
+                "SELECT repo_root, status FROM tasks WHERE task_id = ?", (spec.task_id,)
+            ).fetchone()
+            if task is None:
+                raise KeyError(f"Task not found: {spec.task_id}")
+            if task["status"] in {"completed", "failed", "aborted"}:
+                raise StaleState(f"Task is terminal: {spec.task_id}")
+
+            blocking = conn.execute(
+                """
+                SELECT r.* FROM effect_reservations r
+                JOIN tasks t ON t.task_id = r.task_id
+                LEFT JOIN operations o ON o.operation_id = r.operation_id
+                WHERE t.repo_root = ? AND r.state IN ('running', 'unknown')
+                  AND (o.operation_id IS NULL OR o.state IN ('dispatched', 'unknown'))
+                ORDER BY r.reservation_id
+                """,
+                (str(task["repo_root"]),),
+            ).fetchall()
+            if blocking:
+                raise EffectBlocked(str(task["repo_root"]), [
+                    self._decode_reservation(row) for row in blocking  # type: ignore[list-item]
+                ])
+
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO operations(
+                        operation_id, task_id, tool_use_id, adapter, semantics,
+                        effect_scope, dedupe_key, idempotency_key, args_hash,
+                        state, request_json, attempt_count, version, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, 0, 0, ?, ?)
+                    """,
+                    (
+                        operation_id,
+                        spec.task_id,
+                        spec.tool_use_id,
+                        spec.adapter,
+                        spec.semantics.value,
+                        spec.effect_scope,
+                        spec.dedupe_key,
+                        spec.idempotency_key,
+                        spec.args_hash,
+                        request_json,
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                if spec.idempotency_key is not None or "idempotency" in str(exc).lower():
+                    raise StaleState(
+                        f"Idempotency key already exists in effect scope: {spec.effect_scope}"
+                    ) from exc
+                raise StaleState(f"Operation already exists for tool call: {spec.tool_use_id}") from exc
+            conn.execute(
+                """
+                INSERT INTO operation_outbox(
+                    operation_id, state, available_at, claimed_by, claimed_until,
+                    delivery_attempts, last_error, updated_at
+                ) VALUES (?, 'pending', ?, NULL, NULL, 0, NULL, ?)
+                """,
+                (operation_id, now, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO effect_reservations(
+                    task_id, tool_use_id, operation_id, owner_id, owner_pid,
+                    fencing_token, effect, state, started_at, deadline_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)
+                """,
+                (
+                    spec.task_id,
+                    spec.tool_use_id,
+                    operation_id,
+                    owner_id,
+                    int(owner_pid or os.getpid()),
+                    fencing_token,
+                    self._operation_effect(spec),
+                    now,
+                    deadline_at,
+                ),
+            )
+            updated = conn.execute(
+                """
+                UPDATE tool_calls SET operation_id = ?, version = version + 1
+                WHERE task_id = ? AND tool_use_id = ? AND operation_id IS NULL
+                """,
+                (operation_id, spec.task_id, spec.tool_use_id),
+            )
+            if updated.rowcount != 1:
+                raise StaleState(f"Tool call changed while preparing operation: {spec.tool_use_id}")
+            operation = self._operation_row_conn(conn, operation_id)
+            self._append_operation_event_conn(
+                conn,
+                spec.task_id,
+                "operation_prepared",
+                operation,
+                "prepared",
+                "effect intent and outbox prepared",
+            )
+        return self.get_operation(operation_id)  # type: ignore[return-value]
+
+    def claim_operation(
+        self,
+        operation_id: str,
+        *,
+        claim_ttl: float = 30.0,
+        expected_version: int | None = None,
+    ) -> dict[str, Any]:
+        now = _now()
+        with self.transaction() as conn:
+            operation = self._operation_row_conn(conn, operation_id)
+            owner_id, fencing_token = self._operation_lease_conn(conn, str(operation["task_id"]))
+            outbox = conn.execute(
+                "SELECT * FROM operation_outbox WHERE operation_id = ?", (operation_id,)
+            ).fetchone()
+            if outbox is None:
+                raise InvariantViolation(f"Missing operation outbox: {operation_id}")
+            if operation["state"] != "prepared":
+                if operation["state"] == "committed":
+                    return self._decode_operation(operation)  # type: ignore[return-value]
+                raise StaleState(f"Operation is not prepared: {operation_id}")
+            if expected_version is not None and int(operation["version"]) != int(expected_version):
+                raise StaleState(f"Operation version changed before claim: {operation_id}")
+            if outbox["state"] not in {"pending", "claimed"}:
+                raise StaleState(f"Operation outbox is not claimable: {operation_id}")
+            if (
+                outbox["state"] == "claimed"
+                and outbox["claimed_by"] != owner_id
+                and outbox["claimed_until"] is not None
+                and float(outbox["claimed_until"]) > now
+            ):
+                raise StaleState(f"Operation outbox is claimed by another owner: {operation_id}")
+            version = int(operation["version"])
+            updated = conn.execute(
+                "UPDATE operations SET updated_at = ?, version = version + 1 "
+                "WHERE operation_id = ? AND state = 'prepared' AND version = ?",
+                (now, operation_id, version),
+            )
+            if updated.rowcount != 1:
+                raise StaleState(f"Operation changed during claim: {operation_id}")
+            outbox_updated = conn.execute(
+                """
+                UPDATE operation_outbox SET state = 'claimed', claimed_by = ?,
+                    claimed_until = ?, delivery_attempts = delivery_attempts + 1,
+                    updated_at = ?
+                WHERE operation_id = ? AND state IN ('pending', 'claimed')
+                """,
+                (owner_id, now + claim_ttl, now, operation_id),
+            )
+            if outbox_updated.rowcount != 1:
+                raise StaleState(f"Operation outbox changed during claim: {operation_id}")
+            reservation = conn.execute(
+                """
+                SELECT reservation_id FROM effect_reservations
+                WHERE operation_id = ? AND owner_id = ? AND fencing_token = ? AND state = 'running'
+                ORDER BY reservation_id DESC LIMIT 1
+                """,
+                (operation_id, owner_id, fencing_token),
+            ).fetchone()
+            if reservation is None:
+                conn.execute(
+                    """
+                    INSERT INTO effect_reservations(
+                        task_id, tool_use_id, operation_id, owner_id, owner_pid,
+                        fencing_token, effect, state, started_at, deadline_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)
+                    """,
+                    (
+                        operation["task_id"],
+                        operation["tool_use_id"],
+                        operation_id,
+                        owner_id,
+                        os.getpid(),
+                        fencing_token,
+                        "file_write" if operation["adapter"] == "file" else "unknown_write",
+                        now,
+                        now + claim_ttl,
+                    ),
+                )
+            current = self._operation_row_conn(conn, operation_id)
+            self._append_operation_event_conn(
+                conn,
+                str(operation["task_id"]),
+                "operation_claimed",
+                current,
+                "prepared",
+                "outbox claimed by the current lease",
+            )
+        return self.get_operation(operation_id)  # type: ignore[return-value]
+
+    def mark_operation_dispatched(
+        self,
+        operation_id: str,
+        *,
+        expected_version: int | None = None,
+    ) -> dict[str, Any]:
+        now = _now()
+        with self.transaction() as conn:
+            operation = self._operation_row_conn(conn, operation_id)
+            owner_id, fencing_token = self._operation_lease_conn(conn, str(operation["task_id"]))
+            if operation["state"] != "prepared":
+                if operation["state"] == "dispatched":
+                    return self._decode_operation(operation)  # type: ignore[return-value]
+                raise StaleState(f"Operation is not dispatchable: {operation_id}")
+            version = int(operation["version"])
+            if expected_version is not None and version != int(expected_version):
+                raise StaleState(f"Operation version changed before dispatch: {operation_id}")
+            outbox = conn.execute(
+                "SELECT * FROM operation_outbox WHERE operation_id = ?", (operation_id,)
+            ).fetchone()
+            if (
+                outbox is None
+                or outbox["state"] != "claimed"
+                or outbox["claimed_by"] != owner_id
+                or outbox["claimed_until"] is None
+                or float(outbox["claimed_until"]) <= now
+            ):
+                raise StaleState(f"Operation outbox is not owned for dispatch: {operation_id}")
+            updated = conn.execute(
+                """
+                UPDATE operations SET state = 'dispatched', attempt_count = attempt_count + 1,
+                    dispatched_at = ?, updated_at = ?, version = version + 1
+                WHERE operation_id = ? AND state = 'prepared' AND version = ?
+                """,
+                (now, now, operation_id, version),
+            )
+            if updated.rowcount != 1:
+                raise StaleState(f"Operation changed during dispatch: {operation_id}")
+            reservation = conn.execute(
+                """
+                SELECT reservation_id FROM effect_reservations
+                WHERE operation_id = ? AND owner_id = ? AND fencing_token = ? AND state = 'running'
+                ORDER BY reservation_id DESC LIMIT 1
+                """,
+                (operation_id, owner_id, fencing_token),
+            ).fetchone()
+            if reservation is None:
+                raise StaleState(f"Operation reservation is not owned for dispatch: {operation_id}")
+            call_updated = conn.execute(
+                """
+                UPDATE tool_calls SET status = 'running', started_at = ?,
+                    execution_status = 'running', execution_attempts = execution_attempts + 1,
+                    effect_attempts = effect_attempts + 1, version = version + 1
+                WHERE task_id = ? AND tool_use_id = ? AND status = 'planned'
+                """,
+                (now, operation["task_id"], operation["tool_use_id"]),
+            )
+            if call_updated.rowcount != 1:
+                raise StaleState(f"Tool call is not planned for dispatch: {operation['tool_use_id']}")
+            conn.execute(
+                "UPDATE operation_outbox SET updated_at = ? WHERE operation_id = ?",
+                (now, operation_id),
+            )
+            current = self._operation_row_conn(conn, operation_id)
+            self._append_operation_event_conn(
+                conn,
+                str(operation["task_id"]),
+                "operation_dispatched",
+                current,
+                "dispatched",
+                "external effect boundary entered",
+            )
+        return self.get_operation(operation_id)  # type: ignore[return-value]
+
+    @staticmethod
+    def _evidence_payload(evidence: ReconcileEvidence | dict[str, Any] | None) -> dict[str, Any] | None:
+        if evidence is None:
+            return None
+        if isinstance(evidence, ReconcileEvidence):
+            return {
+                "outcome": evidence.outcome,
+                "reason": evidence.reason,
+                "evidence": evidence.evidence,
+            }
+        return dict(evidence)
+
+    def _update_operation_tool_fields(
+        self,
+        conn: sqlite3.Connection,
+        operation: sqlite3.Row,
+        tool_fields: dict[str, Any],
+        *,
+        statuses: tuple[str, ...] = ("running", "needs_review", "planned"),
+    ) -> None:
+        allowed = {
+            "status", "output", "error", "finished_at", "returncode", "stdout", "stderr",
+            "timed_out", "execution_status", "effect_confirmed", "effect_confirmation",
+        }
+        unknown = set(tool_fields) - allowed
+        if unknown:
+            raise ValueError(f"Unknown operation tool fields: {sorted(unknown)}")
+        assignments = []
+        values: list[Any] = []
+        for key, value in tool_fields.items():
+            assignments.append(f"{key} = ?")
+            values.append(value)
+        if not assignments:
+            return
+        assignments.append("version = version + 1")
+        placeholders = ",".join("?" for _ in statuses)
+        values.extend([operation["task_id"], operation["tool_use_id"], *statuses])
+        updated = conn.execute(
+            f"UPDATE tool_calls SET {', '.join(assignments)} "
+            f"WHERE task_id = ? AND tool_use_id = ? AND status IN ({placeholders})",
+            values,
+        )
+        if updated.rowcount != 1:
+            current = conn.execute(
+                "SELECT status FROM tool_calls WHERE task_id = ? AND tool_use_id = ?",
+                (operation["task_id"], operation["tool_use_id"]),
+            ).fetchone()
+            if current is None or current["status"] not in {"succeeded", "failed", "aborted"}:
+                raise StaleState(f"Tool call changed during operation transition: {operation['tool_use_id']}")
+
+    def _upsert_operation_observation(
+        self,
+        conn: sqlite3.Connection,
+        operation: sqlite3.Row,
+        observation: dict[str, Any] | None,
+        now: float,
+    ) -> None:
+        if observation is None:
+            return
+        conn.execute(
+            """
+            INSERT INTO file_observations(
+                task_id, path, exists_now, sha256, identity_json, observed_at, source_tool_use_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id, path) DO UPDATE SET
+                exists_now = excluded.exists_now,
+                sha256 = excluded.sha256,
+                identity_json = excluded.identity_json,
+                observed_at = excluded.observed_at,
+                source_tool_use_id = excluded.source_tool_use_id
+            """,
+            (
+                operation["task_id"],
+                observation["path"],
+                int(observation.get("exists_now", True)),
+                observation.get("sha256"),
+                _json(observation.get("identity")) if observation.get("identity") is not None else None,
+                now,
+                operation["tool_use_id"],
+            ),
+        )
+
+    def commit_operation(
+        self,
+        operation_id: str,
+        result: Any = None,
+        evidence: ReconcileEvidence | dict[str, Any] | None = None,
+        *,
+        tool_fields: dict[str, Any] | None = None,
+        observation: dict[str, Any] | None = None,
+        expected_version: int | None = None,
+        allow_unknown: bool = False,
+        reason: str = "effect result committed",
+        emit_tool_event: bool = True,
+    ) -> dict[str, Any]:
+        now = _now()
+        evidence_payload = self._evidence_payload(evidence)
+        result_json = _checked_json(result, MAX_CHECKPOINT_BYTES, "operation result")
+        result_digest = sha256_json(result)
+        with self.transaction() as conn:
+            operation = self._operation_row_conn(conn, operation_id)
+            self._operation_lease_conn(conn, str(operation["task_id"]))
+            if operation["state"] not in {"dispatched", "unknown"}:
+                if operation["state"] == "committed":
+                    return self._decode_operation(operation)  # type: ignore[return-value]
+                raise StaleState(f"Operation cannot commit from {operation['state']}: {operation_id}")
+            if operation["state"] == "unknown" and not allow_unknown:
+                raise StaleState(f"Unknown operation requires explicit reconciliation: {operation_id}")
+            if expected_version is not None and int(operation["version"]) != int(expected_version):
+                raise StaleState(f"Operation version changed before commit: {operation_id}")
+            previous_state = str(operation["state"])
+            version = int(operation["version"])
+            updated = conn.execute(
+                """
+                UPDATE operations SET state = 'committed', result_json = ?, result_digest = ?,
+                    probe_evidence_json = ?, completed_at = ?, updated_at = ?, version = version + 1
+                WHERE operation_id = ? AND state = ? AND version = ?
+                """,
+                (
+                    result_json,
+                    result_digest,
+                    _json(evidence_payload) if evidence_payload is not None else None,
+                    now,
+                    now,
+                    operation_id,
+                    previous_state,
+                    version,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StaleState(f"Operation changed during commit: {operation_id}")
+            conn.execute(
+                """
+                UPDATE operation_outbox SET state = 'delivered', claimed_by = NULL,
+                    claimed_until = NULL, last_error = NULL, updated_at = ?
+                WHERE operation_id = ?
+                """,
+                (now, operation_id),
+            )
+            conn.execute(
+                "UPDATE effect_reservations SET state = 'completed', finished_at = ?, details_json = ? "
+                "WHERE operation_id = ? AND state IN ('running', 'unknown')",
+                (now, _json(evidence_payload or {"reason": reason}), operation_id),
+            )
+            self._upsert_operation_observation(conn, operation, observation, now)
+            fields = dict(tool_fields or {})
+            fields.setdefault("status", "succeeded")
+            fields.setdefault("finished_at", now)
+            if "output" not in fields and isinstance(result, str):
+                fields["output"] = result
+            if fields.get("status") != "succeeded":
+                raise ValueError("Committed operation must persist a succeeded tool call")
+            self._update_operation_tool_fields(conn, operation, fields)
+            current = self._operation_row_conn(conn, operation_id)
+            self._append_operation_event_conn(
+                conn,
+                str(operation["task_id"]),
+                "operation_committed",
+                current,
+                "committed",
+                reason,
+            )
+            if emit_tool_event:
+                conn.execute(
+                    "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'tool_succeeded', ?, ?)",
+                    (
+                        operation["task_id"],
+                        _checked_json(
+                            {
+                                "tool_use_id": operation["tool_use_id"],
+                                "operation_id": operation_id,
+                                "output_chars": len(str(fields.get("output", ""))),
+                            },
+                            MAX_EVENT_PAYLOAD_BYTES,
+                            "event payload",
+                        ),
+                        now,
+                    ),
+                )
+        return self.get_operation(operation_id)  # type: ignore[return-value]
+
+    def fail_operation(
+        self,
+        operation_id: str,
+        reason: str,
+        *,
+        tool_fields: dict[str, Any] | None = None,
+        expected_version: int | None = None,
+    ) -> dict[str, Any]:
+        now = _now()
+        with self.transaction() as conn:
+            operation = self._operation_row_conn(conn, operation_id)
+            self._operation_lease_conn(conn, str(operation["task_id"]))
+            if operation["state"] != "dispatched":
+                raise StaleState(f"Operation cannot fail from {operation['state']}: {operation_id}")
+            version = int(operation["version"])
+            if expected_version is not None and version != int(expected_version):
+                raise StaleState(f"Operation version changed before failure: {operation_id}")
+            updated = conn.execute(
+                "UPDATE operations SET state = 'failed', updated_at = ?, completed_at = ?, version = version + 1 "
+                "WHERE operation_id = ? AND state = ? AND version = ?",
+                (now, now, operation_id, operation["state"], version),
+            )
+            if updated.rowcount != 1:
+                raise StaleState(f"Operation changed during failure: {operation_id}")
+            conn.execute(
+                "UPDATE operation_outbox SET state = 'delivered', claimed_by = NULL, claimed_until = NULL, "
+                "last_error = ?, updated_at = ? WHERE operation_id = ?",
+                (_safe_reason(reason), now, operation_id),
+            )
+            conn.execute(
+                "UPDATE effect_reservations SET state = 'cancelled', finished_at = ?, details_json = ? "
+                "WHERE operation_id = ? AND state = 'running'",
+                (now, _json({"reason": _safe_reason(reason)}), operation_id),
+            )
+            fields = dict(tool_fields or {})
+            fields.setdefault("status", "failed")
+            fields.setdefault("error", _safe_reason(reason))
+            fields.setdefault("finished_at", now)
+            self._update_operation_tool_fields(conn, operation, fields)
+            current = self._operation_row_conn(conn, operation_id)
+            self._append_operation_event_conn(
+                conn,
+                str(operation["task_id"]),
+                "operation_failed",
+                current,
+                "failed",
+                reason,
+            )
+            conn.execute(
+                "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'tool_failed', ?, ?)",
+                (
+                    operation["task_id"],
+                    _checked_json(
+                        {
+                            "tool_use_id": operation["tool_use_id"],
+                            "operation_id": operation_id,
+                            "reason": _safe_reason(reason),
+                        },
+                        MAX_EVENT_PAYLOAD_BYTES,
+                        "event payload",
+                    ),
+                    now,
+                ),
+            )
+        return self.get_operation(operation_id)  # type: ignore[return-value]
+
+    def mark_operation_unknown(
+        self,
+        operation_id: str,
+        reason: str,
+        *,
+        evidence: ReconcileEvidence | dict[str, Any] | None = None,
+        tool_fields: dict[str, Any] | None = None,
+        expected_version: int | None = None,
+    ) -> dict[str, Any]:
+        now = _now()
+        evidence_payload = self._evidence_payload(evidence)
+        with self.transaction() as conn:
+            operation = self._operation_row_conn(conn, operation_id)
+            self._operation_lease_conn(conn, str(operation["task_id"]))
+            if operation["state"] == "unknown":
+                return self._decode_operation(operation)  # type: ignore[return-value]
+            if operation["state"] != "dispatched":
+                raise StaleState(f"Operation cannot become unknown from {operation['state']}: {operation_id}")
+            version = int(operation["version"])
+            if expected_version is not None and version != int(expected_version):
+                raise StaleState(f"Operation version changed before unknown transition: {operation_id}")
+            updated = conn.execute(
+                """
+                UPDATE operations SET state = 'unknown', probe_evidence_json = ?,
+                    updated_at = ?, version = version + 1
+                WHERE operation_id = ? AND state = 'dispatched' AND version = ?
+                """,
+                (
+                    _json(evidence_payload or {"reason": _safe_reason(reason)}),
+                    now,
+                    operation_id,
+                    version,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise StaleState(f"Operation changed during unknown transition: {operation_id}")
+            conn.execute(
+                "UPDATE operation_outbox SET state = 'blocked', claimed_by = NULL, claimed_until = NULL, "
+                "last_error = ?, updated_at = ? WHERE operation_id = ?",
+                (_safe_reason(reason), now, operation_id),
+            )
+            conn.execute(
+                "UPDATE effect_reservations SET state = 'unknown', finished_at = ?, details_json = ? "
+                "WHERE operation_id = ? AND state = 'running'",
+                (now, _json(evidence_payload or {"reason": _safe_reason(reason)}), operation_id),
+            )
+            projection = dict(tool_fields or {})
+            projection.setdefault("status", "needs_review")
+            projection.setdefault("error", _safe_reason(reason))
+            projection.setdefault("finished_at", now)
+            projection.setdefault("execution_status", "unknown")
+            self._update_operation_tool_fields(conn, operation, projection)
+            current = self._operation_row_conn(conn, operation_id)
+            self._append_operation_event_conn(
+                conn,
+                str(operation["task_id"]),
+                "operation_unknown",
+                current,
+                "unknown",
+                reason,
+            )
+        return self.get_operation(operation_id)  # type: ignore[return-value]
+
+    def resolve_operation(
+        self,
+        operation_id: str,
+        action: str,
+        evidence: ReconcileEvidence | dict[str, Any] | None = None,
+        *,
+        expected_version: int | None = None,
+    ) -> dict[str, Any]:
+        if action not in {"complete", "retry", "abort"}:
+            raise ValueError("operation resolution action must be complete, retry, or abort")
+        evidence_payload = self._evidence_payload(evidence)
+        now = _now()
+        with self.transaction() as conn:
+            operation = self._operation_row_conn(conn, operation_id)
+            owner_id, fencing_token = self._operation_lease_conn(conn, str(operation["task_id"]))
+            task_row = conn.execute(
+                "SELECT checkpoint_id, status, version FROM tasks WHERE task_id = ?",
+                (operation["task_id"],),
+            ).fetchone()
+            if task_row is None:
+                raise KeyError(f"Task not found: {operation['task_id']}")
+            operation_state = str(operation["state"])
+            if action == "complete" and operation_state != "unknown":
+                raise StaleState(f"Only unknown operations can be completed during resolution: {operation_id}")
+            if action in {"retry", "abort"} and operation_state not in {"unknown", "prepared"}:
+                raise StaleState(f"Operation cannot be {action} from {operation_state}: {operation_id}")
+            version = int(operation["version"])
+            if expected_version is not None and version != int(expected_version):
+                raise StaleState(f"Operation version changed before resolution: {operation_id}")
+            if action == "retry":
+                outcome = str((evidence_payload or {}).get("outcome", ""))
+                if outcome not in {"not_happened", "safe_to_retry", "before_hash"}:
+                    raise ValueError("retry requires evidence that the external effect did not happen")
+                conn.execute(
+                    "UPDATE effect_reservations SET state = 'cancelled', finished_at = ?, details_json = ? "
+                    "WHERE operation_id = ? AND state IN ('running', 'unknown')",
+                    (now, _json(evidence_payload or {"reason": "manual_retry"}), operation_id),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO effect_reservations(
+                        task_id, tool_use_id, operation_id, owner_id, owner_pid,
+                        fencing_token, effect, state, started_at, deadline_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?)
+                    """,
+                    (
+                        operation["task_id"],
+                        operation["tool_use_id"],
+                        operation_id,
+                        owner_id,
+                        os.getpid(),
+                        fencing_token,
+                        "file_write" if operation["adapter"] == "file" else "unknown_write",
+                        now,
+                        now + 300.0,
+                    ),
+                )
+                updated = conn.execute(
+                    """
+                    UPDATE operations SET state = 'prepared', probe_evidence_json = ?,
+                        updated_at = ?, version = version + 1
+                    WHERE operation_id = ? AND state = ? AND version = ?
+                    """,
+                    (_json(evidence_payload or {}), now, operation_id, operation_state, version),
+                )
+                if updated.rowcount != 1:
+                    raise StaleState(f"Operation changed during retry: {operation_id}")
+                conn.execute(
+                    "UPDATE operation_outbox SET state = 'pending', available_at = ?, claimed_by = NULL, "
+                    "claimed_until = NULL, last_error = NULL, updated_at = ? WHERE operation_id = ?",
+                    (now, now, operation_id),
+                )
+                conn.execute(
+                    "UPDATE tool_calls SET status = 'planned', error = NULL, execution_status = NULL, "
+                    "finished_at = NULL, version = version + 1 WHERE task_id = ? AND tool_use_id = ? "
+                    "AND status IN ('running', 'needs_review')",
+                    (operation["task_id"], operation["tool_use_id"]),
+                )
+                conn.execute(
+                    "UPDATE tasks SET status = 'running', last_error = NULL, updated_at = ?, version = version + 1 "
+                    "WHERE task_id = ? AND status = 'needs_review'",
+                    (now, operation["task_id"]),
+                )
+                conn.execute(
+                    "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'review_resolved', ?, ?)",
+                    (
+                        operation["task_id"],
+                        _json({
+                            "tool_use_id": operation["tool_use_id"],
+                            "operation_id": operation_id,
+                            "action": action,
+                            "checkpoint_id": task_row["checkpoint_id"],
+                        }),
+                        now,
+                    ),
+                )
+                current = self._operation_row_conn(conn, operation_id)
+                self._append_operation_event_conn(
+                    conn,
+                    str(operation["task_id"]),
+                    "operation_reconciled",
+                    current,
+                    "prepared",
+                    "operator authorized a safe retry",
+                )
+            else:
+                target_state = "committed" if action == "complete" else "cancelled"
+                manual_output = (
+                    "[manually marked complete after reconciliation]"
+                    if action == "complete"
+                    else None
+                )
+                manual_result_json = (
+                    _checked_json(manual_output, MAX_CHECKPOINT_BYTES, "operation result")
+                    if manual_output is not None
+                    else None
+                )
+                manual_result_digest = sha256_json(manual_output) if manual_output is not None else None
+                updated = conn.execute(
+                    "UPDATE operations SET state = ?, result_json = ?, result_digest = ?, "
+                    "probe_evidence_json = ?, completed_at = ?, "
+                    "updated_at = ?, version = version + 1 WHERE operation_id = ? AND state = ? AND version = ?",
+                    (
+                        target_state,
+                        manual_result_json,
+                        manual_result_digest,
+                        _json(evidence_payload or {}),
+                        now,
+                        now,
+                        operation_id,
+                        operation_state,
+                        version,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise StaleState(f"Operation changed during resolution: {operation_id}")
+                outbox_state = "delivered" if action == "complete" else "cancelled"
+                conn.execute(
+                    "UPDATE operation_outbox SET state = ?, claimed_by = NULL, claimed_until = NULL, "
+                    "last_error = NULL, updated_at = ? WHERE operation_id = ?",
+                    (outbox_state, now, operation_id),
+                )
+                reservation_state = "completed" if action == "complete" else "cancelled"
+                conn.execute(
+                    "UPDATE effect_reservations SET state = ?, finished_at = ?, details_json = ? "
+                    "WHERE operation_id = ? AND state IN ('running', 'unknown')",
+                    (reservation_state, now, _json(evidence_payload or {}), operation_id),
+                )
+                if action == "complete":
+                    self._update_operation_tool_fields(
+                        conn,
+                        operation,
+                        {
+                            "status": "succeeded",
+                            "output": manual_output,
+                            "finished_at": now,
+                            "effect_confirmed": 1,
+                        },
+                        statuses=("running", "needs_review", "planned"),
+                    )
+                else:
+                    self._update_operation_tool_fields(
+                        conn,
+                        operation,
+                        {
+                            "status": "aborted",
+                            "output": "Aborted during review.",
+                            "finished_at": now,
+                            "error": "Operator aborted the operation.",
+                        },
+                        statuses=("running", "needs_review", "planned"),
+                    )
+                conn.execute(
+                    "UPDATE tasks SET status = 'running', last_error = NULL, updated_at = ?, version = version + 1 "
+                    "WHERE task_id = ? AND status = 'needs_review'",
+                    (now, operation["task_id"]),
+                )
+                conn.execute(
+                    "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'review_resolved', ?, ?)",
+                    (
+                        operation["task_id"],
+                        _json({
+                            "tool_use_id": operation["tool_use_id"],
+                            "operation_id": operation_id,
+                            "action": action,
+                            "checkpoint_id": task_row["checkpoint_id"],
+                        }),
+                        now,
+                    ),
+                )
+                current = self._operation_row_conn(conn, operation_id)
+                self._append_operation_event_conn(
+                    conn,
+                    str(operation["task_id"]),
+                    "operation_reconciled",
+                    current,
+                    target_state,
+                    "operator completed reconciliation" if action == "complete" else "operator aborted operation",
+                )
+        return self.get_operation(operation_id)  # type: ignore[return-value]
+
     def scan_invariants(self, task_id: str | None = None) -> list[str]:
         """Return durable state inconsistencies without attempting silent repair."""
         violations: list[str] = []
@@ -1354,147 +2309,58 @@ class EventStore:
             current = conn.execute("SELECT MAX(version) AS version FROM schema_migrations").fetchone()["version"]
             if current is None or int(current) != SCHEMA_VERSION:
                 violations.append(f"schema version mismatch: {current!r} != {SCHEMA_VERSION}")
-            task_filter = " WHERE task_id = ?" if task_id else ""
-            params = (task_id,) if task_id else ()
-            tasks = conn.execute(f"SELECT * FROM tasks{task_filter}", params).fetchall()
-            for task in tasks:
-                prefix = f"task {task['task_id']}"
-                checkpoint = conn.execute(
-                    "SELECT * FROM checkpoints WHERE checkpoint_id = ?", (task["checkpoint_id"],)
-                ).fetchone() if task["checkpoint_id"] is not None else None
-                if checkpoint is None:
-                    violations.append(f"{prefix}: missing checkpoint pointer")
-                elif checkpoint["task_id"] != task["task_id"]:
-                    violations.append(f"{prefix}: checkpoint belongs to another task")
-                elif task["status"] == "completed" and checkpoint["phase"] != "completed":
-                    violations.append(f"{prefix}: completed task has phase {checkpoint['phase']}")
-                elif task["status"] == "aborted" and checkpoint["phase"] != "aborted":
-                    violations.append(f"{prefix}: aborted task has phase {checkpoint['phase']}")
-                elif task["status"] == "failed" and checkpoint["phase"] != "failed":
-                    violations.append(f"{prefix}: failed task has phase {checkpoint['phase']}")
-                if checkpoint is not None and checkpoint["phase"] not in {
-                    "input_ready", "model_responded", "tool_results_appended", "waiting_approval",
-                    "needs_review", "completed", "failed", "aborted",
-                }:
-                    violations.append(f"{prefix}: invalid checkpoint phase {checkpoint['phase']}")
-                calls = conn.execute("SELECT status FROM tool_calls WHERE task_id = ?", (task["task_id"],)).fetchall()
-                invalid_statuses = {row["status"] for row in calls} - {
-                    "planned", "running", "waiting_approval", "needs_review", "succeeded", "failed", "denied", "aborted"
-                }
-                if invalid_statuses:
-                    violations.append(f"{prefix}: invalid tool status {sorted(invalid_statuses)}")
-                if task["status"] == "aborted" and any(row["status"] in {"planned", "running"} for row in calls):
-                    violations.append(f"{prefix}: aborted task has executable tool call")
-                if task["status"] == "completed" and any(row["status"] in {"planned", "running"} for row in calls):
-                    violations.append(f"{prefix}: completed task has executable tool call")
-                call_statuses = {row["status"] for row in calls}
-                event_types = {
-                    row["type"] for row in conn.execute("SELECT type FROM events WHERE task_id = ?", (task["task_id"],))
-                }
-                if task["status"] == "completed" and "task_completed" not in event_types:
-                    violations.append(f"{prefix}: completed task missing task_completed event")
-                if task["status"] == "aborted" and "task_aborted" not in event_types:
-                    violations.append(f"{prefix}: aborted task missing task_aborted event")
-                if task["status"] in {"needs_review", "waiting_approval"}:
-                    expected_phase = task["status"]
-                    if checkpoint is None or checkpoint["phase"] != expected_phase:
-                        violations.append(f"{prefix}: {task['status']} task has incompatible checkpoint")
-                    checkpoint_saved = False
-                    if checkpoint is not None:
-                        for event in conn.execute(
-                            "SELECT payload_json FROM events WHERE task_id = ? AND type = 'checkpoint_saved'",
-                            (task["task_id"],),
-                        ):
-                            payload = _loads(event["payload_json"], {})
-                            if payload.get("checkpoint_id") == checkpoint["checkpoint_id"] and payload.get("phase") == expected_phase:
-                                checkpoint_saved = True
-                                break
-                    if not checkpoint_saved:
-                        violations.append(f"{prefix}: review checkpoint missing checkpoint_saved event")
-                    expected_event = "task_needs_review" if expected_phase == "needs_review" else "task_waiting_approval"
-                    matching_review_event = False
-                    for event in conn.execute(
-                        "SELECT payload_json FROM events WHERE task_id = ? AND type = ? ORDER BY event_id DESC",
-                        (task["task_id"], expected_event),
-                    ):
-                        payload = _loads(event["payload_json"], {})
-                        if checkpoint is not None and payload.get("checkpoint_id") == checkpoint["checkpoint_id"]:
-                            matching_review_event = True
-                            break
-                    if not matching_review_event:
-                        violations.append(f"{prefix}: missing {expected_event} transition event")
-                    if expected_phase == "needs_review":
-                        if not any(status == "needs_review" for status in call_statuses):
-                            violations.append(f"{prefix}: needs_review task has no needs_review tool call")
-                        if any(status in {"planned", "running", "waiting_approval"} for status in call_statuses):
-                            violations.append(f"{prefix}: needs_review task has executable tool call")
-                    elif "waiting_approval" not in call_statuses:
-                        violations.append(f"{prefix}: waiting_approval task has no waiting tool call")
-                    if any(status in {"planned", "running"} for status in call_statuses):
-                        violations.append(f"{prefix}: review task has executable tool call")
-                elif checkpoint is not None and checkpoint["phase"] in {"needs_review", "waiting_approval"}:
-                    checkpoint_saved = False
-                    for event in conn.execute(
-                        "SELECT payload_json FROM events WHERE task_id = ? AND type = 'checkpoint_saved'",
-                        (task["task_id"],),
-                    ):
-                        payload = _loads(event["payload_json"], {})
-                        if payload.get("checkpoint_id") == checkpoint["checkpoint_id"] and payload.get("phase") == checkpoint["phase"]:
-                            checkpoint_saved = True
-                            break
-                    if not checkpoint_saved:
-                        violations.append(f"{prefix}: review checkpoint missing checkpoint_saved event")
-                    resolved = False
-                    for event in conn.execute(
-                        "SELECT type, payload_json FROM events WHERE task_id = ? "
-                        "AND type IN ('permission_approved', 'permission_denied', 'review_resolved')",
-                        (task["task_id"],),
-                    ):
-                        payload = _loads(event["payload_json"], {})
-                        if payload.get("checkpoint_id") == checkpoint["checkpoint_id"]:
-                            resolved = True
-                            break
-                    if not resolved:
-                        violations.append(f"{prefix}: running task has unresolved review checkpoint")
-                for event in conn.execute(
-                    "SELECT payload_json FROM events WHERE task_id = ? AND type = 'checkpoint_saved'",
-                    (task["task_id"],),
-                ):
-                    payload = _loads(event["payload_json"], {})
-                    checkpoint_id = payload.get("checkpoint_id")
-                    if checkpoint_id is None or conn.execute(
-                        "SELECT 1 FROM checkpoints WHERE checkpoint_id = ? AND task_id = ?",
-                        (checkpoint_id, task["task_id"]),
-                    ).fetchone() is None:
-                        violations.append(f"{prefix}: checkpoint_saved points to missing checkpoint")
+            violations.extend(
+                _legacy_projection_violations(
+                    conn,
+                    task_id,
+                    allow_prepared_operations=True,
+                )
+            )
             leases = conn.execute("SELECT * FROM leases").fetchall()
             for lease in leases:
                 if not lease["owner_id"] or int(lease["fencing_token"]) < 1:
                     violations.append(f"lease {lease['repo_root']}: invalid owner or fencing token")
-            reservations = conn.execute("SELECT * FROM effect_reservations").fetchall()
-            valid_reservation_states = {"running", "completed", "unknown", "cancelled"}
-            for reservation in reservations:
-                if reservation["state"] not in valid_reservation_states:
-                    violations.append(f"reservation {reservation['reservation_id']}: invalid state")
-                if int(reservation["fencing_token"]) < 1 or not reservation["owner_id"]:
-                    violations.append(f"reservation {reservation['reservation_id']}: invalid owner or fencing token")
-                task = conn.execute("SELECT status, repo_root FROM tasks WHERE task_id = ?", (reservation["task_id"],)).fetchone()
-                if task is None:
-                    violations.append(f"reservation {reservation['reservation_id']}: missing task")
-                elif reservation["state"] in {"running", "unknown"} and task["status"] in {"completed", "failed", "aborted"}:
-                    violations.append(f"reservation {reservation['reservation_id']}: unresolved on terminal task")
-                elif reservation["state"] == "unknown" and task["status"] not in {"created", "running", "needs_review"}:
-                    violations.append(f"reservation {reservation['reservation_id']}: unknown on incompatible task")
-                tool = conn.execute(
-                    "SELECT status FROM tool_calls WHERE task_id = ? AND tool_use_id = ?",
-                    (reservation["task_id"], reservation["tool_use_id"]),
+            operations = conn.execute(
+                "SELECT o.*, b.state AS outbox_state FROM operations o "
+                "LEFT JOIN operation_outbox b ON b.operation_id = o.operation_id"
+            ).fetchall()
+            valid_operation_states = {
+                "prepared", "dispatched", "committed", "failed", "unknown", "cancelled"
+            }
+            valid_outbox_states = {"pending", "claimed", "delivered", "blocked", "cancelled"}
+            for operation in operations:
+                if operation["state"] not in valid_operation_states:
+                    violations.append(f"operation {operation['operation_id']}: invalid state")
+                if operation["semantics"] not in {
+                    "replay_safe", "idempotent", "reconcilable", "opaque"
+                }:
+                    violations.append(f"operation {operation['operation_id']}: invalid semantics")
+                if operation["version"] < 0 or operation["attempt_count"] < 0:
+                    violations.append(f"operation {operation['operation_id']}: invalid version or attempt count")
+                if operation["outbox_state"] not in valid_outbox_states:
+                    violations.append(f"operation {operation['operation_id']}: missing or invalid outbox")
+                expected_outbox = {
+                    "committed": "delivered",
+                    "unknown": "blocked",
+                    "cancelled": "cancelled",
+                }.get(operation["state"])
+                if expected_outbox and operation["outbox_state"] != expected_outbox:
+                    violations.append(
+                        f"operation {operation['operation_id']}: {operation['state']} "
+                        f"has outbox {operation['outbox_state']}"
+                    )
+                call = conn.execute(
+                    "SELECT operation_id, effect, status FROM tool_calls "
+                    "WHERE task_id = ? AND tool_use_id = ?",
+                    (operation["task_id"], operation["tool_use_id"]),
                 ).fetchone()
-                if tool is None:
-                    violations.append(f"reservation {reservation['reservation_id']}: missing tool call")
-                elif reservation["state"] == "completed" and tool["status"] != "succeeded":
-                    violations.append(f"reservation {reservation['reservation_id']}: completed without succeeded tool")
-                elif reservation["state"] == "running" and tool["status"] != "running":
-                    violations.append(f"reservation {reservation['reservation_id']}: running without running tool")
+                if call is None:
+                    violations.append(f"operation {operation['operation_id']}: missing tool call")
+                else:
+                    if call["operation_id"] != operation["operation_id"]:
+                        violations.append(f"operation {operation['operation_id']}: tool call projection mismatch")
+                    if call["effect"] == "read_only":
+                        violations.append(f"operation {operation['operation_id']}: read-only call has operation")
         finally:
             conn.close()
         return violations
@@ -1562,7 +2428,7 @@ class EventStore:
                 fencing_token = int(row["fencing_token"])
             else:
                 running = conn.execute(
-                    "SELECT r.reservation_id, r.owner_pid, r.owner_id, r.fencing_token "
+                    "SELECT r.reservation_id, r.operation_id, r.owner_pid, r.owner_id, r.fencing_token "
                     "FROM effect_reservations r JOIN tasks t ON t.task_id = r.task_id "
                     "WHERE t.repo_root = ? AND r.state = 'running' ORDER BY r.reservation_id",
                     (repo_root,),
@@ -1575,6 +2441,26 @@ class EventStore:
                         "WHERE reservation_id = ? AND state = 'running'",
                         (now, _json({"reason": "owner_crashed", "owner_id": reservation["owner_id"]}), reservation["reservation_id"]),
                     )
+                    if reservation["operation_id"] is not None:
+                        operation_updated = conn.execute(
+                            "UPDATE operations SET state = 'unknown', updated_at = ?, version = version + 1 "
+                            "WHERE operation_id = ? AND state = 'dispatched'",
+                            (now, reservation["operation_id"]),
+                        )
+                        if operation_updated.rowcount == 1:
+                            conn.execute(
+                                "UPDATE operation_outbox SET state = 'blocked', claimed_by = NULL, "
+                                "claimed_until = NULL, last_error = ?, updated_at = ? WHERE operation_id = ?",
+                                ("owner_crashed", now, reservation["operation_id"]),
+                            )
+                        else:
+                            conn.execute(
+                                "UPDATE operation_outbox SET state = 'pending', claimed_by = NULL, "
+                                "claimed_until = NULL, last_error = ?, updated_at = ? "
+                                "WHERE operation_id = ? AND operation_id IN "
+                                "(SELECT operation_id FROM operations WHERE state = 'prepared')",
+                                ("owner_crashed_before_dispatch", now, reservation["operation_id"]),
+                            )
                 fencing_token = (int(row["fencing_token"]) if row is not None else 0) + 1
             conn.execute(
                 "INSERT INTO leases(repo_root, task_id, owner_id, heartbeat_at, expires_at, fencing_token) "
@@ -1619,6 +2505,31 @@ class EventStore:
                 "WHERE owner_id = ? AND fencing_token = ? AND state = 'running'",
                 (now, _json({"reason": "lease_released", "owner_id": owner_id}), owner_id, int(fencing_token)),
             )
+            operation_rows = conn.execute(
+                "SELECT DISTINCT operation_id FROM effect_reservations "
+                "WHERE owner_id = ? AND fencing_token = ? AND operation_id IS NOT NULL",
+                (owner_id, int(fencing_token)),
+            ).fetchall()
+            for operation in operation_rows:
+                operation_updated = conn.execute(
+                    "UPDATE operations SET state = 'unknown', updated_at = ?, version = version + 1 "
+                    "WHERE operation_id = ? AND state = 'dispatched'",
+                    (now, operation["operation_id"]),
+                )
+                if operation_updated.rowcount == 1:
+                    conn.execute(
+                        "UPDATE operation_outbox SET state = 'blocked', claimed_by = NULL, "
+                        "claimed_until = NULL, last_error = ?, updated_at = ? WHERE operation_id = ?",
+                        ("lease_released", now, operation["operation_id"]),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE operation_outbox SET state = 'pending', claimed_by = NULL, "
+                        "claimed_until = NULL, last_error = ?, updated_at = ? "
+                        "WHERE operation_id = ? AND operation_id IN "
+                        "(SELECT operation_id FROM operations WHERE state = 'prepared')",
+                        ("lease_released_before_dispatch", now, operation["operation_id"]),
+                    )
             # Retain the fencing epoch so a later owner cannot reuse an old token.
             conn.execute(
                 "UPDATE leases SET heartbeat_at = ?, expires_at = ? "

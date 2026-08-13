@@ -22,6 +22,8 @@ external side effect happened exactly once.
 | `events` | Append-only audit sequence |
 | `leases` | Repository owner and monotonically increasing fencing token |
 | `effect_reservations` | Non-read-only effect ownership and outcome |
+| `operations` | Logical side-effect intent, state, attempts, result digest, and evidence |
+| `operation_outbox` | Durable claim/delivery state for effect execution |
 | `schema_migrations` | Supported schema version |
 
 SQLite uses WAL, foreign keys, and `synchronous=FULL`. Projection changes and
@@ -56,7 +58,7 @@ the tool execution path.
 | Persisted terminal tool result | Replay result; do not execute again |
 | Same tool ID with different canonical arguments | Fail closed as corrupt state |
 | Read-only tool left running | Retry after lease validation |
-| File still equals recorded before-state | Revalidate policy and execute once |
+| File still equals recorded before-state | Require explicit operator retry before another write |
 | File equals expected after-state | Mark recovered success without another write |
 | File equals neither state | Enter `needs_review`; preserve external content |
 | Unknown/non-zero/timed-out Shell effect | Enter `needs_review`; never auto-retry |
@@ -107,3 +109,67 @@ Trace summaries derive metrics from durable model, tool, and event records:
 - invariant violations.
 
 JSONL exports redact common credential keys and inline secret assignments.
+
+## Phase 1 schema migration
+
+Schema version 5 is created directly for fresh Runtime databases. Existing v4
+databases require the explicit db-migrate command; normal Runtime commands fail
+closed with SchemaUpgradeRequired. Versions above v5, versions below v4
+without a registered migration, business tables without schema_migrations, and
+checksum mismatches are all rejected.
+
+The migration sequence is:
+
+1. Run SQLite integrity and active-lease preflight checks.
+2. Take a SQLite backup and verify its integrity and SHA-256.
+3. Acquire an exclusive migration transaction.
+4. Convert stale running reservations to unknown.
+5. Add operation/outbox tables and nullable compatibility projections.
+6. Backfill one deterministic operation per task/tool call.
+7. Record DDL, backfill, checksum, backup filename, and duration metadata.
+8. Commit once; any earlier fault rolls back to a complete v4 database.
+
+The migration never stores an absolute user path in schema metadata. Only the
+backup filename and digest are durable.
+
+## Phase 1 Effect Ledger
+
+The four EffectSemantics values are replay_safe, idempotent, reconcilable, and
+opaque. read_file and glob use replay_safe tool-call records and do not create
+operations. File writes use a file adapter with reconcilable post-state hashes.
+Shell uses the opaque semantics: a zero return code is recorded as evidence, not
+as a generic exactly-once guarantee.
+
+An operation is prepared together with its outbox and compatibility
+effect_reservations row. The current lease claims the outbox, then the Runtime
+marks the operation dispatched immediately before crossing the external tool
+boundary. A validation failure before that boundary keeps the operation
+prepared, releases the outbox claim, and can be explicitly retried without
+claiming that an external effect is unknown. Commit, failure, unknown, and
+reconciliation transitions use
+state-plus-version compare-and-swap, lease/fencing validation, compatibility
+projection updates, and an append-only event in one SQLite transaction.
+
+The outbox mapping is deliberately conservative:
+
+| Operation state | Outbox state | Recovery meaning |
+|---|---|---|
+| prepared | pending/claimed | Safe to claim again |
+| dispatched | claimed | Boundary was entered |
+| committed | delivered | Return the durable result; deduplicate |
+| failed | delivered | Effect failure was known |
+| unknown | blocked | Never auto-claim; reconcile |
+| cancelled | cancelled | Do not execute |
+
+For reconcilable files, a post-write hash match can complete an unknown
+operation without another write. If the file still has the before hash, only an
+explicit operator retry is allowed. An opaque Shell operation goes to
+needs_review. These rules reduce duplicate effects but intentionally do not
+claim generic Shell exactly-once execution.
+
+## Scope boundary
+
+Phase 1 remains a local SQLite protocol on a local filesystem. Docker,
+Bubblewrap, Windows restricted tokens, MCP, subagents, background scheduling,
+Postgres, distributed leases, generic HTTP adapters, dashboards, and a
+universal exactly-once declaration are outside this phase.
