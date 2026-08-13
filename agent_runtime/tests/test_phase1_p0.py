@@ -209,7 +209,7 @@ def test_fencing_rejects_stale_owner_writes_and_tool_execution(tmp_path: Path):
             release_model.wait(_WORKER_WAIT_TIMEOUT)
             return ModelResponse(text="old-owner")
 
-    first = Runtime(tmp_path, SlowModel(), owner_id="owner-a", lease_ttl=0.1)
+    first = Runtime(tmp_path, SlowModel(), owner_id="owner-a", lease_ttl=_WORKER_WAIT_TIMEOUT)
     task_id = "task-stale-model-owner"
     messages = [{"role": "user", "content": "first"}]
     first.store.bootstrap_task(
@@ -267,7 +267,7 @@ def test_stale_owner_is_fenced_around_tool_effect(tmp_path: Path):
         tmp_path,
         ScriptedModel([ModelResponse(tool_calls=[ToolCall("slow-read", "read_file", {"path": "note.txt"})])]),
         owner_id="owner-a",
-        lease_ttl=0.5,
+        lease_ttl=_WORKER_WAIT_TIMEOUT,
         fault_injector=mark_effect_boundary,
     )
     task_id = "task-stale-effect-owner"
