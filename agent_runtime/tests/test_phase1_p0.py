@@ -16,6 +16,8 @@ from agent_runtime.store import EventStore
 import agent_runtime.store as store_module
 
 LeaseLost = getattr(store_module, "LeaseLost", RuntimeError)
+_WORKER_WAIT_TIMEOUT = 30.0
+_WORKER_POLL_INTERVAL = 0.05
 
 
 def _crash_at(expected: str):
@@ -24,6 +26,31 @@ def _crash_at(expected: str):
             raise InjectedCrash(point)
 
     return inject
+
+
+def _wait_for_worker_event(
+    event: threading.Event,
+    worker: threading.Thread,
+    result: dict[str, object],
+    *,
+    label: str,
+    timeout: float = _WORKER_WAIT_TIMEOUT,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            pytest.fail(
+                f"Timed out waiting for {label}; "
+                f"first_result['error']={result.get('error')!r}"
+            )
+        if event.wait(min(_WORKER_POLL_INTERVAL, remaining)):
+            return
+        if not worker.is_alive():
+            pytest.fail(
+                f"Worker exited before {label} was signaled; "
+                f"first_result['error']={result.get('error')!r}"
+            )
 
 
 def _expire_lease(runtime: Runtime) -> None:
@@ -179,7 +206,7 @@ def test_fencing_rejects_stale_owner_writes_and_tool_execution(tmp_path: Path):
 
         def complete(self, messages, tools):
             started.set()
-            release_model.wait(10)
+            release_model.wait(_WORKER_WAIT_TIMEOUT)
             return ModelResponse(text="old-owner")
 
     first = Runtime(tmp_path, SlowModel(), owner_id="owner-a", lease_ttl=0.1)
@@ -204,23 +231,26 @@ def test_fencing_rejects_stale_owner_writes_and_tool_execution(tmp_path: Path):
 
     thread = threading.Thread(target=run_first)
     thread.start()
-    assert started.wait(10)
-    _expire_lease(first)
-
-    second = Runtime(
-        tmp_path,
-        ScriptedModel([ModelResponse(text="new-owner")]),
-        owner_id="owner-b",
-        lease_ttl=0.5,
-    )
     try:
+        _wait_for_worker_event(started, thread, first_result, label="model start")
+        _expire_lease(first)
+
+        second = Runtime(
+            tmp_path,
+            ScriptedModel([ModelResponse(text="new-owner")]),
+            owner_id="owner-b",
+            lease_ttl=0.5,
+        )
         second_result = second.run("second")
     finally:
         release_model.set()
-    thread.join(timeout=10)
+        thread.join(timeout=_WORKER_WAIT_TIMEOUT)
 
+    assert not thread.is_alive(), (
+        "Worker did not exit after release; "
+        f"first_result['error']={first_result.get('error')!r}"
+    )
     assert second_result.status == "completed"
-    assert not thread.is_alive()
     assert isinstance(first_result.get("error"), LeaseLost)
 
 
@@ -268,22 +298,25 @@ def test_stale_owner_is_fenced_around_tool_effect(tmp_path: Path):
 
     thread = threading.Thread(target=run_first)
     thread.start()
-    assert effect_started.wait(10)
-    _expire_lease(first)
-
-    second = Runtime(
-        tmp_path,
-        ScriptedModel([ModelResponse(text="new-owner")]),
-        owner_id="owner-b",
-        lease_ttl=0.5,
-    )
     try:
+        _wait_for_worker_event(effect_started, thread, first_result, label="tool effect start")
+        _expire_lease(first)
+
+        second = Runtime(
+            tmp_path,
+            ScriptedModel([ModelResponse(text="new-owner")]),
+            owner_id="owner-b",
+            lease_ttl=0.5,
+        )
         assert second.run("take over").status == "completed"
     finally:
         release_effect.set()
-    thread.join(timeout=10)
+        thread.join(timeout=_WORKER_WAIT_TIMEOUT)
 
-    assert not thread.is_alive()
+    assert not thread.is_alive(), (
+        "Worker did not exit after release; "
+        f"first_result['error']={first_result.get('error')!r}"
+    )
     assert isinstance(first_result.get("error"), LeaseLost)
     assert first.store.get_tool_call(task_id, "slow-read")["status"] == "running"
 
