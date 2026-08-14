@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.1 - Release metadata
+
+- Set the durable Agent Runtime package version to `0.2.1`.
+- Added version-consistency coverage for package metadata, CLI `--version`,
+  doctor runtime metadata, and the top Changelog entry.
+- This release is metadata, documentation, and test-only; it does not change
+  Runtime execution semantics or expand the supported safety boundaries.
+
 ## v0.2.0.dev1 - Phase 1 Effect Ledger
 
 - Added explicit, checksum-verified SQLite SchemaManager migrations.
