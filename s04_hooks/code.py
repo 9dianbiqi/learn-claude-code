@@ -158,6 +158,9 @@ TOOL_HANDLERS = {
 
 HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []}
 
+# s04+: accumulate actual token usage from API responses
+SESSION_TOKENS = {"input": 0, "output": 0}
+
 def register_hook(event: str, callback):
     HOOKS[event].append(callback)
 
@@ -216,10 +219,11 @@ def context_inject_hook(query: str):
 
 # Stop hook: print summary when loop is about to exit
 def summary_hook(messages: list):
+    total = SESSION_TOKENS["input"] + SESSION_TOKENS["output"]
     tool_count = sum(1 for m in messages
                      for b in (m.get("content") if isinstance(m.get("content"), list) else [])
                      if isinstance(b, dict) and b.get("type") == "tool_result")
-    print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
+    print(f"\033[90m[HOOK] Stop: used {SESSION_TOKENS['input']:,}→{SESSION_TOKENS['output']:,} tokens ({total:,} total), {tool_count} tool calls\033[0m")
     return None
 
 register_hook("UserPromptSubmit", context_inject_hook)
@@ -241,6 +245,10 @@ def agent_loop(messages: list):
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
+        # s04+: accumulate token usage from API response
+        SESSION_TOKENS["input"] += response.usage.input_tokens
+        SESSION_TOKENS["output"] += response.usage.output_tokens
+
         messages.append({"role": "assistant", "content": response.content})
 
         if response.stop_reason != "tool_use":

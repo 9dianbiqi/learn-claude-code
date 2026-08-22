@@ -15,6 +15,88 @@ Status values: `OPEN`, `FIXED`, `VERIFIED`, `DEFERRED`, `REOPENED`.
 | P0-4 Permission rule fail-closed scoping | P0 | VERIFIED | Phase 5 | Independent deny/composition matrix passes |
 | P0-5 Runtime internal namespace isolation | P0 | VERIFIED | Phase 1 | Phase 3 independent namespace checks pass |
 
+## Phase 1 follow-up review
+
+- Review finding: the v0.2 Runtime marked an operation `dispatched` before its
+  final file, lease, and Shell preflight checks.
+- Fix: `mark_operation_dispatched()` now runs immediately before
+  `tools.execute()`. A pre-dispatch failure keeps the operation `prepared`,
+  returns the outbox to `pending`, cancels only the local reservation, and
+  supports an explicit safe retry.
+- Tests: subprocess exit after migration DDL, prepare/claim/dispatch/commit
+  transaction rollback, illegal state transition no-op, resolve projection
+  matrix, pre-dispatch file conflict retry, and token/API-key/Authorization
+  redaction.
+- Verification status: `FIXED`; independent review remains required before
+  changing this follow-up item to `VERIFIED`.
+
+### PR #2 migration review follow-up
+
+- The v4-to-v5 migration now validates legacy reservation/tool projections
+  before changing v4 rows or applying v5 DDL. Invalid completed/running
+  reservation histories fail closed and remain readable v4 databases.
+- P2 deferred: the current contract requires sensitive fields to be redacted
+  in operation events and exported Trace/JSONL. It does not define a blanket
+  prohibition on every generic event payload being stored in plaintext in the
+  local Runtime DB. Generic event-payload-at-rest redaction remains a v0.2
+  hardening item and is not part of this merge-blocker fix.
+
+### PR #2 final blocker closure
+
+The preceding independent review recorded `REJECT FOR MERGE` for two remaining
+blockers. That historical result is retained; this section records the
+follow-up reproduction and fix.
+
+#### Legacy projection validation
+
+- Pre-fix reproduction at the PR head: six schema-valid v4 fixtures migrated
+  successfully and then produced immediate v5 invariant violations. The
+  fixtures were a completed task without a checkpoint, a failed task without a
+  checkpoint, an aborted task without a checkpoint, a `needs_review` task with
+  a succeeded tool, a `waiting_approval` task with a succeeded tool, and a
+  completed task with a planned tool.
+- Root cause: `_validate_legacy_rows()` checked only a subset of
+  reservation/tool relationships. It did not validate the task, checkpoint,
+  event, and review projection that `scan_invariants()` already enforced.
+- Fix: the shared `_legacy_projection_violations()` validator now covers task
+  status, task/checkpoint ownership and phase, terminal/review events,
+  checkpoint-saved pointers, executable terminal/review tools, orphan events,
+  tool statuses, and reservation/tool/task projections. Migration invokes it
+  before stale-running mutation, DDL, backfill, or schema-version update;
+  `scan_invariants()` uses the same validator with only the v5 prepared
+  operation exception.
+- After-fix evidence: all six fixtures reject twice; schema remains v4, the
+  complete SQLite snapshot is unchanged, no v5 tables/columns appear, and
+  `PRAGMA integrity_check` is `ok`. A legal completed+succeeded fixture
+  migrates to v5 and scans with zero violations. A mixed legal v4 projection
+  parity fixture also migrates and scans with zero violations.
+- Tests: migration targeted `33 passed`; migration fault/rollback subset
+  `6 passed`; the six adversarial cases are included in the targeted count.
+
+#### Windows fencing test determinism
+
+- Pre-fix CI reproduction: Windows Runtime run `31678898092` failed the two
+  fencing tests at `started.wait(2)` and `effect_started.wait(2)` while the
+  other Runtime tests passed (`2 failed, 173 passed`). Local repeated runs
+  showed the Runtime behavior was correct; the test depended on scheduler and
+  wall-clock lease timing.
+- Root cause: the tests used `sleep()` both to wait for the effect boundary and
+  to make the lease expire. Under Windows CI load the owner thread was not
+  guaranteed to reach the event before the fixed two-second wait.
+- Fix: tests now synchronize at Runtime fault hooks/events, inject lease expiry
+  directly in the disposable test database, release the blocked model/effect
+  through events, and assert the owner thread terminates. No Runtime fencing,
+  takeover, stale-write, or effect barrier semantics were changed.
+- After-fix evidence: the two-test fencing subset passed `20/20` repetitions
+  (`40 passed, 0 failed`); Runtime tests passed `180 passed, 2 skipped`.
+
+CI evidence for commit `d1b937a09d4d8b19b69c8d211f3fa23fdb26dfce`: Agent
+Runtime push run `31686341539` and pull-request run `31686344680` both passed,
+including Windows jobs `94403176801` and `94403188227`; the Test workflow
+(`31686344638`) and CI workflow (`31686344584`) also passed. The PR required
+check rollup was `7/7 pass`. P2 generic event-payload-at-rest redaction
+remains `DEFERRED` under the existing contract documented above.
+
 ## P0-1 — Bootstrap / initial checkpoint atomicity
 
 - First identified: adversarial review against the Phase 1 baseline.
@@ -948,3 +1030,40 @@ baseline commit containing the intended `agent_runtime/`, `evals/`,
 and workspace changes; propose commit message `feat(agent-runtime): freeze
 v0.1 hardened runtime baseline`; and propose tag `agent-runtime-v0.1`. No Git
 operation is executed by this review.
+## v0.2.0.dev1 Phase 1 - Schema Migration and Effect Ledger
+
+Phase 1 adds an explicit v4-to-v5 migration framework and a durable
+operations/operation_outbox ledger. Fresh databases are created directly at
+v5; normal Runtime startup does not silently mutate an existing v4 database.
+Migration preflight checks SQLite integrity and unexpired leases, creates and
+verifies a SQLite backup, preserves the legacy effect_reservations barrier,
+converts stale running reservations to unknown, and commits DDL, backfill,
+metadata, and audit projections as one transaction.
+
+The operation state machine is prepared -> dispatched -> committed, with
+cancelled, failed, and unknown recovery branches. Every ledger transition uses
+state-plus-version CAS and lease/fencing validation. Events contain only
+operation_id, tool_use_id, semantics, adapter, attempt, state, and a bounded
+reason; request and effect result payloads stay out of operation audit events.
+
+File effects are reconcilable from before/after SHA-256 evidence. An unknown
+file effect can be completed when the post hash matches; a before-hash match
+requires an explicit retry. Shell remains opaque and enters needs_review after
+an ambiguous boundary. Phase 1 does not implement an OS sandbox or claim
+generic Shell exactly-once execution.
+
+## v0.3.0.dev1 Phase 1 - Durable Memory, Context Projector, Plan Store
+
+v0.3 Phase 1 upgrades the schema to v6 and adds `memories`, `memory_links`,
+`summaries`, `plans`, and `plan_items` as durable long-horizon state. The
+runtime wires a read-only `ContextProjector` immediately before each model
+call so the model sees a compact view of the active plan item, memories,
+summaries, and recent review/failure evidence while `checkpoints.messages_json`
+stays the authoritative conversation history.
+
+Projected model calls record `source_checkpoint_id` and projection metrics in
+`model_calls.projection_json`; trace summaries and JSONL exports now carry
+projection token estimates and plan transition events. Plan items follow
+pending -> in_progress -> verifying -> completed (with failed -> retryable) and
+only reach `completed` from verifier evidence. This phase adds no OS sandbox,
+MCP, subagents, background scheduling, or remote coordination.

@@ -169,12 +169,15 @@ def run_git(args: list[str]) -> tuple[bool, str]:
     """Run git command. Return (ok, output)."""
     try:
         r = subprocess.run(["git"] + args, cwd=WORKDIR,
-                           capture_output=True, text=True, timeout=30)
-        out = (r.stdout + r.stderr).strip()
+                           capture_output=True, text=True,
+                           encoding='utf-8', errors='replace', timeout=30)
+        stdout = r.stdout or ""
+        stderr = r.stderr or ""
+        out = (stdout + stderr).strip()
         out = out[:5000] if out else "(no output)"
         return r.returncode == 0, out
-    except subprocess.TimeoutExpired:
-        return False, "Error: git timeout"
+    except Exception as e:
+        return False, f"Error: {e}"
 
 
 def log_event(event_type: str, worktree_name: str, task_id: str = ""):
@@ -311,11 +314,14 @@ def safe_path(p: str, cwd: Path = None) -> Path:
 def run_bash(command: str, cwd: Path = None) -> str:
     try:
         r = subprocess.run(command, shell=True, cwd=cwd or WORKDIR,
-                           capture_output=True, text=True, timeout=120)
-        out = (r.stdout + r.stderr).strip()
+                           capture_output=True, text=True,
+                           encoding='utf-8', errors='replace', timeout=120)
+        stdout = r.stdout or ""
+        stderr = r.stderr or ""
+        out = (stdout + stderr).strip()
         return out[:50000] if out else "(no output)"
-    except subprocess.TimeoutExpired:
-        return "Error: Timeout (120s)"
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
 
 
 def run_read(path: str, limit: int | None = None, cwd: Path = None) -> str:
