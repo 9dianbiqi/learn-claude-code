@@ -124,3 +124,19 @@ GitHub Issues in `9dianbiqi/learn-claude-code`, using the `gh` CLI. See `docs/ag
 ### Domain docs
 
 Single-context: `CONTEXT.md` at the repo root plus `docs/adr/`. See `docs/agents/domain.md`.
+
+## Projects
+
+The repository hosts two independent projects:
+
+- **Teaching track**: the progressive course in `agents/`, `docs/{en,zh,ja}/`,
+  `skills/`, `tests/` and the `sNN_*` example directories. It remains a
+  self-contained learning repo.
+- **agent_runtime**: an independent runtime project under `agent_runtime/`,
+  with its own README, CLI, schema migrations, tests and evidence pipeline.
+  Treat it as a separate codebase even though it lives in the same git repo.
+
+Reuse rule: teaching scripts are self-contained demos, not an importable
+library. When a runtime phase needs a teaching mechanism, port the relevant
+module into `agent_runtime/` with tests and record the source in the phase doc
+or an ADR instead of importing from `agents/` or `sNN_*/`.

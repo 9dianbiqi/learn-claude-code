@@ -2,7 +2,7 @@
 
 ## Status
 
-Planned for v0.3. This phase replaces teaching-thread/in-memory queues with a
+Implemented in `v0.3.0.dev2`. This phase replaces teaching-thread/in-memory queues with a
 SQLite-backed job system that can survive process restart.
 
 ## Objective
@@ -148,4 +148,3 @@ lifecycle directly.
 - No external distributed queue.
 - No generic exactly-once for arbitrary shell payloads.
 - Cron timezone and calendar extensions are deferred.
-
