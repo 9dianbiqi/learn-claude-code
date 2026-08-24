@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -18,6 +19,7 @@ from .permissions import PermissionEngine
 from .providers import AnthropicModel
 from .runtime import Runtime
 from .store import EventStore
+from .tool_registry import ToolRegistry
 from .trace import TraceReporter
 
 
@@ -65,6 +67,11 @@ def _add_repo(parser: argparse.ArgumentParser) -> None:
 
 def _add_policy(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--policy", help="Optional allow/ask/deny YAML policy.")
+
+
+def _mcp_connection_id(server_name: str) -> str:
+    slug = re.sub(r"[^0-9A-Za-z]+", "-", str(server_name)).strip("-").casefold()
+    return f"conn-{slug or 'mcp'}"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -148,6 +155,24 @@ def build_parser() -> argparse.ArgumentParser:
     db_migrate = sub.add_parser("db-migrate", help="Plan or apply an explicit SQLite schema migration.")
     _add_repo(db_migrate)
     db_migrate.add_argument("--dry-run", action="store_true")
+
+    mcp = sub.add_parser("mcp", help="Manage MCP server connections and discovered tools.")
+    mcp_sub = mcp.add_subparsers(dest="mcp_action", required=True)
+
+    mcp_add = mcp_sub.add_parser("add", help="Add or update an MCP server connection.")
+    _add_repo(mcp_add)
+    mcp_add.add_argument("--server", required=True, help="Stable MCP server name.")
+    mcp_add.add_argument("--endpoint", required=True, help="Executable that launches the stdio MCP server.")
+    mcp_add.add_argument("--arg", action="append", default=[], help="Argument passed to the executable (repeatable).")
+    mcp_add.add_argument("--auth-token-env", help="Environment variable that carries the server auth token.")
+    mcp_add.add_argument("--connection", help="Optional explicit connection id (default: derived from server name).")
+
+    mcp_list = mcp_sub.add_parser("list", help="List MCP connections and their registered tools.")
+    _add_repo(mcp_list)
+
+    mcp_refresh = mcp_sub.add_parser("refresh", help="Discover tools from configured MCP servers.")
+    _add_repo(mcp_refresh)
+    mcp_refresh.add_argument("--connection", help="Refresh only this connection id (default: all).")
 
     evaluation = sub.add_parser("eval", help="Run a deterministic fixed-task suite.")
     evaluation.add_argument("--suite", required=True)
@@ -277,6 +302,85 @@ def _events(args: argparse.Namespace) -> list[dict[str, Any]]:
     if args.event_type:
         events = [event for event in events if event["type"] == args.event_type]
     return events[-args.limit:]
+
+
+def _mcp_add(args: argparse.Namespace) -> dict[str, Any]:
+    server_name = str(args.server)
+    auth_profile = {}
+    if args.auth_token_env:
+        auth_profile["auth_token_env"] = str(args.auth_token_env)
+    store = _store(args, must_exist=False)
+    return store.upsert_mcp_connection(
+        connection_id=args.connection or _mcp_connection_id(server_name),
+        server_name=server_name,
+        endpoint=str(args.endpoint),
+        args=list(args.arg),
+        auth_profile=auth_profile,
+    )
+
+
+def _mcp_list(args: argparse.Namespace) -> list[dict[str, Any]]:
+    store = _store(args)
+    connections = store.list_mcp_connections()
+    tools_by_connection: dict[str, list[dict[str, Any]]] = {
+        str(connection["connection_id"]): [] for connection in connections
+    }
+    for item in store.list_tool_registrations(enabled_only=True):
+        connection_id = item.get("connection_id")
+        if connection_id is not None and str(connection_id) in tools_by_connection:
+            tools_by_connection[str(connection_id)].append({
+                "tool_name": item["tool_name"],
+                "source_tool_name": item.get("source_tool_name"),
+                "effect_kind": item["effect_kind"],
+            })
+    return [
+        {
+            **connection,
+            "tools": tools_by_connection[str(connection["connection_id"])],
+        }
+        for connection in connections
+    ]
+
+
+def _mcp_refresh(args: argparse.Namespace) -> list[dict[str, Any]]:
+    store = _store(args)
+    if args.connection:
+        connection = store.get_mcp_connection(args.connection)
+        if connection is None:
+            raise SystemExit(f"MCP connection not found: {args.connection}")
+        connections = [connection]
+    else:
+        connections = store.list_mcp_connections()
+
+    registry = ToolRegistry(_repo(args), store=store)
+    results: list[dict[str, Any]] = []
+    for connection in connections:
+        connection_id = str(connection["connection_id"])
+        try:
+            entries = registry.discover_mcp(connection_id)
+        except Exception as exc:
+            results.append({
+                "connection_id": connection_id,
+                "server_name": str(connection["server_name"]),
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "tools": [],
+            })
+            continue
+        results.append({
+            "connection_id": connection_id,
+            "server_name": str(connection["server_name"]),
+            "status": "connected",
+            "tools": [
+                {
+                    "tool_name": entry.tool_name,
+                    "source_tool_name": entry.source_tool_name,
+                    "effect_kind": entry.effect_kind,
+                }
+                for entry in entries
+            ],
+        })
+    return results
 
 
 def _check(name: str, status: str, message: str, **details: Any) -> dict[str, Any]:
@@ -514,4 +618,15 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         _print_json(report.as_dict())
         return 0 if report.ok else 2
+    if args.command == "mcp":
+        if args.mcp_action == "add":
+            _print_json(_mcp_add(args))
+            return 0
+        if args.mcp_action == "list":
+            _print_json(_mcp_list(args))
+            return 0
+        if args.mcp_action == "refresh":
+            results = _mcp_refresh(args)
+            _print_json(results)
+            return 0 if all(item["status"] != "error" for item in results) else 2
     raise SystemExit(f"Unsupported command: {args.command}")

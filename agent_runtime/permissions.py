@@ -27,7 +27,6 @@ class PermissionEngine:
     """Fail-closed allow/ask/deny policy evaluation."""
 
     _file_tools = {"read_file", "glob", "write_file", "edit_file"}
-    _known_tools = _file_tools | {"bash"}
     _internal_namespace = ".agent_runtime"
 
     _hard_deny = (
@@ -61,8 +60,19 @@ class PermissionEngine:
         r"python\s+-m\s+pytest\s+--collect-only(?:\s+.*)?",
     )
 
-    def __init__(self, repo_root: str | Path, policy_path: str | Path | None = None):
+    def __init__(
+        self,
+        repo_root: str | Path,
+        policy_path: str | Path | None = None,
+        tool_registry: Any | None = None,
+    ):
         self.repo_root = Path(repo_root).resolve()
+        self.tool_registry = tool_registry
+        self._known_tools = set(self._file_tools) | {"bash"}
+        if tool_registry is not None:
+            self._known_tools.update(
+                entry.tool_name for entry in tool_registry.list_tools() if entry.enabled
+            )
         self.rules = self._load_rules(policy_path)
 
     @staticmethod
@@ -111,6 +121,10 @@ class PermissionEngine:
             if any(re.fullmatch(pattern, command) for pattern in self._read_only_commands):
                 return "read_only"
             return "unknown_write"
+        if self.tool_registry is not None:
+            entry = self.tool_registry.get(tool_name)
+            if entry is not None and entry.enabled:
+                return entry.effect_kind
         return "unknown_write"
 
     def evaluate(self, tool_name: str, args: dict[str, Any]) -> PermissionDecision:

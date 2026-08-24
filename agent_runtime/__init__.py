@@ -4,7 +4,7 @@ from .models import ModelResponse, RunResult, ToolCall
 from .effects import EffectSemantics, OperationSpec, ReconcileEvidence
 from .runtime import Runtime
 
-__version__ = "0.3.0.dev2"
+__version__ = "0.3.0.dev3"
 
 __all__ = [
     "EffectSemantics",

@@ -142,10 +142,40 @@ and an item only becomes `completed` after a verifier supplies evidence. Trace
 summaries and JSONL exports now include projection token estimates and plan
 transition metrics.
 
+## v0.3 Phase 4: Tool Registry + MCP
+
+Phase 4 replaces the static tool map with a durable `ToolRegistry` and adds a
+real stdio MCP client. Built-in tools are registry entries, and discovered MCP
+tools are exposed as `mcp__<server>__<tool>` with schemas fed into model
+context and permission evaluation. Tool and connection metadata lives in
+`tool_registrations` and `mcp_connections`; MCP tokens are referenced by
+environment variable and never persisted.
+
+Manage connections:
+
+```powershell
+python -m agent_runtime mcp add `
+  --repo $sandbox `
+  --server github `
+  --endpoint docker `
+  --arg "run" --arg "-i" --arg "--rm" `
+  --arg "ghcr.io/github/github-mcp-server" `
+  --auth-token-env GITHUB_PERSONAL_ACCESS_TOKEN
+
+python -m agent_runtime mcp refresh --repo $sandbox
+python -m agent_runtime mcp list --repo $sandbox
+```
+
+`mcp refresh` launches each configured stdio server, registers its tools, and
+records `connected` or `error` status. GitHub uses the official
+`ghcr.io/github/github-mcp-server` image with a
+`GITHUB_PERSONAL_ACCESS_TOKEN` that has `repo`, `read:packages`, and `read:org`
+scopes. Add matching `allow` policy rules before the model may call MCP tools.
+
 ## Requirements
 
 - Python 3.11+
-- `anthropic`, `python-dotenv`, and `PyYAML`
+- `anthropic`, `mcp`, `python-dotenv`, and `PyYAML`
 - `pytest` for the test suite
 
 Install dependencies from the repository root:
@@ -320,7 +350,7 @@ Deferred beyond Phase 1:
 
 - worktree-based parallel execution;
 - background scheduling and Cron;
-- MCP and sub-agent orchestration;
+- sub-agent orchestration;
 - distributed or multi-machine coordination;
 - a full OS-level Shell sandbox;
 - OpenTelemetry and visual dashboards;
@@ -341,6 +371,8 @@ agent_runtime/
   store.py         SQLite projections, transactions, leases, and ledger API
   migrations.py    explicit v4/v5-to-v6 schema migration and backup framework
   projector.py     read-only context projector (memories, summaries, plans)
+  mcp_client.py    stdio MCP discovery, invocation, timeout, and auth reference
+  tool_registry.py durable built-in + MCP tool registry
   effects.py       EffectSemantics and operation specifications
   permissions.py   allow/ask/deny evaluation
   tools.py         repository tools and file safety

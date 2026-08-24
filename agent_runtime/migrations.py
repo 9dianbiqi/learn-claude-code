@@ -10,10 +10,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 7
-MIGRATION_NAME = "v7_background_jobs"
+SCHEMA_VERSION = 8
+MIGRATION_NAME = "v8_tool_registry_mcp"
 V5_MIGRATION_NAME = "v5_effect_ledger"
 V6_MIGRATION_NAME = "v6_durable_context"
+V7_MIGRATION_NAME = "v7_background_jobs"
+V8_MIGRATION_NAME = "v8_tool_registry_mcp"
 MAX_EVENT_PAYLOAD_BYTES = 1 * 1024 * 1024
 
 _TASK_STATUSES = frozenset({
@@ -542,6 +544,60 @@ _V7_MIGRATION_SOURCE = "\n".join(
 V7_CHECKSUM = _sha256_text(_V7_MIGRATION_SOURCE)
 
 
+_V8_ADDITIONS = (
+    """
+    CREATE TABLE IF NOT EXISTS tool_registrations (
+        registration_id TEXT PRIMARY KEY,
+        tool_name TEXT NOT NULL UNIQUE,
+        adapter_kind TEXT NOT NULL,
+        connection_id TEXT,
+        server_name TEXT,
+        source_tool_name TEXT,
+        description TEXT NOT NULL DEFAULT '',
+        schema_json TEXT NOT NULL,
+        effect_kind TEXT NOT NULL,
+        permission_json TEXT NOT NULL,
+        timeout_seconds REAL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        version INTEGER NOT NULL DEFAULT 1,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        CHECK (adapter_kind IN ('builtin', 'mcp')),
+        CHECK (effect_kind IN ('read_only', 'file_write', 'idempotent', 'unknown_write', 'opaque')),
+        CHECK (timeout_seconds IS NULL OR timeout_seconds > 0)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS mcp_connections (
+        connection_id TEXT PRIMARY KEY,
+        server_name TEXT NOT NULL UNIQUE,
+        transport TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        args_json TEXT NOT NULL DEFAULT '[]',
+        auth_profile_json TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL DEFAULT 'configured',
+        last_connected_at REAL,
+        last_error TEXT,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        CHECK (transport IN ('stdio')),
+        CHECK (status IN ('configured', 'connected', 'error', 'disabled'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_tool_registrations_adapter ON tool_registrations(adapter_kind, enabled)",
+    "CREATE INDEX IF NOT EXISTS idx_mcp_connections_status ON mcp_connections(status, server_name)",
+)
+
+
+_V8_MIGRATION_SOURCE = "\n".join(
+    [statement.strip() for statement in _BASE_SCHEMA]
+    + [statement.strip() for statement in _V6_ADDITIONS]
+    + [statement.strip() for statement in _V7_ADDITIONS]
+    + [statement.strip() for statement in _V8_ADDITIONS]
+)
+V8_CHECKSUM = _sha256_text(_V8_MIGRATION_SOURCE)
+
+
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in columns:
@@ -577,6 +633,8 @@ def _business_tables(table_names: set[str]) -> set[str]:
         "agent_jobs",
         "job_runs",
         "cron_schedules",
+        "tool_registrations",
+        "mcp_connections",
     }
 
 
@@ -1091,11 +1149,16 @@ def _apply_v7_background_jobs(conn: sqlite3.Connection) -> None:
     _execute_all(conn, _V7_ADDITIONS)
 
 
+def _apply_v8_tool_registry(conn: sqlite3.Connection) -> None:
+    _execute_all(conn, _V8_ADDITIONS)
+
+
 def _create_latest_schema(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys=ON")
     _execute_all(conn, _BASE_SCHEMA)
     _apply_v6_durable_context(conn)
     _apply_v7_background_jobs(conn)
+    _apply_v8_tool_registry(conn)
     row = conn.execute("SELECT 1 FROM schema_migrations WHERE version = ?", (SCHEMA_VERSION,)).fetchone()
     if row is None:
         conn.execute(
@@ -1104,13 +1167,14 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
                 version, name, checksum, applied_at, duration_ms, backup_filename, backup_sha256
             ) VALUES (?, ?, ?, ?, ?, NULL, NULL)
             """,
-            (SCHEMA_VERSION, MIGRATION_NAME, V7_CHECKSUM, _now(), 0.0),
+            (SCHEMA_VERSION, MIGRATION_NAME, V8_CHECKSUM, _now(), 0.0),
         )
 
 
 V5_MIGRATION = Migration(5, V5_MIGRATION_NAME, V5_CHECKSUM, _apply_v5_effect_ledger)
 V6_MIGRATION = Migration(6, V6_MIGRATION_NAME, V6_CHECKSUM, _apply_v6_durable_context)
-V7_MIGRATION = Migration(7, MIGRATION_NAME, V7_CHECKSUM, _apply_v7_background_jobs)
+V7_MIGRATION = Migration(7, V7_MIGRATION_NAME, V7_CHECKSUM, _apply_v7_background_jobs)
+V8_MIGRATION = Migration(8, V8_MIGRATION_NAME, V8_CHECKSUM, _apply_v8_tool_registry)
 
 
 class SchemaManager:
@@ -1137,7 +1201,7 @@ class SchemaManager:
 
     @property
     def migrations(self) -> tuple[Migration, ...]:
-        return (V5_MIGRATION, V6_MIGRATION, V7_MIGRATION)
+        return (V5_MIGRATION, V6_MIGRATION, V7_MIGRATION, V8_MIGRATION)
 
     def _connect(self, *, read_only: bool = False) -> sqlite3.Connection:
         if read_only:
@@ -1179,7 +1243,7 @@ class SchemaManager:
             if not {"name", "checksum"} <= columns:
                 raise MigrationValidationError("schema_migrations is missing migration audit columns")
             latest = next(row for row in rows if int(row["version"]) == SCHEMA_VERSION)
-            if str(latest["name"]) != MIGRATION_NAME or str(latest["checksum"]) != V7_CHECKSUM:
+            if str(latest["name"]) != MIGRATION_NAME or str(latest["checksum"]) != V8_CHECKSUM:
                 raise MigrationChecksumMismatch(
                     f"migration checksum mismatch for v{SCHEMA_VERSION}: "
                     f"{latest['name']!r}/{latest['checksum']!r}"
@@ -1189,6 +1253,7 @@ class SchemaManager:
                 "events", "leases", "operations", "operation_outbox", "effect_reservations",
                 "memories", "memory_links", "summaries", "plans", "plan_items",
                 "agent_jobs", "job_runs", "cron_schedules",
+                "tool_registrations", "mcp_connections",
             }
             missing = sorted(required - tables)
             if missing:
@@ -1238,6 +1303,16 @@ class SchemaManager:
                 "cron_schedules": {
                     "schedule_id", "task_id", "expression", "job_kind", "payload_json",
                     "enabled", "last_triggered_at", "next_trigger_at",
+                },
+                "tool_registrations": {
+                    "registration_id", "tool_name", "adapter_kind", "description", "schema_json",
+                    "effect_kind", "permission_json", "timeout_seconds", "enabled", "version",
+                    "created_at", "updated_at",
+                },
+                "mcp_connections": {
+                    "connection_id", "server_name", "transport", "endpoint", "args_json",
+                    "auth_profile_json", "status", "last_connected_at", "last_error",
+                    "created_at", "updated_at",
                 },
             }
             for table, columns in required_columns.items():
@@ -1537,6 +1612,8 @@ class SchemaManager:
                 _apply_v6_durable_context(conn)
             if 7 in expected_versions:
                 _apply_v7_background_jobs(conn)
+            if 8 in expected_versions:
+                _apply_v8_tool_registry(conn)
 
             duration_ms = (time.perf_counter() - started) * 1000.0
             for migration in pending:
@@ -1615,4 +1692,5 @@ __all__ = [
     "V5_CHECKSUM",
     "V6_CHECKSUM",
     "V7_CHECKSUM",
+    "V8_CHECKSUM",
 ]

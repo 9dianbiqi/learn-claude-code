@@ -19,7 +19,8 @@ from .effects import (
 from .models import ModelResponse, RunResult, ToolCall
 from .permissions import PermissionDecision, PermissionEngine
 from .store import EffectBlocked, EventStore, InvariantViolation, LeaseLost, StaleState
-from .tools import FileConflict, ShellResult, TOOL_SCHEMAS, ToolExecutor
+from .tools import FileConflict, ShellResult, ToolExecutor
+from .tool_registry import ToolRegistry
 from .projector import ContextProjector
 
 
@@ -69,7 +70,14 @@ class Runtime:
         self.tools = ToolExecutor(self.repo_root)
         if float(self.tools.shell_timeout) >= lease_ttl:
             self.tools.shell_timeout = max(0.01, float(lease_ttl) * 0.8)
-        self.permissions = PermissionEngine(self.repo_root, policy_path=policy_path)
+        self.tool_registry = ToolRegistry(self.repo_root, executor=self.tools, store=self.store)
+        self.tool_registry.install_builtins()
+        self.tool_registry.load_from_store()
+        self.permissions = PermissionEngine(
+            self.repo_root,
+            policy_path=policy_path,
+            tool_registry=self.tool_registry,
+        )
         self._pending_review: tuple[str, str, str] | None = None
         self.projector = ContextProjector(self.store)
 
@@ -323,7 +331,8 @@ class Runtime:
                 checkpoint_id = self.store.get_task(task_id)["checkpoint_id"]
                 projection = self.projector.project(task_id, messages, checkpoint_id)
                 projected_messages = projection.messages
-                request = {"messages": messages, "tools": TOOL_SCHEMAS}
+                tool_schemas = self.tool_registry.schemas()
+                request = {"messages": messages, "tools": tool_schemas}
                 model_call_id = self.store.create_model_call(
                     task_id,
                     turn,
@@ -333,7 +342,7 @@ class Runtime:
                 )
                 self._fault("before_model_call", task_id=task_id, turn=turn)
                 try:
-                    response: ModelResponse = self.model.complete(projected_messages, TOOL_SCHEMAS)
+                    response: ModelResponse = self.model.complete(projected_messages, tool_schemas)
                 except Exception as exc:
                     self.store.finish_model_call(model_call_id, error=f"{type(exc).__name__}: {exc}")
                     self.store.append_event(task_id, "model_failed", {"error": str(exc), "turn": turn})
@@ -420,6 +429,12 @@ class Runtime:
             results.append({"type": "tool_result", "tool_use_id": call.id, "content": output})
         messages.append({"role": "user", "content": results})
         self.store.save_checkpoint(task_id, "tool_results_appended", messages, {"turn": turn + 1})
+
+    def _execute_tool(self, name: str, args: dict[str, Any]) -> Any:
+        entry = self.tool_registry.get(name)
+        if entry is None or not entry.enabled or entry.adapter is None:
+            raise RuntimeError(f"Tool has no executable adapter: {name}")
+        return entry.adapter(args)
 
     def _execute_call(self, task_id: str, turn: int, call: ToolCall) -> str:
         args_hash = canonical_args_hash(call.name, call.input)
@@ -524,7 +539,7 @@ class Runtime:
             self._fault("after_tool_started", task_id=task_id, tool_use_id=call.id)
             self._assert_lease_for_effect(task_id, call.id, "before_tool_effect")
             try:
-                raw_output = self.tools.execute(call.name, call.input)
+                raw_output = self._execute_tool(call.name, call.input)
             except Exception as exc:
                 reason = f"{type(exc).__name__}: {exc}"
                 self.store.update_tool_call(
@@ -628,7 +643,7 @@ class Runtime:
         # state transition; any failure before it remains safely prepared.
         operation = self.store.mark_operation_dispatched(operation["operation_id"])
         try:
-            raw_output = self.tools.execute(call.name, call.input)
+            raw_output = self._execute_tool(call.name, call.input)
         except FileConflict as exc:
             reason = str(exc)
             self.store.mark_operation_unknown(operation["operation_id"], reason)

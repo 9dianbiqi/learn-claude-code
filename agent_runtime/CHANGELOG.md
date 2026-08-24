@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.3.0.dev3 - Phase 4 Tool Registry & MCP
+
+- Added a durable `ToolRegistry` as the single tool dispatch path; built-in
+  tools are registry entries and tool schemas flow into model context.
+- Added `tool_registrations` and `mcp_connections` metadata tables via a v8
+  schema migration with connection status, last-connected time, and error
+  history.
+- Added a real stdio MCP client that discovers tools, normalizes
+  `mcp__<server>__<tool>` names, infers read-only/idempotent/write hints from
+  tool annotations, and persists callable adapters.
+- MCP authentication uses an environment-variable reference
+  (`auth_token_env`); tokens are never written to the database.
+- `PermissionEngine` evaluates registered MCP tools and fails closed for
+  unregistered or unknown MCP tools.
+- Added `mcp add`, `mcp list`, and `mcp refresh` CLI lifecycle commands with
+  GitHub setup documentation.
+- Bumped the package version.
+
 ## v0.3.0.dev2 - Phase 2 Background Jobs & Cron
 
 - Added durable `agent_jobs`, `job_runs`, and `cron_schedules` tables via a

@@ -2979,6 +2979,200 @@ class EventStore:
                 triggered.append(job_id)
         return triggered
 
+    def upsert_tool_registration(
+        self,
+        *,
+        registration_id: str,
+        tool_name: str,
+        adapter_kind: str,
+        schema: dict[str, Any],
+        effect_kind: str,
+        connection_id: str | None = None,
+        server_name: str | None = None,
+        source_tool_name: str | None = None,
+        description: str = "",
+        permission_requirements: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
+        enabled: bool = True,
+        version: int = 1,
+    ) -> dict[str, Any]:
+        if adapter_kind not in {"builtin", "mcp"}:
+            raise ValueError(f"Invalid adapter kind: {adapter_kind!r}")
+        if effect_kind not in {"read_only", "file_write", "idempotent", "unknown_write", "opaque"}:
+            raise ValueError(f"Invalid effect kind: {effect_kind!r}")
+        if timeout_seconds is not None and float(timeout_seconds) <= 0:
+            raise ValueError("Tool timeout must be positive")
+        now = _now()
+        schema_json = _checked_json(schema, MAX_EVENT_PAYLOAD_BYTES, "tool schema")
+        permission_json = _checked_json(
+            permission_requirements or {},
+            MAX_EVENT_PAYLOAD_BYTES,
+            "tool permission requirements",
+        )
+        with self.transaction(guard=False) as conn:
+            conn.execute(
+                """
+                INSERT INTO tool_registrations(
+                    registration_id, tool_name, adapter_kind, connection_id, server_name,
+                    source_tool_name, description, schema_json,
+                    effect_kind, permission_json, timeout_seconds, enabled, version,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tool_name) DO UPDATE SET
+                    registration_id = excluded.registration_id,
+                    adapter_kind = excluded.adapter_kind,
+                    connection_id = excluded.connection_id,
+                    server_name = excluded.server_name,
+                    source_tool_name = excluded.source_tool_name,
+                    description = excluded.description,
+                    schema_json = excluded.schema_json,
+                    effect_kind = excluded.effect_kind,
+                    permission_json = excluded.permission_json,
+                    timeout_seconds = excluded.timeout_seconds,
+                    enabled = excluded.enabled,
+                    version = excluded.version,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    registration_id,
+                    tool_name,
+                    adapter_kind,
+                    connection_id,
+                    server_name,
+                    source_tool_name,
+                    description,
+                    schema_json,
+                    effect_kind,
+                    permission_json,
+                    timeout_seconds,
+                    1 if enabled else 0,
+                    version,
+                    now,
+                    now,
+                ),
+            )
+        return self.get_tool_registration(tool_name)  # type: ignore[return-value]
+
+    def get_tool_registration(self, tool_name: str) -> dict[str, Any] | None:
+        row = self._fetchone(
+            "SELECT * FROM tool_registrations WHERE tool_name = ?",
+            (tool_name,),
+        )
+        if row is None:
+            return None
+        item = dict(row)
+        item["schema"] = _loads(item.pop("schema_json"), {})
+        item["permission_requirements"] = _loads(item.pop("permission_json"), {})
+        item["enabled"] = bool(item["enabled"])
+        return item
+
+    def list_tool_registrations(self, enabled_only: bool = False) -> list[dict[str, Any]]:
+        query = "SELECT * FROM tool_registrations"
+        if enabled_only:
+            query += " WHERE enabled = 1"
+        query += " ORDER BY tool_name"
+        rows = self._fetchall(query)
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["schema"] = _loads(item.pop("schema_json"), {})
+            item["permission_requirements"] = _loads(item.pop("permission_json"), {})
+            item["enabled"] = bool(item["enabled"])
+            result.append(item)
+        return result
+
+    def delete_tool_registration(self, tool_name: str) -> None:
+        with self.transaction(guard=False) as conn:
+            conn.execute("DELETE FROM tool_registrations WHERE tool_name = ?", (tool_name,))
+
+    def upsert_mcp_connection(
+        self,
+        *,
+        connection_id: str,
+        server_name: str,
+        endpoint: str,
+        transport: str = "stdio",
+        args: list[str] | None = None,
+        auth_profile: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if transport != "stdio":
+            raise ValueError(f"Unsupported MCP transport: {transport!r}")
+        now = _now()
+        args_json = _checked_json(args or [], MAX_EVENT_PAYLOAD_BYTES, "MCP args")
+        auth_profile_json = _checked_json(auth_profile or {}, MAX_EVENT_PAYLOAD_BYTES, "MCP auth profile")
+        with self.transaction(guard=False) as conn:
+            conn.execute(
+                """
+                INSERT INTO mcp_connections(
+                    connection_id, server_name, transport, endpoint, args_json,
+                    auth_profile_json, status, last_connected_at, last_error,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'configured', NULL, NULL, ?, ?)
+                ON CONFLICT(server_name) DO UPDATE SET
+                    connection_id = excluded.connection_id,
+                    transport = excluded.transport,
+                    endpoint = excluded.endpoint,
+                    args_json = excluded.args_json,
+                    auth_profile_json = excluded.auth_profile_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    connection_id,
+                    server_name,
+                    transport,
+                    endpoint,
+                    args_json,
+                    auth_profile_json,
+                    now,
+                    now,
+                ),
+            )
+        return self.get_mcp_connection(connection_id)  # type: ignore[return-value]
+
+    def get_mcp_connection(self, connection_id: str) -> dict[str, Any] | None:
+        row = self._fetchone(
+            "SELECT * FROM mcp_connections WHERE connection_id = ?",
+            (connection_id,),
+        )
+        if row is None:
+            return None
+        item = dict(row)
+        item["args"] = _loads(item.pop("args_json"), [])
+        item["auth_profile"] = _loads(item.pop("auth_profile_json"), {})
+        return item
+
+    def list_mcp_connections(self) -> list[dict[str, Any]]:
+        rows = self._fetchall("SELECT * FROM mcp_connections ORDER BY server_name")
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["args"] = _loads(item.pop("args_json"), [])
+            item["auth_profile"] = _loads(item.pop("auth_profile_json"), {})
+            result.append(item)
+        return result
+
+    def update_mcp_connection_status(
+        self,
+        connection_id: str,
+        status: str,
+        *,
+        last_connected_at: float | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        if status not in {"configured", "connected", "error", "disabled"}:
+            raise ValueError(f"Invalid MCP connection status: {status!r}")
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            conn.execute(
+                """
+                UPDATE mcp_connections
+                SET status = ?, last_connected_at = COALESCE(?, last_connected_at),
+                    last_error = ?, updated_at = ?
+                WHERE connection_id = ?
+                """,
+                (status, last_connected_at, last_error, now, connection_id),
+            )
+
     def scan_invariants(self, task_id: str | None = None) -> list[str]:
         """Return durable state inconsistencies without attempting silent repair."""
         violations: list[str] = []
