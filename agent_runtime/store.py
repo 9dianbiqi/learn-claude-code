@@ -3173,6 +3173,598 @@ class EventStore:
                 (status, last_connected_at, last_error, now, connection_id),
             )
 
+    # ------------------------------------------------------------------
+    # Durable subagents, team mailboxes, and plan approvals (Phase 3)
+    # ------------------------------------------------------------------
+
+    _SUBAGENT_RUN_STATUSES = {
+        "pending", "running", "completed", "failed", "needs_review", "cancelled",
+    }
+    _PLAN_APPROVAL_STATUSES = {"requested", "approved", "rejected", "superseded"}
+    _MAILBOX_MESSAGE_STATUSES = {"delivered", "read", "archived"}
+
+    @staticmethod
+    def _subagent_run_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        item = dict(row)
+        item["messages"] = _loads(item.pop("messages_json"), [])
+        return item
+
+    def create_subagent_run(self, run_id: str, parent_task_id: str | None, child_task_id: str,
+                            repo_root: str, role: str, owner_id: str,
+                            messages: list[dict]) -> dict[str, Any]:
+        now = _now()
+        messages_json = _checked_json(messages, MAX_CHECKPOINT_BYTES, "subagent messages")
+        with self.transaction(guard=False) as conn:
+            conn.execute(
+                """
+                INSERT INTO subagent_runs(
+                    subagent_run_id, parent_task_id, child_task_id, repo_root,
+                    lane_id, role, status, owner_id, version, messages_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'default', ?, 'pending', ?, 1, ?, ?, ?)
+                """,
+                (
+                    run_id, parent_task_id, child_task_id, repo_root, role,
+                    owner_id, messages_json, now, now,
+                ),
+            )
+            self._emit_conn(conn, parent_task_id or child_task_id, "subagent_run_created", {
+                "subagent_run_id": run_id,
+                "child_task_id": child_task_id,
+                "role": role,
+                "repo_root": repo_root,
+            })
+        run = self.get_subagent_run(run_id)
+        if run is None:
+            raise RuntimeError(f"Subagent run was not persisted: {run_id}")
+        return run
+
+    def get_subagent_run(self, run_id: str) -> dict[str, Any] | None:
+        return self._subagent_run_dict(
+            self._fetchone(
+                "SELECT * FROM subagent_runs WHERE subagent_run_id = ?",
+                (run_id,),
+            )
+        )
+
+    def list_subagent_runs(self, parent_task_id: str | None = None,
+                           status: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM subagent_runs"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if parent_task_id is not None:
+            clauses.append("parent_task_id = ?")
+            params.append(parent_task_id)
+        if status is not None:
+            if status not in self._SUBAGENT_RUN_STATUSES:
+                raise ValueError(f"Invalid subagent run status: {status!r}")
+            clauses.append("status = ?")
+            params.append(status)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at, subagent_run_id"
+        rows = self._fetchall(query, tuple(params))
+        return [item for item in (self._subagent_run_dict(row) for row in rows) if item is not None]
+
+    def claim_subagent_run(self, run_id: str, owner_id: str, fencing_token: str) -> dict[str, Any]:
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            row = conn.execute(
+                "SELECT * FROM subagent_runs WHERE subagent_run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Subagent run not found: {run_id}")
+            if row["status"] not in {"pending", "running"}:
+                raise StaleState(
+                    f"Subagent run is not claimable: {run_id} status={row['status']!r}"
+                )
+            if row["fencing_token"] is not None and (
+                str(row["fencing_token"]) != str(fencing_token)
+                or str(row["owner_id"]) != str(owner_id)
+            ):
+                lease = conn.execute(
+                    "SELECT owner_id, task_id, expires_at FROM leases WHERE repo_root = ?",
+                    (row["repo_root"],),
+                ).fetchone()
+                if (
+                    lease is None
+                    or str(lease["owner_id"]) != str(owner_id)
+                    or str(lease["task_id"]) != str(row["child_task_id"])
+                    or float(lease["expires_at"]) <= now
+                ):
+                    raise StaleState(f"Subagent run is fenced by another owner: {run_id}")
+            updated = conn.execute(
+                """
+                UPDATE subagent_runs
+                SET status = 'running', owner_id = ?, fencing_token = ?,
+                    updated_at = ?, version = version + 1
+                WHERE subagent_run_id = ?
+                """,
+                (owner_id, str(fencing_token), now, run_id),
+            )
+            if updated.rowcount != 1:
+                raise StaleState(f"Subagent run changed during claim: {run_id}")
+            self._emit_conn(conn, str(row["parent_task_id"] or row["child_task_id"]), "subagent_run_claimed", {
+                "subagent_run_id": run_id,
+                "owner_id": owner_id,
+                "fencing_token": str(fencing_token),
+            })
+        return self.get_subagent_run(run_id)  # type: ignore[return-value]
+
+    def update_subagent_run(self, run_id: str, status: str | None = None,
+                            messages: list[dict] | None = None,
+                            result_summary: str | None = None,
+                            error: str | None = None,
+                            expected_version: int | None = None,
+                            fencing_token: str | None = None) -> dict[str, Any]:
+        if status is not None and status not in self._SUBAGENT_RUN_STATUSES:
+            raise ValueError(f"Invalid subagent run status: {status!r}")
+        assignments: list[str] = []
+        values: list[Any] = []
+        now = _now()
+        if status is not None:
+            assignments.append("status = ?")
+            values.append(status)
+        if messages is not None:
+            assignments.append("messages_json = ?")
+            values.append(_checked_json(messages, MAX_CHECKPOINT_BYTES, "subagent messages"))
+        if result_summary is not None:
+            assignments.append("result_summary = ?")
+            values.append(result_summary)
+        if error is not None:
+            assignments.append("error = ?")
+            values.append(_safe_reason(error))
+        assignments.append("updated_at = ?")
+        values.append(now)
+        assignments.append("version = version + 1")
+        where = "subagent_run_id = ?"
+        params: list[Any] = []
+        params.extend(values)
+        params.append(run_id)
+        if expected_version is not None:
+            where += " AND version = ?"
+            params.append(int(expected_version))
+        if fencing_token is not None:
+            where += " AND fencing_token = ?"
+            params.append(str(fencing_token))
+        with self.transaction(guard=False) as conn:
+            cursor = conn.execute(
+                f"UPDATE subagent_runs SET {', '.join(assignments)} WHERE {where}",
+                params,
+            )
+            if cursor.rowcount != 1:
+                raise StaleState(f"Subagent run state changed before update: {run_id}")
+        return self.get_subagent_run(run_id)  # type: ignore[return-value]
+
+    def complete_subagent_run(self, run_id: str, result_summary: str,
+                              messages: list[dict], expected_version: int,
+                              fencing_token: str) -> dict[str, Any]:
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            row = conn.execute(
+                "SELECT status, parent_task_id, child_task_id FROM subagent_runs WHERE subagent_run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Subagent run not found: {run_id}")
+            if row["status"] != "running":
+                raise StaleState(
+                    f"Subagent run is not running: {run_id} status={row['status']!r}"
+                )
+            cursor = conn.execute(
+                """
+                UPDATE subagent_runs
+                SET status = 'completed', result_summary = ?, messages_json = ?,
+                    error = NULL, updated_at = ?, version = version + 1
+                WHERE subagent_run_id = ? AND version = ? AND fencing_token = ?
+                """,
+                (
+                    result_summary,
+                    _checked_json(messages, MAX_CHECKPOINT_BYTES, "subagent messages"),
+                    now, run_id, int(expected_version), str(fencing_token),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StaleState(f"Subagent run changed during completion: {run_id}")
+            self._emit_conn(conn, str(row["parent_task_id"] or row["child_task_id"]), "subagent_run_completed", {
+                "subagent_run_id": run_id,
+                "result_chars": len(result_summary),
+            })
+        return self.get_subagent_run(run_id)  # type: ignore[return-value]
+
+    def fail_subagent_run(self, run_id: str, error: str, expected_version: int,
+                          fencing_token: str) -> dict[str, Any]:
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            row = conn.execute(
+                "SELECT status, parent_task_id, child_task_id FROM subagent_runs WHERE subagent_run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Subagent run not found: {run_id}")
+            if row["status"] not in {"pending", "running"}:
+                raise StaleState(
+                    f"Subagent run cannot fail: {run_id} status={row['status']!r}"
+                )
+            cursor = conn.execute(
+                """
+                UPDATE subagent_runs
+                SET status = 'failed', error = ?, updated_at = ?, version = version + 1
+                WHERE subagent_run_id = ? AND version = ? AND fencing_token = ?
+                """,
+                (_safe_reason(error), now, run_id, int(expected_version), str(fencing_token)),
+            )
+            if cursor.rowcount != 1:
+                raise StaleState(f"Subagent run changed before failure: {run_id}")
+            self._emit_conn(conn, str(row["parent_task_id"] or row["child_task_id"]), "subagent_run_failed", {
+                "subagent_run_id": run_id,
+                "error": _safe_reason(error),
+            })
+        return self.get_subagent_run(run_id)  # type: ignore[return-value]
+
+    def cancel_subagent_run(self, run_id: str, reason: str,
+                            expected_version: int, fencing_token: str) -> dict[str, Any]:
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            row = conn.execute(
+                "SELECT status, parent_task_id, child_task_id FROM subagent_runs WHERE subagent_run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Subagent run not found: {run_id}")
+            if row["status"] not in {"pending", "running", "needs_review"}:
+                raise StaleState(
+                    f"Subagent run cannot be cancelled: {run_id} status={row['status']!r}"
+                )
+            cursor = conn.execute(
+                """
+                UPDATE subagent_runs
+                SET status = 'cancelled', error = ?, updated_at = ?, version = version + 1
+                WHERE subagent_run_id = ? AND version = ? AND fencing_token = ?
+                """,
+                (_safe_reason(reason), now, run_id, int(expected_version), str(fencing_token)),
+            )
+            if cursor.rowcount != 1:
+                raise StaleState(f"Subagent run changed before cancellation: {run_id}")
+            self._emit_conn(conn, str(row["parent_task_id"] or row["child_task_id"]), "subagent_run_cancelled", {
+                "subagent_run_id": run_id,
+                "reason": _safe_reason(reason),
+            })
+        return self.get_subagent_run(run_id)  # type: ignore[return-value]
+
+    def mark_subagent_needs_review(self, run_id: str, reason: str,
+                                   expected_version: int, fencing_token: str) -> dict[str, Any]:
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            row = conn.execute(
+                "SELECT status, parent_task_id, child_task_id FROM subagent_runs WHERE subagent_run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Subagent run not found: {run_id}")
+            if row["status"] != "running":
+                raise StaleState(
+                    f"Subagent run cannot enter review: {run_id} status={row['status']!r}"
+                )
+            cursor = conn.execute(
+                """
+                UPDATE subagent_runs
+                SET status = 'needs_review', error = ?, updated_at = ?,
+                    version = version + 1
+                WHERE subagent_run_id = ? AND version = ? AND fencing_token = ?
+                """,
+                (_safe_reason(reason), now, run_id, int(expected_version), str(fencing_token)),
+            )
+            if cursor.rowcount != 1:
+                raise StaleState(f"Subagent run changed before review: {run_id}")
+            self._emit_conn(conn, str(row["parent_task_id"] or row["child_task_id"]), "subagent_run_needs_review", {
+                "subagent_run_id": run_id,
+                "reason": _safe_reason(reason),
+            })
+        return self.get_subagent_run(run_id)  # type: ignore[return-value]
+
+    def ensure_mailbox(self, owner_task_id: str, owner_role: str,
+                       mailbox_id: str | None = None) -> dict[str, Any]:
+        mailbox_id = mailbox_id or f"mailbox-{owner_task_id}"
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO mailboxes(
+                    mailbox_id, owner_task_id, owner_role, version, created_at, updated_at
+                ) VALUES (?, ?, ?, 1, ?, ?)
+                """,
+                (mailbox_id, owner_task_id, owner_role, now, now),
+            )
+        return self.get_mailbox(owner_task_id)  # type: ignore[return-value]
+
+    def get_mailbox(self, owner_task_id: str) -> dict[str, Any] | None:
+        return self._row(
+            self._fetchone(
+                "SELECT * FROM mailboxes WHERE owner_task_id = ?",
+                (owner_task_id,),
+            )
+        )
+
+    def get_mailbox_by_id(self, mailbox_id: str) -> dict[str, Any] | None:
+        return self._row(
+            self._fetchone(
+                "SELECT * FROM mailboxes WHERE mailbox_id = ?",
+                (mailbox_id,),
+            )
+        )
+
+    def send_mailbox_message(self, message_id: str, mailbox_id: str,
+                             sender_task_id: str, recipient_task_id: str,
+                             payload: dict[str, Any]) -> dict[str, Any]:
+        payload_json = _checked_json(payload, MAX_EVENT_PAYLOAD_BYTES, "mailbox payload")
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            mailbox = conn.execute(
+                "SELECT mailbox_id FROM mailboxes WHERE mailbox_id = ?",
+                (mailbox_id,),
+            ).fetchone()
+            if mailbox is None:
+                raise KeyError(f"Mailbox not found: {mailbox_id}")
+            existing = conn.execute(
+                "SELECT payload_json FROM mailbox_messages WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["payload_json"] != payload_json:
+                    raise StaleState(f"Mailbox message id reused with different payload: {message_id}")
+                return self.get_mailbox_message(message_id)  # type: ignore[return-value]
+            conn.execute(
+                """
+                INSERT INTO mailbox_messages(
+                    message_id, mailbox_id, sender_task_id, recipient_task_id,
+                    payload_json, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'delivered', ?)
+                """,
+                (message_id, mailbox_id, sender_task_id, recipient_task_id, payload_json, now),
+            )
+            conn.execute(
+                "UPDATE mailboxes SET updated_at = ?, version = version + 1 WHERE mailbox_id = ?",
+                (now, mailbox_id),
+            )
+            self._emit_conn(conn, sender_task_id, "mailbox_message_sent", {
+                "message_id": message_id,
+                "mailbox_id": mailbox_id,
+                "recipient_task_id": recipient_task_id,
+            })
+        return self.get_mailbox_message(message_id)  # type: ignore[return-value]
+
+    @staticmethod
+    def _mailbox_message_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        item = dict(row)
+        item["payload"] = _loads(item.pop("payload_json"), {})
+        return item
+
+    def get_mailbox_message(self, message_id: str) -> dict[str, Any] | None:
+        return self._mailbox_message_dict(
+            self._fetchone(
+                "SELECT * FROM mailbox_messages WHERE message_id = ?",
+                (message_id,),
+            )
+        )
+
+    def list_mailbox_messages(self, mailbox_id: str,
+                              status: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM mailbox_messages WHERE mailbox_id = ?"
+        params: list[Any] = [mailbox_id]
+        if status is not None:
+            if status not in self._MAILBOX_MESSAGE_STATUSES:
+                raise ValueError(f"Invalid mailbox message status: {status!r}")
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY created_at, message_id"
+        rows = self._fetchall(query, tuple(params))
+        return [
+            item for item in (self._mailbox_message_dict(row) for row in rows) if item is not None
+        ]
+
+    def read_mailbox_messages(self, mailbox_id: str, recipient_task_id: str,
+                              limit: int = 50) -> list[dict[str, Any]]:
+        if limit < 1:
+            raise ValueError("Mailbox read limit must be positive")
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            mailbox = conn.execute(
+                "SELECT mailbox_id FROM mailboxes WHERE mailbox_id = ?",
+                (mailbox_id,),
+            ).fetchone()
+            if mailbox is None:
+                raise KeyError(f"Mailbox not found: {mailbox_id}")
+            rows = conn.execute(
+                """
+                SELECT * FROM mailbox_messages
+                WHERE mailbox_id = ? AND recipient_task_id = ? AND status = 'delivered'
+                ORDER BY created_at, message_id LIMIT ?
+                """,
+                (mailbox_id, recipient_task_id, int(limit)),
+            ).fetchall()
+            message_ids = [str(row["message_id"]) for row in rows]
+            if message_ids:
+                placeholders = ",".join("?" for _ in message_ids)
+                conn.execute(
+                    f"""
+                    UPDATE mailbox_messages
+                    SET status = 'read', read_at = ?
+                    WHERE message_id IN ({placeholders}) AND status = 'delivered'
+                    """,
+                    [now, *message_ids],
+                )
+                conn.execute(
+                    "UPDATE mailboxes SET updated_at = ?, version = version + 1 WHERE mailbox_id = ?",
+                    (now, mailbox_id),
+                )
+                rows = conn.execute(
+                    f"""
+                    SELECT * FROM mailbox_messages
+                    WHERE message_id IN ({placeholders})
+                    ORDER BY created_at, message_id
+                    """,
+                    tuple(message_ids),
+                ).fetchall()
+            return [
+                item for item in (
+                    self._mailbox_message_dict(row) for row in rows
+                ) if item is not None
+            ]
+
+    def archive_mailbox_message(self, message_id: str, expected_version: int) -> dict[str, Any]:
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            message = conn.execute(
+                "SELECT mailbox_id, status FROM mailbox_messages WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+            if message is None:
+                raise KeyError(f"Mailbox message not found: {message_id}")
+            if message["status"] != "read":
+                raise StaleState(
+                    f"Mailbox message is not readable: {message_id} status={message['status']!r}"
+                )
+            mailbox = conn.execute(
+                "SELECT version FROM mailboxes WHERE mailbox_id = ?",
+                (message["mailbox_id"],),
+            ).fetchone()
+            if mailbox is None or int(mailbox["version"]) != int(expected_version):
+                raise StaleState(f"Mailbox version changed before archive: {message_id}")
+            cursor = conn.execute(
+                """
+                UPDATE mailbox_messages
+                SET status = 'archived'
+                WHERE message_id = ? AND status = 'read'
+                """,
+                (message_id,),
+            )
+            if cursor.rowcount != 1:
+                raise StaleState(f"Mailbox message changed during archive: {message_id}")
+            conn.execute(
+                "UPDATE mailboxes SET updated_at = ?, version = version + 1 WHERE mailbox_id = ?",
+                (now, message["mailbox_id"]),
+            )
+        return self.get_mailbox_message(message_id)  # type: ignore[return-value]
+
+    def create_plan_approval(self, approval_id: str, subagent_run_id: str,
+                             plan_hash: str, requested_by: str) -> dict[str, Any]:
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            run = conn.execute(
+                "SELECT parent_task_id, child_task_id FROM subagent_runs WHERE subagent_run_id = ?",
+                (subagent_run_id,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"Subagent run not found: {subagent_run_id}")
+            conn.execute(
+                """
+                INSERT INTO plan_approvals(
+                    approval_id, subagent_run_id, plan_hash, status, requested_by,
+                    version, created_at, updated_at
+                ) VALUES (?, ?, ?, 'requested', ?, 1, ?, ?)
+                """,
+                (approval_id, subagent_run_id, plan_hash, requested_by, now, now),
+            )
+            self._emit_conn(conn, str(run["parent_task_id"] or run["child_task_id"]), "plan_approval_requested", {
+                "approval_id": approval_id,
+                "subagent_run_id": subagent_run_id,
+                "plan_hash": plan_hash,
+                "requested_by": requested_by,
+            })
+        return self.get_plan_approval(approval_id)  # type: ignore[return-value]
+
+    @staticmethod
+    def _plan_approval_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        return dict(row) if row is not None else None
+
+    def get_plan_approval(self, approval_id: str) -> dict[str, Any] | None:
+        return self._plan_approval_dict(
+            self._fetchone(
+                "SELECT * FROM plan_approvals WHERE approval_id = ?",
+                (approval_id,),
+            )
+        )
+
+    def list_plan_approvals(self, subagent_run_id: str | None = None,
+                            status: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM plan_approvals"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if subagent_run_id is not None:
+            clauses.append("subagent_run_id = ?")
+            params.append(subagent_run_id)
+        if status is not None:
+            if status not in self._PLAN_APPROVAL_STATUSES:
+                raise ValueError(f"Invalid plan approval status: {status!r}")
+            clauses.append("status = ?")
+            params.append(status)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at, approval_id"
+        rows = self._fetchall(query, tuple(params))
+        return [
+            item for item in (self._plan_approval_dict(row) for row in rows) if item is not None
+        ]
+
+    def transition_plan_approval(self, approval_id: str, new_status: str,
+                                 decided_by: str | None = None,
+                                 reason: str | None = None,
+                                 expected_version: int | None = None) -> dict[str, Any]:
+        if new_status not in {"approved", "rejected", "superseded"}:
+            raise ValueError(f"Invalid plan approval transition: {new_status!r}")
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            row = conn.execute(
+                "SELECT * FROM plan_approvals WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Plan approval not found: {approval_id}")
+            run = conn.execute(
+                "SELECT parent_task_id, child_task_id FROM subagent_runs WHERE subagent_run_id = ?",
+                (row["subagent_run_id"],),
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"Subagent run not found: {row['subagent_run_id']}")
+            if row["status"] != "requested":
+                raise StaleState(
+                    f"Plan approval is not actionable: {approval_id} status={row['status']!r}"
+                )
+            if expected_version is not None and int(row["version"]) != int(expected_version):
+                raise StaleState(f"Plan approval state changed before transition: {approval_id}")
+            cursor = conn.execute(
+                """
+                UPDATE plan_approvals
+                SET status = ?, decided_by = ?, reason = ?, updated_at = ?,
+                    version = version + 1
+                WHERE approval_id = ? AND status = 'requested'
+                """,
+                (new_status, decided_by, reason, now, approval_id),
+            )
+            if cursor.rowcount != 1:
+                raise StaleState(f"Plan approval changed during transition: {approval_id}")
+            if new_status in {"approved", "rejected"}:
+                conn.execute(
+                    """
+                    UPDATE plan_approvals
+                    SET status = 'superseded', updated_at = ?, version = version + 1
+                    WHERE subagent_run_id = ? AND approval_id != ? AND status = 'requested'
+                    """,
+                    (now, row["subagent_run_id"], approval_id),
+                )
+            self._emit_conn(conn, str(run["parent_task_id"] or run["child_task_id"]), "plan_approval_decided", {
+                "approval_id": approval_id,
+                "status": new_status,
+                "decided_by": decided_by,
+            })
+        return self.get_plan_approval(approval_id)  # type: ignore[return-value]
+
     def scan_invariants(self, task_id: str | None = None) -> list[str]:
         """Return durable state inconsistencies without attempting silent repair."""
         violations: list[str] = []
@@ -3235,9 +3827,86 @@ class EventStore:
                         violations.append(f"operation {operation['operation_id']}: read-only call has operation")
             self._scan_v6_invariants(conn, task_id, violations)
             self._scan_job_invariants(conn, task_id, violations)
+            self._scan_subagent_invariants(conn, task_id, violations)
         finally:
             conn.close()
         return violations
+
+    def _scan_subagent_invariants(self, conn: sqlite3.Connection,
+                                  task_id: str | None, violations: list[str]) -> None:
+        if task_id is not None:
+            runs = conn.execute(
+                "SELECT * FROM subagent_runs WHERE parent_task_id = ? OR child_task_id = ?",
+                (task_id, task_id),
+            ).fetchall()
+        else:
+            runs = conn.execute("SELECT * FROM subagent_runs").fetchall()
+        for run in runs:
+            run_id = str(run["subagent_run_id"])
+            if run["status"] not in self._SUBAGENT_RUN_STATUSES:
+                violations.append(f"subagent_run {run_id}: invalid status {run['status']!r}")
+            if int(run["version"]) < 1:
+                violations.append(f"subagent_run {run_id}: invalid version {run['version']}")
+            if run["status"] == "running" and run["fencing_token"] is None:
+                violations.append(f"subagent_run {run_id}: running without fencing token")
+            if run["status"] in {"completed", "failed"} and run["fencing_token"] is None:
+                violations.append(f"subagent_run {run_id}: {run['status']} without fencing token")
+            child = conn.execute(
+                "SELECT 1 FROM tasks WHERE task_id = ?",
+                (run["child_task_id"],),
+            ).fetchone()
+            if child is None:
+                violations.append(f"subagent_run {run_id}: missing child task {run['child_task_id']!r}")
+            requested = conn.execute(
+                "SELECT COUNT(*) AS count FROM plan_approvals "
+                "WHERE subagent_run_id = ? AND status = 'requested'",
+                (run_id,),
+            ).fetchone()["count"]
+            if requested and run["status"] != "needs_review":
+                violations.append(
+                    f"subagent_run {run_id}: requested plan approval while status={run['status']!r}"
+                )
+
+        if task_id is not None:
+            messages = conn.execute(
+                "SELECT m.* FROM mailbox_messages m JOIN mailboxes b "
+                "ON b.mailbox_id = m.mailbox_id WHERE b.owner_task_id = ?",
+                (task_id,),
+            ).fetchall()
+        else:
+            messages = conn.execute("SELECT * FROM mailbox_messages").fetchall()
+        for message in messages:
+            message_id = str(message["message_id"])
+            if message["status"] not in self._MAILBOX_MESSAGE_STATUSES:
+                violations.append(
+                    f"mailbox_message {message_id}: invalid status {message['status']!r}"
+                )
+            if message["status"] == "delivered" and message["read_at"] is not None:
+                violations.append(f"mailbox_message {message_id}: delivered with read_at")
+            if message["status"] in {"read", "archived"} and message["read_at"] is None:
+                violations.append(f"mailbox_message {message_id}: {message['status']} without read_at")
+
+        if task_id is not None:
+            approvals = conn.execute(
+                "SELECT a.* FROM plan_approvals a JOIN subagent_runs r "
+                "ON r.subagent_run_id = a.subagent_run_id "
+                "WHERE r.parent_task_id = ? OR r.child_task_id = ?",
+                (task_id, task_id),
+            ).fetchall()
+        else:
+            approvals = conn.execute("SELECT * FROM plan_approvals").fetchall()
+        for approval in approvals:
+            approval_id = str(approval["approval_id"])
+            if approval["status"] not in self._PLAN_APPROVAL_STATUSES:
+                violations.append(
+                    f"plan_approval {approval_id}: invalid status {approval['status']!r}"
+                )
+            if int(approval["version"]) < 1:
+                violations.append(f"plan_approval {approval_id}: invalid version")
+            if approval["status"] != "requested" and approval["decided_by"] is None:
+                violations.append(
+                    f"plan_approval {approval_id}: {approval['status']} without decided_by"
+                )
 
     def _scan_job_invariants(self, conn: sqlite3.Connection, task_id: str | None,
                              violations: list[str]) -> None:

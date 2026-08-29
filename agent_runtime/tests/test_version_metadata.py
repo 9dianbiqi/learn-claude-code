@@ -9,7 +9,7 @@ from agent_runtime import __version__
 from agent_runtime.cli import build_parser, main
 
 
-EXPECTED_RELEASE_VERSION = "0.3.0.dev3"
+EXPECTED_RELEASE_VERSION = "0.3.0.dev4"
 CHANGELOG = Path(__file__).parents[1] / "CHANGELOG.md"
 
 

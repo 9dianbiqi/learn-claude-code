@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.3.0.dev4 - Phase 3 Durable Subagents, Plan Approval & Team Mailbox
+
+- Stabilized and froze the reproducible v0.3 Exec-Full baseline at package
+  version `0.3.0.dev4` and schema version `v9`; execution checkpoints and
+  full-history resume remain authoritative, while the verified-subtask layer
+  is deferred to a later ticket.
+- Fixed the public plan-approval resume path so its fenced compare-and-swap
+  update binds the run identifier, version, and fencing token correctly;
+  genuinely stale writers remain rejected.
+- Added durable `subagent_runs`, `mailboxes`, `mailbox_messages`, and
+  `plan_approvals` tables via a checksum-verified v9 schema migration. Fresh
+  databases build directly to v9 and existing v4-v8 stores upgrade in place.
+- Added a durable child-agent execution model: a subagent is a full Runtime
+  task with its own checkpoint lineage, tool calls, operations, and effect
+  ledger entries, while `subagent_runs` keeps orchestration metadata with
+  fencing and CAS-protected state transitions.
+- Added `Runtime.spawn_subagent` with Codex-style `prompt`, `context_window`
+  (default 32000 tokens), `model` (inherited from the parent task), and
+  `tool_scope` parameters; context budget overflow fails closed and spawning
+  is capped at a depth of three task layers.
+- Added plan approval persistence: `request_plan_approval` writes an immutable
+  markdown plan file under `.agent_runtime/plans/`, records `plan_hash`, and
+  stops the child in `needs_review`; `approve_subagent_plan` resumes or cancels
+  the child with CAS-protected FSM transitions.
+- Added an internal `.agent_runtime.spawn_subagent` orchestration tool that
+  bypasses `PermissionEngine` and returns `run_id`, `child_task_id`, `status`,
+  `result_summary`, and aggregated `token_usage`.
+- Added team mailbox durability: idempotent send, atomic read, and
+  `delivered -> read -> archived` transitions that survive restart.
+- Added `subagent spawn|run|resume|list|approvals|approve|reject|show-plan` and
+  `subagent mailbox send|read` CLI commands.
+- Bumped the package version.
+
 ## v0.3.0.dev3 - Phase 4 Tool Registry & MCP
 
 - Added a durable `ToolRegistry` as the single tool dispatch path; built-in

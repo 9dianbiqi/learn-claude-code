@@ -10,12 +10,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 8
-MIGRATION_NAME = "v8_tool_registry_mcp"
+SCHEMA_VERSION = 9
+MIGRATION_NAME = "v9_subagents_mailbox"
 V5_MIGRATION_NAME = "v5_effect_ledger"
 V6_MIGRATION_NAME = "v6_durable_context"
 V7_MIGRATION_NAME = "v7_background_jobs"
 V8_MIGRATION_NAME = "v8_tool_registry_mcp"
+V9_MIGRATION_NAME = "v9_subagents_mailbox"
 MAX_EVENT_PAYLOAD_BYTES = 1 * 1024 * 1024
 
 _TASK_STATUSES = frozenset({
@@ -598,6 +599,83 @@ _V8_MIGRATION_SOURCE = "\n".join(
 V8_CHECKSUM = _sha256_text(_V8_MIGRATION_SOURCE)
 
 
+_V9_ADDITIONS = (
+    """
+    CREATE TABLE IF NOT EXISTS subagent_runs (
+        subagent_run_id TEXT PRIMARY KEY,
+        parent_task_id TEXT,
+        child_task_id TEXT NOT NULL UNIQUE,
+        repo_root TEXT NOT NULL,
+        lane_id TEXT NOT NULL DEFAULT 'default',
+        role TEXT NOT NULL,
+        status TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        fencing_token TEXT,
+        version INTEGER NOT NULL DEFAULT 1,
+        messages_json TEXT NOT NULL,
+        result_summary TEXT,
+        error TEXT,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        CHECK (status IN ('pending', 'running', 'completed', 'failed', 'needs_review', 'cancelled'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_subagent_runs_parent ON subagent_runs(parent_task_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_subagent_runs_child ON subagent_runs(child_task_id)",
+    """
+    CREATE TABLE IF NOT EXISTS mailboxes (
+        mailbox_id TEXT PRIMARY KEY,
+        owner_task_id TEXT NOT NULL UNIQUE,
+        owner_role TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS mailbox_messages (
+        message_id TEXT PRIMARY KEY,
+        mailbox_id TEXT NOT NULL,
+        sender_task_id TEXT NOT NULL,
+        recipient_task_id TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'delivered',
+        created_at REAL NOT NULL,
+        read_at REAL,
+        FOREIGN KEY (mailbox_id) REFERENCES mailboxes(mailbox_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_mailbox_messages_pending ON mailbox_messages(mailbox_id, status, created_at)",
+    """
+    CREATE TABLE IF NOT EXISTS plan_approvals (
+        approval_id TEXT PRIMARY KEY,
+        subagent_run_id TEXT NOT NULL,
+        plan_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        requested_by TEXT NOT NULL,
+        decided_by TEXT,
+        reason TEXT,
+        version INTEGER NOT NULL DEFAULT 1,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        CHECK (status IN ('requested', 'approved', 'rejected', 'superseded')),
+        FOREIGN KEY (subagent_run_id) REFERENCES subagent_runs(subagent_run_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_plan_approvals_run ON plan_approvals(subagent_run_id, status)",
+)
+
+
+_V9_MIGRATION_SOURCE = "\n".join(
+    [statement.strip() for statement in _BASE_SCHEMA]
+    + [statement.strip() for statement in _V6_ADDITIONS]
+    + [statement.strip() for statement in _V7_ADDITIONS]
+    + [statement.strip() for statement in _V8_ADDITIONS]
+    + [statement.strip() for statement in _V9_ADDITIONS]
+)
+V9_CHECKSUM = _sha256_text(_V9_MIGRATION_SOURCE)
+
+
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in columns:
@@ -635,6 +713,10 @@ def _business_tables(table_names: set[str]) -> set[str]:
         "cron_schedules",
         "tool_registrations",
         "mcp_connections",
+        "subagent_runs",
+        "mailboxes",
+        "mailbox_messages",
+        "plan_approvals",
     }
 
 
@@ -1153,12 +1235,17 @@ def _apply_v8_tool_registry(conn: sqlite3.Connection) -> None:
     _execute_all(conn, _V8_ADDITIONS)
 
 
+def _apply_v9_subagents_mailbox(conn: sqlite3.Connection) -> None:
+    _execute_all(conn, _V9_ADDITIONS)
+
+
 def _create_latest_schema(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys=ON")
     _execute_all(conn, _BASE_SCHEMA)
     _apply_v6_durable_context(conn)
     _apply_v7_background_jobs(conn)
     _apply_v8_tool_registry(conn)
+    _apply_v9_subagents_mailbox(conn)
     row = conn.execute("SELECT 1 FROM schema_migrations WHERE version = ?", (SCHEMA_VERSION,)).fetchone()
     if row is None:
         conn.execute(
@@ -1167,7 +1254,7 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
                 version, name, checksum, applied_at, duration_ms, backup_filename, backup_sha256
             ) VALUES (?, ?, ?, ?, ?, NULL, NULL)
             """,
-            (SCHEMA_VERSION, MIGRATION_NAME, V8_CHECKSUM, _now(), 0.0),
+            (SCHEMA_VERSION, MIGRATION_NAME, V9_CHECKSUM, _now(), 0.0),
         )
 
 
@@ -1175,6 +1262,7 @@ V5_MIGRATION = Migration(5, V5_MIGRATION_NAME, V5_CHECKSUM, _apply_v5_effect_led
 V6_MIGRATION = Migration(6, V6_MIGRATION_NAME, V6_CHECKSUM, _apply_v6_durable_context)
 V7_MIGRATION = Migration(7, V7_MIGRATION_NAME, V7_CHECKSUM, _apply_v7_background_jobs)
 V8_MIGRATION = Migration(8, V8_MIGRATION_NAME, V8_CHECKSUM, _apply_v8_tool_registry)
+V9_MIGRATION = Migration(9, V9_MIGRATION_NAME, V9_CHECKSUM, _apply_v9_subagents_mailbox)
 
 
 class SchemaManager:
@@ -1201,7 +1289,7 @@ class SchemaManager:
 
     @property
     def migrations(self) -> tuple[Migration, ...]:
-        return (V5_MIGRATION, V6_MIGRATION, V7_MIGRATION, V8_MIGRATION)
+        return (V5_MIGRATION, V6_MIGRATION, V7_MIGRATION, V8_MIGRATION, V9_MIGRATION)
 
     def _connect(self, *, read_only: bool = False) -> sqlite3.Connection:
         if read_only:
@@ -1243,7 +1331,7 @@ class SchemaManager:
             if not {"name", "checksum"} <= columns:
                 raise MigrationValidationError("schema_migrations is missing migration audit columns")
             latest = next(row for row in rows if int(row["version"]) == SCHEMA_VERSION)
-            if str(latest["name"]) != MIGRATION_NAME or str(latest["checksum"]) != V8_CHECKSUM:
+            if str(latest["name"]) != MIGRATION_NAME or str(latest["checksum"]) != V9_CHECKSUM:
                 raise MigrationChecksumMismatch(
                     f"migration checksum mismatch for v{SCHEMA_VERSION}: "
                     f"{latest['name']!r}/{latest['checksum']!r}"
@@ -1254,6 +1342,7 @@ class SchemaManager:
                 "memories", "memory_links", "summaries", "plans", "plan_items",
                 "agent_jobs", "job_runs", "cron_schedules",
                 "tool_registrations", "mcp_connections",
+                "subagent_runs", "mailboxes", "mailbox_messages", "plan_approvals",
             }
             missing = sorted(required - tables)
             if missing:
@@ -1312,6 +1401,24 @@ class SchemaManager:
                 "mcp_connections": {
                     "connection_id", "server_name", "transport", "endpoint", "args_json",
                     "auth_profile_json", "status", "last_connected_at", "last_error",
+                    "created_at", "updated_at",
+                },
+                "subagent_runs": {
+                    "subagent_run_id", "parent_task_id", "child_task_id", "repo_root",
+                    "lane_id", "role", "status", "owner_id", "fencing_token", "version",
+                    "messages_json", "result_summary", "error", "created_at", "updated_at",
+                },
+                "mailboxes": {
+                    "mailbox_id", "owner_task_id", "owner_role", "version",
+                    "created_at", "updated_at",
+                },
+                "mailbox_messages": {
+                    "message_id", "mailbox_id", "sender_task_id", "recipient_task_id",
+                    "payload_json", "status", "created_at", "read_at",
+                },
+                "plan_approvals": {
+                    "approval_id", "subagent_run_id", "plan_hash", "status",
+                    "requested_by", "decided_by", "reason", "version",
                     "created_at", "updated_at",
                 },
             }
@@ -1614,6 +1721,8 @@ class SchemaManager:
                 _apply_v7_background_jobs(conn)
             if 8 in expected_versions:
                 _apply_v8_tool_registry(conn)
+            if 9 in expected_versions:
+                _apply_v9_subagents_mailbox(conn)
 
             duration_ms = (time.perf_counter() - started) * 1000.0
             for migration in pending:
@@ -1693,4 +1802,5 @@ __all__ = [
     "V6_CHECKSUM",
     "V7_CHECKSUM",
     "V8_CHECKSUM",
+    "V9_CHECKSUM",
 ]

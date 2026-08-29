@@ -7,7 +7,7 @@ task: SQLite checkpoints, an append-only event log, tool-call deduplication,
 effect reservations, repository leases, permission policies, file conflict
 detection, traces, and deterministic regression evaluation.
 
-The v0.2 development line remains intentionally local and single-repository.
+The v0.3 development line remains intentionally local and single-repository.
 It is not a distributed workflow engine and does not claim generic exactly-once
 execution.
 
@@ -171,6 +171,19 @@ records `connected` or `error` status. GitHub uses the official
 `ghcr.io/github/github-mcp-server` image with a
 `GITHUB_PERSONAL_ACCESS_TOKEN` that has `repo`, `read:packages`, and `read:org`
 scopes. Add matching `allow` policy rules before the model may call MCP tools.
+
+## v0.3 frozen Exec-Full baseline
+
+The v0.3.0.dev4 baseline combines the durable memory/context, background
+jobs/Cron, subagent/mailbox/plan-approval, and ToolRegistry/stdio MCP phases.
+Execution checkpoints and full-history resume remain authoritative. The
+first-class verified-subtask ledger and semantic checkpointing layer are not
+implemented in this baseline and remain deferred to later work.
+
+The fixed review point for Ticket #6 is commit `a16f90e`; the Ticket #6
+implementation commit is the handoff point for subsequent work. See the
+[v0.3 execution docs](docs/v0.3/README.md) for the phase boundaries and
+verification commands.
 
 ## Requirements
 
@@ -346,11 +359,11 @@ Release-oriented changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## Scope boundaries
 
-Deferred beyond Phase 1:
+The v0.3 baseline remains local and single-repository. Deferred beyond v0.3:
 
-- worktree-based parallel execution;
-- background scheduling and Cron;
-- sub-agent orchestration;
+- lane-aware worktree-based parallel execution;
+- retention/GC and the v0.3 release-gate hardening phase;
+- first-class verified-subtask checkpoints and semantic ledger state;
 - distributed or multi-machine coordination;
 - a full OS-level Shell sandbox;
 - OpenTelemetry and visual dashboards;
@@ -369,7 +382,7 @@ system sandbox.
 agent_runtime/
   runtime.py       durable loop and recovery
   store.py         SQLite projections, transactions, leases, and ledger API
-  migrations.py    explicit v4/v5-to-v6 schema migration and backup framework
+  migrations.py    explicit v4-to-v9 schema migrations and backup framework
   projector.py     read-only context projector (memories, summaries, plans)
   mcp_client.py    stdio MCP discovery, invocation, timeout, and auth reference
   tool_registry.py durable built-in + MCP tool registry

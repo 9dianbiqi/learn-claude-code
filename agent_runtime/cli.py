@@ -7,6 +7,7 @@ import re
 import shutil
 import sqlite3
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,9 @@ from .trace import TraceReporter
 
 TASK_STATUSES = (
     "created", "running", "waiting_approval", "needs_review", "completed", "failed", "aborted"
+)
+SUBAGENT_RUN_STATUSES = (
+    "pending", "running", "completed", "failed", "needs_review", "cancelled"
 )
 
 
@@ -173,6 +177,67 @@ def build_parser() -> argparse.ArgumentParser:
     mcp_refresh = mcp_sub.add_parser("refresh", help="Discover tools from configured MCP servers.")
     _add_repo(mcp_refresh)
     mcp_refresh.add_argument("--connection", help="Refresh only this connection id (default: all).")
+
+    subagent = sub.add_parser("subagent", help="Manage durable subagents, plan approvals, and mailboxes.")
+    subagent_sub = subagent.add_subparsers(dest="subagent_action", required=True)
+
+    subagent_spawn = subagent_sub.add_parser("spawn", help="Spawn and run a durable subagent.")
+    _add_repo(subagent_spawn)
+    _add_policy(subagent_spawn)
+    subagent_spawn.add_argument("--prompt", required=True)
+    subagent_spawn.add_argument("--role", default="assistant")
+    subagent_spawn.add_argument("--tool-scope", action="append", default=[])
+    subagent_spawn.add_argument("--context-window", type=int, default=32000)
+    subagent_spawn.add_argument("--model")
+
+    subagent_run = subagent_sub.add_parser("run", help="Run a pending subagent run.")
+    subagent_run.add_argument("run_id")
+    _add_repo(subagent_run)
+    _add_policy(subagent_run)
+
+    subagent_resume = subagent_sub.add_parser("resume", help="Resume a pending or running subagent run.")
+    subagent_resume.add_argument("run_id")
+    _add_repo(subagent_resume)
+    _add_policy(subagent_resume)
+
+    subagent_list = subagent_sub.add_parser("list", help="List durable subagent runs.")
+    _add_repo(subagent_list)
+    subagent_list.add_argument("--status", choices=SUBAGENT_RUN_STATUSES)
+    subagent_list.add_argument("--parent-task-id")
+
+    subagent_approvals = subagent_sub.add_parser("approvals", help="List plan approvals for a subagent run.")
+    subagent_approvals.add_argument("run_id")
+    _add_repo(subagent_approvals)
+
+    subagent_approve = subagent_sub.add_parser("approve", help="Approve a subagent plan.")
+    subagent_approve.add_argument("approval_id")
+    _add_repo(subagent_approve)
+    _add_policy(subagent_approve)
+    subagent_approve.add_argument("--reason")
+
+    subagent_reject = subagent_sub.add_parser("reject", help="Reject a subagent plan.")
+    subagent_reject.add_argument("approval_id")
+    _add_repo(subagent_reject)
+    _add_policy(subagent_reject)
+    subagent_reject.add_argument("--reason")
+
+    subagent_show_plan = subagent_sub.add_parser("show-plan", help="Show a persisted subagent plan file.")
+    subagent_show_plan.add_argument("approval_id")
+    _add_repo(subagent_show_plan)
+
+    mailbox = subagent_sub.add_parser("mailbox", help="Send or read durable mailbox messages.")
+    mailbox_sub = mailbox.add_subparsers(dest="mailbox_action", required=True)
+    mailbox_send = mailbox_sub.add_parser("send", help="Send a durable mailbox message.")
+    _add_repo(mailbox_send)
+    mailbox_send.add_argument("--mailbox", required=True)
+    mailbox_send.add_argument("--sender", required=True)
+    mailbox_send.add_argument("--recipient", required=True)
+    mailbox_send.add_argument("--payload", required=True, help="JSON payload")
+    mailbox_send.add_argument("--message-id")
+    mailbox_read = mailbox_sub.add_parser("read", help="Atomically read delivered mailbox messages.")
+    _add_repo(mailbox_read)
+    mailbox_read.add_argument("--mailbox", required=True)
+    mailbox_read.add_argument("--recipient", required=True)
 
     evaluation = sub.add_parser("eval", help="Run a deterministic fixed-task suite.")
     evaluation.add_argument("--suite", required=True)
@@ -629,4 +694,70 @@ def main(argv: list[str] | None = None) -> int:
             results = _mcp_refresh(args)
             _print_json(results)
             return 0 if all(item["status"] != "error" for item in results) else 2
+    if args.command == "subagent":
+        if args.subagent_action == "spawn":
+            scope = set(args.tool_scope) if args.tool_scope else None
+            result = _runtime(args).spawn_subagent(
+                args.prompt,
+                role=args.role,
+                tool_scope=scope,
+                context_window=args.context_window,
+                model=args.model,
+                parent_task_id=None,
+            )
+            _print_json(result)
+            return 0 if result["status"] == "completed" else 2
+        if args.subagent_action == "run":
+            return _print_result(_runtime(args).run_subagent(args.run_id))
+        if args.subagent_action == "resume":
+            return _print_result(_runtime(args).resume_subagent(args.run_id))
+        if args.subagent_action == "list":
+            _print_json(_store(args).list_subagent_runs(
+                parent_task_id=args.parent_task_id,
+                status=args.status,
+            ))
+            return 0
+        if args.subagent_action == "approvals":
+            approvals = _store(args).list_plan_approvals(subagent_run_id=args.run_id)
+            plans_dir = _repo(args) / ".agent_runtime" / "plans"
+            for approval in approvals:
+                approval["plan_file"] = str(plans_dir / f"{approval['approval_id']}.md")
+            _print_json(approvals)
+            return 0
+        if args.subagent_action == "approve":
+            return _print_result(
+                _runtime(args).approve_subagent_plan(args.approval_id, approve=True, reason=args.reason)
+            )
+        if args.subagent_action == "reject":
+            return _print_result(
+                _runtime(args).approve_subagent_plan(args.approval_id, approve=False, reason=args.reason)
+            )
+        if args.subagent_action == "show-plan":
+            path = _repo(args) / ".agent_runtime" / "plans" / f"{args.approval_id}.md"
+            if not path.exists():
+                raise SystemExit(f"Plan file does not exist: {path}")
+            print(path.read_text(encoding="utf-8"), end="")
+            return 0
+        if args.subagent_action == "mailbox":
+            if args.mailbox_action == "send":
+                try:
+                    payload = json.loads(args.payload)
+                except json.JSONDecodeError as exc:
+                    raise SystemExit(f"Invalid --payload JSON: {exc}")
+                store = _store(args)
+                store.ensure_mailbox(args.recipient, "operator", mailbox_id=args.mailbox)
+                message_id = args.message_id or f"msg-{uuid.uuid4().hex}"
+                message = store.send_mailbox_message(
+                    message_id,
+                    args.mailbox,
+                    args.sender,
+                    args.recipient,
+                    payload,
+                )
+                _print_json(message)
+                return 0
+            if args.mailbox_action == "read":
+                messages = _store(args).read_mailbox_messages(args.mailbox, args.recipient)
+                _print_json(messages)
+                return 0
     raise SystemExit(f"Unsupported command: {args.command}")

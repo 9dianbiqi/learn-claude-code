@@ -28,6 +28,21 @@ phase without re-reading the full design discussion.
 - Background jobs, subagents, MCP tools, and worktrees must not bypass the
   effect ledger or lease/fencing rules.
 
+## Frozen v0.3 Exec-Full baseline
+
+Ticket #6 freezes the reproducible execution baseline at package version
+`0.3.0.dev4` and schema version `v9`. It includes the durable Phase 1 through
+Phase 4 runtime behavior: full-history execution checkpoints and recovery,
+effect reconciliation, migrations, background jobs, durable subagents and
+mailboxes, plan approval, the ToolRegistry, and stdio MCP.
+
+The baseline remains execution-only: `checkpoints.messages_json` is the
+authoritative history, and no first-class verified-subtask ledger or semantic
+checkpointing mechanism is included. Those dissertation-specific mechanisms
+are deferred to later work. The Ticket #6 review compares changes against the
+immutable pre-freeze commit `a16f90e`; the resulting implementation commit is
+the handoff point for subsequent phases.
+
 ## Phase delivery checklist
 
 Every phase must produce:

@@ -21,7 +21,11 @@ from .permissions import PermissionDecision, PermissionEngine
 from .store import EffectBlocked, EventStore, InvariantViolation, LeaseLost, StaleState
 from .tools import FileConflict, ShellResult, ToolExecutor
 from .tool_registry import ToolRegistry
-from .projector import ContextProjector
+from .projector import ContextProjector, estimate_tokens
+
+
+DEFAULT_SUBAGENT_CONTEXT_WINDOW = 32000
+MAX_SUBAGENT_DEPTH = 3
 
 
 class InjectedCrash(RuntimeError):
@@ -47,13 +51,46 @@ def canonical_args_hash(name: str, args: dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+INTERNAL_TOOL_SCHEMAS = {
+    ".agent_runtime.spawn_subagent": {
+        "name": ".agent_runtime.spawn_subagent",
+        "description": "Create and run a child agent in its own durable task.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string"},
+                "role": {"type": "string"},
+                "wait": {"type": "boolean"},
+                "tool_scope": {"type": "array", "items": {"type": "string"}},
+                "context_window": {"type": "integer"},
+                "model": {"type": "string"},
+            },
+            "required": ["prompt"],
+        },
+    },
+    ".agent_runtime.request_plan_approval": {
+        "name": ".agent_runtime.request_plan_approval",
+        "description": "Request human approval for a subagent plan before continuing.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "plan_text": {"type": "string"},
+                "plan_hash": {"type": "string"},
+            },
+            "required": ["plan_text"],
+        },
+    },
+}
+
+
 class Runtime:
     def __init__(self, repo_root: str | Path, model: Any, store: EventStore | None = None,
                  model_name: str | None = None, owner_id: str | None = None,
                  fault_injector: Callable[..., None] | None = None,
                  approval_callback: Callable[[str, dict[str, Any], str], bool] | None = None,
                  interactive: bool = False, policy_path: str | Path | None = None,
-                 lease_ttl: float = 300.0):
+                 lease_ttl: float = 300.0,
+                 tool_scope: set[str] | None = None):
         self.repo_root = Path(repo_root).resolve()
         self.model = model
         self.model_name = model_name or getattr(model, "name", "unknown")
@@ -63,10 +100,16 @@ class Runtime:
         self.approval_callback = approval_callback
         self.interactive = interactive
         self.lease_ttl = lease_ttl
+        self.tool_scope = self._normalize_tool_scope(tool_scope)
         model_timeout = getattr(model, "timeout", None)
         if model_timeout is not None and float(model_timeout) >= lease_ttl:
             raise ValueError("Model timeout must be smaller than lease TTL")
         self._lease_token: int | None = None
+        self._active_task_id: str | None = None
+        self._active_tool_scope: set[str] | None = None
+        self._active_subagent_run_id: str | None = None
+        self._subagent_fencing: dict[str, str] = {}
+        self._subagent_tool_scopes: dict[str, set[str] | None] = {}
         self.tools = ToolExecutor(self.repo_root)
         if float(self.tools.shell_timeout) >= lease_ttl:
             self.tools.shell_timeout = max(0.01, float(lease_ttl) * 0.8)
@@ -274,6 +317,8 @@ class Runtime:
                   lease_acquired: bool = False) -> RunResult:
         recovered_completion_text: str | None = None
         self._pending_review = None
+        previous_active_task = self._active_task_id
+        self._active_task_id = task_id
         if not lease_acquired:
             self._acquire(task_id)
         elif self._lease_token is None:
@@ -331,7 +376,12 @@ class Runtime:
                 checkpoint_id = self.store.get_task(task_id)["checkpoint_id"]
                 projection = self.projector.project(task_id, messages, checkpoint_id)
                 projected_messages = projection.messages
-                tool_schemas = self.tool_registry.schemas()
+                active_tool_scope = self._effective_tool_scope()
+                tool_schemas = [
+                    schema for schema in self.tool_registry.schemas()
+                    if active_tool_scope is None or schema["name"] in active_tool_scope
+                ]
+                tool_schemas.extend(INTERNAL_TOOL_SCHEMAS.values())
                 request = {"messages": messages, "tools": tool_schemas}
                 model_call_id = self.store.create_model_call(
                     task_id,
@@ -421,14 +471,627 @@ class Runtime:
             return RunResult(task_id, "failed", error=str(exc))
         finally:
             self._release()
+            self._active_task_id = previous_active_task
 
     def _append_tool_results(self, task_id: str, turn: int, messages: list[dict], calls: list[ToolCall]) -> None:
         results: list[dict[str, Any]] = []
         for call in calls:
-            output = self._execute_call(task_id, turn, call)
+            output = self._execute_call(task_id, turn, call, messages)
             results.append({"type": "tool_result", "tool_use_id": call.id, "content": output})
         messages.append({"role": "user", "content": results})
         self.store.save_checkpoint(task_id, "tool_results_appended", messages, {"turn": turn + 1})
+
+    def spawn_subagent(self, prompt: str, role: str = "assistant", wait: bool = True,
+                       tool_scope: set[str] | None = None,
+                       context_window: int | None = None,
+                       model: str | None = None,
+                       parent_task_id: str | None = None) -> dict[str, Any]:
+        if parent_task_id is None:
+            parent_task_id = self._active_task_id
+        return self._spawn_subagent(
+            parent_task_id,
+            str(prompt),
+            role=role,
+            wait=wait,
+            tool_scope=tool_scope,
+            context_window=context_window,
+            model=model,
+        )
+
+    def run_subagent(self, run_id: str, tool_scope: set[str] | None = None) -> RunResult:
+        run = self.store.get_subagent_run(run_id)
+        if run is None:
+            raise KeyError(f"Subagent run not found: {run_id}")
+        child_task_id = str(run["child_task_id"])
+        if run["status"] in {"completed", "failed", "cancelled"}:
+            return RunResult(
+                child_task_id,
+                run["status"],
+                final_text=run.get("result_summary") or "",
+                error=run.get("error"),
+            )
+        if run["status"] == "needs_review":
+            return RunResult(child_task_id, "needs_review", error=run.get("error"))
+        token = self._subagent_fencing.get(run_id)
+        if token is None:
+            token = f"run-{uuid.uuid4().hex}"
+        lease_acquired_here = False
+        try:
+            self._acquire(child_task_id)
+            lease_acquired_here = True
+            claimed = self.store.claim_subagent_run(run_id, self.owner_id, token)
+            self._subagent_fencing[run_id] = token
+            child_task_id = str(claimed["child_task_id"])
+            scope = self._normalize_tool_scope(tool_scope)
+            if scope is None:
+                scope = self._effective_tool_scope()
+            if scope is not None:
+                self._subagent_tool_scopes[child_task_id] = scope
+            else:
+                scope = self._subagent_tool_scopes.get(child_task_id)
+                if scope is None:
+                    scope = self._subagent_tool_scope_from_messages(claimed.get("messages") or [])
+                    if scope is not None:
+                        self._subagent_tool_scopes[child_task_id] = scope
+            previous_task = self._active_task_id
+            previous_scope = self._active_tool_scope
+            previous_run = self._active_subagent_run_id
+            self._active_subagent_run_id = run_id
+            self._active_tool_scope = scope
+            try:
+                metadata = self._subagent_orchestration_metadata(list(claimed.get("messages") or []))
+                context_window = int(metadata["context_window"] or DEFAULT_SUBAGENT_CONTEXT_WINDOW)
+                self._check_subagent_context_budget(child_task_id, context_window)
+                child_result = self._resume_task(child_task_id, lease_acquired=True)
+            finally:
+                self._active_task_id = previous_task
+                self._active_tool_scope = previous_scope
+                self._active_subagent_run_id = previous_run
+        finally:
+            if lease_acquired_here and self._lease_token is not None:
+                self._release()
+        if child_result.status in {"completed", "failed", "needs_review"}:
+            self._settle_subagent_run(run_id, claimed, child_result, self._child_messages(child_task_id))
+        return child_result
+
+    def resume_subagent(self, run_id: str, tool_scope: set[str] | None = None) -> RunResult:
+        run = self.store.get_subagent_run(run_id)
+        if run is None:
+            raise KeyError(f"Subagent run not found: {run_id}")
+        child_task_id = str(run["child_task_id"])
+        if run["status"] in {"completed", "failed", "cancelled"}:
+            return RunResult(
+                child_task_id,
+                run["status"],
+                final_text=run.get("result_summary") or "",
+                error=run.get("error"),
+            )
+        if run["status"] == "needs_review":
+            return RunResult(child_task_id, "needs_review", error=run.get("error"))
+        return self.run_subagent(run_id, tool_scope=tool_scope)
+
+    def approve_subagent_plan(self, approval_id: str, approve: bool = True,
+                              reason: str | None = None) -> RunResult:
+        approval = self.store.get_plan_approval(approval_id)
+        if approval is None:
+            raise KeyError(f"Plan approval not found: {approval_id}")
+        run = self.store.get_subagent_run(approval["subagent_run_id"])
+        if run is None:
+            raise KeyError(f"Subagent run not found: {approval['subagent_run_id']}")
+        child_task_id = str(run["child_task_id"])
+        tool_use_id = self._find_plan_approval_call(child_task_id)
+        if tool_use_id is None:
+            raise RuntimeError(f"Child task has no pending plan approval call: {child_task_id}")
+        call = self.store.get_tool_call(child_task_id, tool_use_id)
+        task = self.store.get_task(child_task_id)
+        if task["status"] != "needs_review" or call is None or call["status"] != "needs_review":
+            raise StaleState(f"Child task is not awaiting plan approval: {child_task_id}")
+        if not approve:
+            decision_reason = reason or "Plan rejected"
+            self.store.transition_plan_approval(
+                approval_id,
+                "rejected",
+                decided_by=self.owner_id,
+                reason=decision_reason,
+                expected_version=int(approval["version"]),
+            )
+            self.store.cancel_subagent_run(
+                run["subagent_run_id"],
+                decision_reason,
+                expected_version=int(run["version"]),
+                fencing_token=str(run["fencing_token"]),
+            )
+            self.store.abort_task(
+                child_task_id,
+                tool_use_id,
+                decision_reason,
+                expected_tool_version=int(call["version"]),
+                expected_task_version=int(task["version"]),
+            )
+            return RunResult(child_task_id, "cancelled", error=decision_reason)
+        self.store.transition_plan_approval(
+            approval_id,
+            "approved",
+            decided_by=self.owner_id,
+            reason=reason,
+            expected_version=int(approval["version"]),
+        )
+        self.store.resolve_review(
+            child_task_id,
+            tool_use_id,
+            "complete",
+            int(call["version"]),
+            int(task["version"]),
+        )
+        output = json.dumps(
+            {"approved": True, "approval_id": approval_id, "reason": reason},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        self.store.update_tool_call(
+            child_task_id,
+            tool_use_id,
+            status="succeeded",
+            output=output,
+            finished_at=time.time(),
+        )
+        checkpoint = self.store.get_checkpoint(task["checkpoint_id"])
+        messages = list(checkpoint.get("messages") or [])
+        turn = int(checkpoint.get("cursor", {}).get("turn", 0))
+        messages.append({
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": output}],
+        })
+        self.store.save_checkpoint(child_task_id, "tool_results_appended", messages, {"turn": turn + 1})
+        updated_run = self.store.update_subagent_run(
+            run["subagent_run_id"],
+            status="running",
+            expected_version=int(run["version"]),
+            fencing_token=str(run["fencing_token"]),
+        )
+        child_result = self.resume(child_task_id)
+        if child_result.status in {"completed", "failed", "needs_review"}:
+            self._settle_subagent_run(
+                run["subagent_run_id"],
+                updated_run,
+                child_result,
+                self._child_messages(child_task_id),
+            )
+        return child_result
+
+    def _spawn_subagent(self, parent_task_id: str, prompt: str, role: str = "assistant",
+                        wait: bool = True, tool_scope: set[str] | None = None,
+                        context_window: int | None = None,
+                        model: str | None = None,
+                        run_id: str | None = None,
+                        child_task_id: str | None = None) -> dict[str, Any]:
+        parent_depth = self._subagent_depth(parent_task_id)
+        if parent_depth + 1 > MAX_SUBAGENT_DEPTH:
+            raise RuntimeError(
+                f"Subagent depth limit exceeded: parent depth {parent_depth}, "
+                f"max depth {MAX_SUBAGENT_DEPTH}"
+            )
+        run_id = run_id or f"subagent_{uuid.uuid4().hex}"
+        child_task_id = child_task_id or f"task_{uuid.uuid4().hex}"
+        scope = self._normalize_tool_scope(tool_scope)
+        if scope is None:
+            scope = self._effective_tool_scope()
+        child_model = self._resolve_child_model(parent_task_id, model)
+        self._ensure_subagent_child(
+            parent_task_id,
+            run_id,
+            child_task_id,
+            prompt,
+            role,
+            scope,
+            context_window=context_window,
+            model=child_model,
+        )
+        if not wait:
+            return {
+                "run_id": run_id,
+                "child_task_id": child_task_id,
+                "status": "pending",
+                "result_summary": None,
+                "error": None,
+                "token_usage": self._child_token_usage(child_task_id),
+            }
+        had_lease = self._lease_token is not None
+        if had_lease:
+            self._release()
+        try:
+            child_result = self.run_subagent(run_id)
+        except Exception as exc:
+            child_result = RunResult(child_task_id, "failed", error=f"{type(exc).__name__}: {exc}")
+        finally:
+            if had_lease:
+                self._acquire(parent_task_id)
+        return {
+            "run_id": run_id,
+            "child_task_id": child_task_id,
+            "status": child_result.status,
+            "result_summary": child_result.final_text,
+            "error": child_result.error,
+            "token_usage": self._child_token_usage(child_task_id),
+        }
+
+    def _ensure_subagent_child(self, parent_task_id: str, run_id: str, child_task_id: str,
+                               prompt: str, role: str, tool_scope: set[str] | None,
+                               context_window: int | None = None,
+                               model: str | None = None) -> None:
+        context_window = int(context_window or DEFAULT_SUBAGENT_CONTEXT_WINDOW)
+        if context_window < 1:
+            raise ValueError("context_window must be a positive integer")
+        existing_run = self.store.get_subagent_run(run_id)
+        if existing_run is not None:
+            persisted = self._subagent_orchestration_metadata(list(existing_run.get("messages") or []))
+            if persisted["context_window"] is not None:
+                context_window = int(persisted["context_window"])
+            if persisted["tool_scope"] is not None:
+                tool_scope = persisted["tool_scope"]
+            if persisted["model"]:
+                model = persisted["model"]
+        try:
+            self.store.get_task(child_task_id)
+        except KeyError:
+            self.store.bootstrap_task(
+                child_task_id,
+                str(self.repo_root),
+                prompt,
+                model or self.model_name,
+                [{"role": "user", "content": prompt}],
+                {"turn": 0},
+                fault_injector=self._fault,
+            )
+        if existing_run is None:
+            self.store.create_subagent_run(
+                run_id,
+                parent_task_id,
+                child_task_id,
+                str(self.repo_root),
+                role,
+                self.owner_id,
+                self._subagent_orchestration_messages(
+                    prompt,
+                    tool_scope,
+                    context_window=context_window,
+                    model=model or self.model_name,
+                ),
+            )
+        self._subagent_tool_scopes[child_task_id] = tool_scope
+        self._check_subagent_context_budget(child_task_id, context_window)
+
+    def _settle_subagent_run(self, run_id: str, claimed: dict[str, Any],
+                             child_result: RunResult, child_messages: list[dict]) -> None:
+        version = int(claimed["version"])
+        token = str(claimed["fencing_token"])
+        if child_result.status == "completed":
+            summary = self._last_text(child_messages) or child_result.final_text
+            self.store.complete_subagent_run(run_id, summary, child_messages, version, token)
+        elif child_result.status == "failed":
+            self.store.fail_subagent_run(run_id, child_result.error or "Subagent failed", version, token)
+        elif child_result.status == "needs_review":
+            current = self.store.get_subagent_run(run_id)
+            if current is not None and current["status"] != "needs_review":
+                self.store.mark_subagent_needs_review(
+                    run_id,
+                    child_result.error or "Plan approval required",
+                    version,
+                    token,
+                )
+
+    def _child_messages(self, task_id: str) -> list[dict]:
+        task = self.store.get_task(task_id)
+        checkpoint_id = task.get("checkpoint_id")
+        if checkpoint_id is None:
+            return []
+        checkpoint = self.store.get_checkpoint(checkpoint_id)
+        return list(checkpoint.get("messages") or [])
+
+    def _find_plan_approval_call(self, task_id: str) -> str | None:
+        for message in reversed(self._child_messages(task_id)):
+            if message.get("role") != "assistant":
+                continue
+            for block in reversed(message.get("content", [])):
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("name") == ".agent_runtime.request_plan_approval"
+                ):
+                    return str(block.get("id"))
+        return None
+
+    @staticmethod
+    def _normalize_tool_scope(tool_scope: Any) -> set[str] | None:
+        if tool_scope is None:
+            return None
+        if isinstance(tool_scope, str):
+            return {tool_scope}
+        return {str(item) for item in tool_scope}
+
+    @staticmethod
+    def _subagent_orchestration_messages(prompt: str, tool_scope: set[str] | None,
+                                         context_window: int = DEFAULT_SUBAGENT_CONTEXT_WINDOW,
+                                         model: str | None = None) -> list[dict]:
+        messages: list[dict] = []
+        metadata: dict[str, Any] = {"context_window": int(context_window)}
+        if tool_scope is not None:
+            metadata["tool_scope"] = sorted(tool_scope)
+        if model:
+            metadata["model"] = str(model)
+        messages.append({
+            "role": "system",
+            "content": json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+        })
+        messages.append({"role": "user", "content": prompt})
+        return messages
+
+    @staticmethod
+    def _subagent_orchestration_metadata(messages: list[dict]) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "tool_scope": None,
+            "context_window": DEFAULT_SUBAGENT_CONTEXT_WINDOW,
+            "model": None,
+        }
+        for message in messages:
+            if message.get("role") != "system" or not isinstance(message.get("content"), str):
+                continue
+            try:
+                parsed = json.loads(message["content"])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                if isinstance(parsed.get("tool_scope"), list):
+                    metadata["tool_scope"] = {str(item) for item in parsed["tool_scope"]}
+                if isinstance(parsed.get("context_window"), int):
+                    metadata["context_window"] = int(parsed["context_window"])
+                if isinstance(parsed.get("model"), str):
+                    metadata["model"] = parsed["model"]
+                return metadata
+        return metadata
+
+    def _subagent_tool_scope_from_messages(self, messages: list[dict]) -> set[str] | None:
+        return self._subagent_orchestration_metadata(messages)["tool_scope"]
+
+    def _effective_tool_scope(self) -> set[str] | None:
+        if self._active_tool_scope is not None:
+            return self._active_tool_scope
+        return self.tool_scope
+
+    def _resolve_child_model(self, parent_task_id: str | None, requested: str | None) -> str:
+        if requested:
+            return str(requested)
+        if parent_task_id is not None:
+            try:
+                parent = self.store.get_task(parent_task_id)
+                return str(parent["model"])
+            except KeyError:
+                pass
+        return self.model_name
+
+    def _subagent_depth(self, task_id: str | None) -> int:
+        child_to_parent = {
+            str(run["child_task_id"]): run["parent_task_id"]
+            for run in self.store.list_subagent_runs()
+        }
+        depth = 0
+        seen: set[str] = set()
+        current = task_id
+        while current is not None:
+            if current in seen:
+                raise InvariantViolation(f"Subagent parent cycle detected at task {current}")
+            seen.add(current)
+            parent = child_to_parent.get(current)
+            if parent is None:
+                return depth
+            current = str(parent)
+            depth += 1
+        return depth
+
+    @staticmethod
+    def _estimate_messages_tokens(messages: list[dict]) -> int:
+        rendered = json.dumps(messages, ensure_ascii=False, sort_keys=True)
+        return estimate_tokens(rendered)
+
+    def _check_subagent_context_budget(self, child_task_id: str, context_window: int) -> None:
+        task = self.store.get_task(child_task_id)
+        checkpoint_id = task.get("checkpoint_id")
+        if checkpoint_id is None:
+            raise RuntimeError(f"Subagent child has no checkpoint: {child_task_id}")
+        checkpoint = self.store.get_checkpoint(int(checkpoint_id))
+        estimated = self._estimate_messages_tokens(list(checkpoint.get("messages") or []))
+        if estimated > int(context_window):
+            raise RuntimeError(
+                f"Subagent context budget exceeded: estimated {estimated} tokens "
+                f"> context_window {int(context_window)}"
+            )
+
+    def _child_token_usage(self, child_task_id: str) -> dict[str, int]:
+        input_tokens = 0
+        output_tokens = 0
+        for call in self.store.list_model_calls(child_task_id):
+            if call.get("status") != "succeeded":
+                continue
+            input_tokens += int(call.get("input_tokens") or 0)
+            output_tokens += int(call.get("output_tokens") or 0)
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        }
+
+    def _handle_internal_tool(self, task_id: str, turn: int, call: ToolCall,
+                              messages: list[dict]) -> str:
+        args_hash = canonical_args_hash(call.name, call.input)
+        existing = self.store.get_tool_call(task_id, call.id)
+        if existing is not None:
+            if existing["args_hash"] != args_hash:
+                raise RuntimeError(f"Tool call ID reused with different arguments: {call.id}")
+            if existing["status"] == "succeeded":
+                self.store.append_event(task_id, "tool_deduplicated", {"tool_use_id": call.id})
+                return existing.get("output") or "{}"
+            if existing["status"] in {"denied", "failed", "aborted"}:
+                raise RuntimeError(f"Terminal internal tool call cannot execute again: {call.id}")
+            if existing["status"] == "needs_review":
+                raise NeedsReview(call.id, existing.get("error") or "Manual review required")
+            if existing["status"] == "waiting_approval":
+                raise WaitingForApproval(call.id, existing.get("permission_reason") or "Approval required")
+        if existing is None:
+            existing = self.store.create_tool_call(
+                task_id, call.id, turn, call.name, call.input, args_hash, effect="read_only"
+            )
+        if existing["status"] == "planned":
+            self.store.start_tool_call(task_id, call.id, "read_only", started_at=time.time())
+        self.store.append_event(task_id, "internal_tool_started", {
+            "tool_use_id": call.id,
+            "name": call.name,
+        })
+        self._fault("after_tool_started", task_id=task_id, tool_use_id=call.id)
+        if call.name == ".agent_runtime.spawn_subagent":
+            output = self._run_internal_spawn(task_id, turn, call)
+        elif call.name == ".agent_runtime.request_plan_approval":
+            output = self._run_internal_plan_approval(task_id, call)
+        else:
+            raise RuntimeError(f"Unknown internal tool: {call.name}")
+        self.store.update_tool_call(task_id, call.id, status="succeeded", output=output, finished_at=time.time())
+        self.store.append_event(task_id, "internal_tool_succeeded", {
+            "tool_use_id": call.id,
+            "name": call.name,
+            "output_chars": len(output),
+        })
+        self._fault("after_tool_persist", task_id=task_id, tool_use_id=call.id)
+        return output
+
+    def _run_internal_spawn(self, task_id: str, turn: int, call: ToolCall) -> str:
+        prompt = call.input.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("spawn_subagent requires a non-empty prompt")
+        role = str(call.input.get("role") or "assistant")
+        wait = bool(call.input.get("wait", True))
+        scope = self._normalize_tool_scope(call.input.get("tool_scope"))
+        context_window = call.input.get("context_window")
+        if context_window is not None and not isinstance(context_window, int):
+            raise ValueError("spawn_subagent context_window must be an integer")
+        model = call.input.get("model")
+        if model is not None and not isinstance(model, str):
+            raise ValueError("spawn_subagent model must be a string")
+        existing = self.store.get_tool_call(task_id, call.id)
+        pending: dict[str, Any] | None = None
+        if existing is not None and existing.get("output"):
+            try:
+                parsed = json.loads(existing["output"])
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict):
+                pending = parsed
+        if pending and pending.get("run_id") and pending.get("child_task_id"):
+            result = self._spawn_subagent(
+                task_id,
+                prompt,
+                role=role,
+                wait=wait,
+                tool_scope=scope,
+                context_window=context_window,
+                model=model,
+                run_id=str(pending["run_id"]),
+                child_task_id=str(pending["child_task_id"]),
+            )
+        else:
+            run_id = f"subagent_{uuid.uuid4().hex}"
+            child_task_id = f"task_{uuid.uuid4().hex}"
+            self.store.update_tool_call(
+                task_id,
+                call.id,
+                output=json.dumps(
+                    {"run_id": run_id, "child_task_id": child_task_id, "status": "pending"},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+            )
+            result = self._spawn_subagent(
+                task_id,
+                prompt,
+                role=role,
+                wait=wait,
+                tool_scope=scope,
+                context_window=context_window,
+                model=model,
+                run_id=run_id,
+                child_task_id=child_task_id,
+            )
+        return json.dumps(result, ensure_ascii=False, sort_keys=True)
+
+    def _run_internal_plan_approval(self, task_id: str, call: ToolCall) -> str:
+        run_id = self._active_subagent_run_id
+        if run_id is None:
+            raise RuntimeError("request_plan_approval requires an active subagent run")
+        plan_text = call.input.get("plan_text")
+        if not isinstance(plan_text, str) or not plan_text.strip():
+            raise ValueError("request_plan_approval requires plan_text")
+        reason = "Plan approval requested by subagent"
+        plan_hash = hashlib.sha256(plan_text.encode("utf-8")).hexdigest()
+        supplied_hash = call.input.get("plan_hash")
+        if supplied_hash is not None and str(supplied_hash) != plan_hash:
+            raise ValueError("request_plan_approval plan_hash does not match plan_text")
+        requested = self.store.list_plan_approvals(run_id, status="requested")
+        if requested:
+            approval = requested[0]
+            if str(approval["plan_hash"]) != plan_hash:
+                raise StaleState("Plan approval already requested with a different plan")
+            self._write_plan_file(approval, plan_text)
+        else:
+            approval_id = f"approval_{uuid.uuid4().hex}"
+            approval_draft = {
+                "approval_id": approval_id,
+                "subagent_run_id": run_id,
+                "plan_hash": plan_hash,
+            }
+            self._write_plan_file(approval_draft, plan_text)
+            approval = self.store.create_plan_approval(
+                approval_id,
+                run_id,
+                plan_hash,
+                self.owner_id,
+            )
+        run = self.store.get_subagent_run(run_id)
+        if run is None:
+            raise RuntimeError(f"Subagent run not found: {run_id}")
+        if run["status"] == "running":
+            self.store.mark_subagent_needs_review(
+                run_id,
+                reason,
+                int(run["version"]),
+                str(run["fencing_token"]),
+            )
+        self._pending_review = ("needs_review", call.id, reason)
+        raise NeedsReview(call.id, reason)
+
+    def _plan_file_path(self, approval_id: str) -> Path:
+        return self.repo_root / ".agent_runtime" / "plans" / f"{approval_id}.md"
+
+    def _write_plan_file(self, approval: dict[str, Any], plan_text: str) -> str:
+        path = self._plan_file_path(str(approval["approval_id"]))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        run = self.store.get_subagent_run(str(approval["subagent_run_id"]))
+        content = "\n".join([
+            "---",
+            f"approval_id: {approval['approval_id']}",
+            f"subagent_run_id: {approval['subagent_run_id']}",
+            f"child_task_id: {run['child_task_id'] if run else 'unknown'}",
+            f"plan_hash: {approval['plan_hash']}",
+            f"requested_by: {self.owner_id}",
+            "immutable: true",
+            "---",
+            "",
+            str(plan_text).rstrip(),
+            "",
+        ])
+        if path.exists():
+            if path.read_text(encoding="utf-8") != content:
+                raise StaleState(f"Plan approval file already exists with different content: {path}")
+        else:
+            path.write_text(content, encoding="utf-8")
+        return str(path)
 
     def _execute_tool(self, name: str, args: dict[str, Any]) -> Any:
         entry = self.tool_registry.get(name)
@@ -436,7 +1099,12 @@ class Runtime:
             raise RuntimeError(f"Tool has no executable adapter: {name}")
         return entry.adapter(args)
 
-    def _execute_call(self, task_id: str, turn: int, call: ToolCall) -> str:
+    def _execute_call(self, task_id: str, turn: int, call: ToolCall, messages: list[dict]) -> str:
+        if call.name.startswith(".agent_runtime."):
+            return self._handle_internal_tool(task_id, turn, call, messages)
+        active_tool_scope = self._effective_tool_scope()
+        if active_tool_scope is not None and call.name not in active_tool_scope:
+            raise RuntimeError(f"Tool is outside the active tool scope: {call.name}")
         args_hash = canonical_args_hash(call.name, call.input)
         existing = self.store.get_tool_call(task_id, call.id)
         operation = None
