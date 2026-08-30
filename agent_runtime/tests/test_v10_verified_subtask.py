@@ -867,6 +867,16 @@ def test_evidence_manifest_uses_normalized_repository_relative_paths():
     }]
 
 
+@pytest.mark.parametrize("path", [None, 123])
+def test_evidence_paths_reject_non_string_non_pathlike_values(path: object):
+    with pytest.raises(TypeError, match="evidence path must be a string or path-like value"):
+        VerifierResult(
+            "fail",
+            "evidence is unavailable",
+            [{"path": path, "sha256": ARTIFACT_SHA256}],
+        )
+
+
 def test_pass_requires_complete_configured_evidence_coverage(tmp_path: Path):
     outcomes = iter([
         VerifierResult(

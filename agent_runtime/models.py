@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from functools import partial
@@ -66,8 +67,13 @@ class RunResult:
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
-def normalize_evidence_path(path: str) -> str:
-    value = str(path).replace("\\", "/")
+def normalize_evidence_path(path: str | os.PathLike[str]) -> str:
+    if not isinstance(path, (str, os.PathLike)):
+        raise TypeError("evidence path must be a string or path-like value")
+    value = os.fspath(path)
+    if not isinstance(value, str):
+        raise TypeError("evidence path must be a string or path-like value")
+    value = value.replace("\\", "/")
     if not value or value.startswith("/") or value.startswith("//"):
         raise ValueError(f"evidence path must be repository-relative: {path!r}")
     if len(value) >= 2 and value[1] == ":" and value[0].isalpha():
