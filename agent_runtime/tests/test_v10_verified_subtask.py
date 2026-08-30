@@ -186,6 +186,25 @@ def test_bundle_hash_covers_the_full_frozen_config_and_verifier_implementation()
     assert len(baseline.verifier_implementation_hash or "") == 64
 
 
+def test_bundle_hash_is_stable_for_equivalent_callable_state():
+    class Policy:
+        def __init__(self, label: str):
+            self.label = label
+
+    def build_verifier(policy: Policy):
+        def verify(_: VerifierContext) -> VerifierResult:
+            return VerifierResult("pass", policy.label, [])
+
+        return verify
+
+    first = _config(build_verifier(Policy("same")))
+    second = _config(build_verifier(Policy("same")))
+    changed = _config(build_verifier(Policy("changed")))
+
+    assert first.verifier_bundle_hash == second.verifier_bundle_hash
+    assert first.verifier_bundle_hash != changed.verifier_bundle_hash
+
+
 def test_v9_migrates_to_v10_with_verified_subtask_schema(tmp_path: Path):
     database = _v9_database(tmp_path)
 

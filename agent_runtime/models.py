@@ -104,36 +104,60 @@ def normalize_evidence_manifest(
     return sorted(normalized, key=lambda entry: entry["path"])
 
 
-def _stable_value(value: Any) -> Any:
+def _stable_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _stable_value(value: Any, seen: set[int] | None = None) -> Any:
+    if seen is None:
+        seen = set()
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, bytes):
         return {"bytes": value.hex()}
-    if isinstance(value, CodeType):
-        return {"code": _stable_code(value)}
-    if isinstance(value, (list, tuple)):
-        return [_stable_value(item) for item in value]
-    if isinstance(value, dict):
+    identity = id(value)
+    if identity in seen:
+        return {"cycle": f"{type(value).__module__}.{type(value).__qualname__}"}
+    seen.add(identity)
+    try:
+        if isinstance(value, CodeType):
+            return {"code": _stable_code(value, seen)}
+        if isinstance(value, (list, tuple)):
+            return [_stable_value(item, seen) for item in value]
+        if isinstance(value, dict):
+            entries = [
+                [_stable_value(key, seen), _stable_value(item, seen)]
+                for key, item in value.items()
+            ]
+            return {
+                "dict": sorted(entries, key=lambda entry: _stable_json(entry[0]))
+            }
+        if isinstance(value, set):
+            values = [_stable_value(item, seen) for item in value]
+            return {"set": sorted(values, key=_stable_json)}
+        qualified_type = f"{type(value).__module__}.{type(value).__qualname__}"
+        try:
+            source = inspect.getsource(type(value))
+        except (OSError, TypeError):
+            source = None
+        state = getattr(value, "__dict__", None)
         return {
-            str(key): _stable_value(value[key])
-            for key in sorted(value, key=lambda item: str(item))
+            "type": qualified_type,
+            "source": source,
+            "state": _stable_value(state, seen) if state is not None else None,
         }
-    if isinstance(value, set):
-        return sorted((_stable_value(item) for item in value), key=repr)
-    return {
-        "type": f"{type(value).__module__}.{type(value).__qualname__}",
-        "repr": repr(value),
-    }
+    finally:
+        seen.remove(identity)
 
 
-def _stable_code(code: CodeType) -> dict[str, Any]:
+def _stable_code(code: CodeType, seen: set[int] | None = None) -> dict[str, Any]:
     return {
         "argcount": code.co_argcount,
         "posonlyargcount": code.co_posonlyargcount,
         "kwonlyargcount": code.co_kwonlyargcount,
         "flags": code.co_flags,
         "code": code.co_code.hex(),
-        "consts": [_stable_value(value) for value in code.co_consts],
+        "consts": [_stable_value(value, seen) for value in code.co_consts],
         "names": list(code.co_names),
         "varnames": list(code.co_varnames),
         "freevars": list(code.co_freevars),
