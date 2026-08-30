@@ -418,6 +418,12 @@ def test_trace_exposes_verified_subtask_checkpoints(tmp_path: Path):
         "verified_subtask_checkpoint",
     }
     assert "semantic_checkpoint" not in {record["record_type"] for record in records}
+    checkpoint_record = next(
+        record for record in records
+        if record["record_type"] == "verified_subtask_checkpoint"
+    )
+    assert "verified_subtask_checkpoint_id" in checkpoint_record
+    assert "semantic_checkpoint_id" not in checkpoint_record
 
 
 def test_v10_business_tables_without_migration_history_fail_closed(tmp_path: Path):

@@ -233,9 +233,13 @@ class TraceReporter:
                     + "\n"
                 )
             for checkpoint in self.store.list_semantic_checkpoints(task_id):
+                checkpoint_payload = dict(checkpoint)
+                checkpoint_payload["verified_subtask_checkpoint_id"] = checkpoint_payload.pop(
+                    "semantic_checkpoint_id"
+                )
                 handle.write(
                     json.dumps(
-                        _redact({"record_type": "verified_subtask_checkpoint", **checkpoint}),
+                        _redact({"record_type": "verified_subtask_checkpoint", **checkpoint_payload}),
                         ensure_ascii=False,
                         sort_keys=True,
                     )
