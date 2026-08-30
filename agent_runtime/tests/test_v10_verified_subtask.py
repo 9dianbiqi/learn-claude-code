@@ -298,6 +298,55 @@ def test_bundle_hash_covers_name_mangled_slots_state():
     assert first.verifier_bundle_hash != changed.verifier_bundle_hash
 
 
+def test_bundle_hash_covers_parent_and_child_name_mangled_slots():
+    class ParentVerifier:
+        __slots__ = ("__expected",)
+
+        def __init__(self, expected: str):
+            self.__expected = expected
+
+        def parent_result(self) -> str:
+            return self.__expected
+
+    class ChildVerifier(ParentVerifier):
+        __slots__ = ("__expected",)
+
+        def __init__(self, parent_expected: str, child_expected: str):
+            super().__init__(parent_expected)
+            self.__expected = child_expected
+
+        def __call__(self, _: VerifierContext) -> VerifierResult:
+            return VerifierResult("pass", f"{self.parent_result()}:{self.__expected}", [])
+
+    first = _config(ChildVerifier("parent", "child"))
+    changed_parent = _config(ChildVerifier("changed", "child"))
+    changed_child = _config(ChildVerifier("parent", "changed"))
+
+    assert first.verifier_bundle_hash != changed_parent.verifier_bundle_hash
+    assert first.verifier_bundle_hash != changed_child.verifier_bundle_hash
+
+
+def test_mutating_a_callable_after_configuration_changes_the_bundle_hash():
+    class MutableVerifier:
+        def __init__(self, expected: str):
+            self.expected = expected
+
+        def __call__(self, _: VerifierContext) -> VerifierResult:
+            return VerifierResult("pass", self.expected, [])
+
+    verifier = MutableVerifier("same")
+    config = _config(verifier)
+    original_hash = config.verifier_bundle_hash
+    verifier.expected = "changed"
+
+    assert config.verifier_bundle_hash != original_hash
+
+
+def test_evidence_paths_must_be_a_sequence_not_a_string():
+    with pytest.raises((TypeError, ValueError), match="evidence_paths"):
+        _config(lambda _: VerifierResult("pass", "ok", []), "artifact.txt")
+
+
 def test_bundle_hash_covers_global_verifier_bindings():
     def verify(_: VerifierContext) -> VerifierResult:
         return VerifierResult("pass", GLOBAL_VERIFIER_LABEL, [])
@@ -307,9 +356,10 @@ def test_bundle_hash_covers_global_verifier_bindings():
     first = _config(verify)
     GLOBAL_VERIFIER_LABEL = "changed"
     changed = _config(verify)
+    changed_hash = changed.verifier_bundle_hash
     GLOBAL_VERIFIER_LABEL = "same"
 
-    assert first.verifier_bundle_hash != changed.verifier_bundle_hash
+    assert first.verifier_bundle_hash != changed_hash
 
 
 def test_bundle_hash_covers_nested_global_verifier_bindings():
@@ -324,9 +374,10 @@ def test_bundle_hash_covers_nested_global_verifier_bindings():
     first = _config(verify)
     NESTED_GLOBAL_VERIFIER_LABEL = "changed"
     changed = _config(verify)
+    changed_hash = changed.verifier_bundle_hash
     NESTED_GLOBAL_VERIFIER_LABEL = "same"
 
-    assert first.verifier_bundle_hash != changed.verifier_bundle_hash
+    assert first.verifier_bundle_hash != changed_hash
 
 
 def test_v9_migrates_to_v10_with_verified_subtask_schema(tmp_path: Path):
