@@ -97,9 +97,10 @@ def test_public_run_commits_a_verified_subtask_bundle(tmp_path: Path):
     assert seen[0].subtask_id == "s1"
     assert seen[0].completion_summary == "summary"
 
-    plan = runtime.store.get_active_plan(result.task_id)
-    assert plan is not None
-    assert plan["items"][0]["status"] == "completed"
+    item = runtime.store.get_plan_item(result.task_id, "s1")
+    assert item is not None
+    assert item["status"] == "completed"
+    assert runtime.store.list_plans(result.task_id)[0]["status"] == "completed"
     runs = runtime.store.list_verifier_runs(result.task_id)
     assert len(runs) == 1
     assert runs[0]["status"] == "pass"
@@ -315,7 +316,7 @@ def test_f3_recovery_exposes_one_bundle_and_deduplicates_resume(tmp_path: Path):
 
     task_id = first.store.list_tasks()[0]["task_id"]
     assert first.store.get_task(task_id)["status"] == "completed"
-    assert first.store.get_active_plan(task_id)["items"][0]["status"] == "completed"
+    assert first.store.get_plan_item(task_id, "s1")["status"] == "completed"
     assert len(first.store.list_verifier_runs(task_id)) == 1
     assert len(first.store.list_semantic_checkpoints(task_id)) == 1
 
@@ -521,4 +522,4 @@ def test_uncertain_verification_is_distinct_non_authoritative_retry(tmp_path: Pa
     assert runs[0]["authoritative"] is False
     assert runs[1]["status"] == "pass"
     assert runs[1]["authoritative"] is True
-    assert runtime.store.get_active_plan(result.task_id)["items"][0]["status"] == "completed"
+    assert runtime.store.get_plan_item(result.task_id, "s1")["status"] == "completed"

@@ -1234,6 +1234,10 @@ class EventStore:
             )
         with self.transaction() as conn:
             row = self._plan_call(conn, plan_item_id)
+            if row["verifier_bundle_hash"] is not None:
+                raise InvariantViolation(
+                    f"verified plan item {plan_item_id} requires a passing verifier bundle"
+                )
             if row["status"] != "verifying":
                 raise InvariantViolation(
                     f"plan item {plan_item_id} cannot complete from {row['status']}"
@@ -1276,7 +1280,7 @@ class EventStore:
         row = self._fetchone(
             "SELECT i.*, p.task_id FROM plan_items i "
             "JOIN plans p ON p.plan_id = i.plan_id "
-            "WHERE p.task_id = ? AND p.status = 'active' AND i.subtask_id = ? "
+            "WHERE p.task_id = ? AND p.status IN ('active', 'completed') AND i.subtask_id = ? "
             "ORDER BY i.plan_item_id DESC LIMIT 1",
             (task_id, subtask_id),
         )
@@ -1563,9 +1567,14 @@ class EventStore:
                 )
                 if updated_item.rowcount != 1:
                     raise StaleState(f"Plan item changed during verified completion: {plan_item_id}")
+                remaining = conn.execute(
+                    "SELECT COUNT(*) FROM plan_items WHERE plan_id = ? AND status != 'completed'",
+                    (item["plan_id"],),
+                ).fetchone()[0]
                 conn.execute(
-                    "UPDATE plans SET updated_at = ? WHERE plan_id = ?",
-                    (now, item["plan_id"]),
+                    "UPDATE plans SET status = CASE WHEN ? = 0 THEN 'completed' ELSE status END, "
+                    "updated_at = ? WHERE plan_id = ?",
+                    (remaining, now, item["plan_id"]),
                 )
                 updated_checkpoint = conn.execute(
                     "UPDATE checkpoints SET phase = 'completed' "
