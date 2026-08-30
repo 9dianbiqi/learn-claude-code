@@ -41,6 +41,7 @@ ARTIFACT_SHA256 = "a" * 64
 EVIDENCE_A_SHA256 = "a" * 64
 EVIDENCE_Z_SHA256 = "b" * 64
 GLOBAL_VERIFIER_LABEL = "same"
+NESTED_GLOBAL_VERIFIER_LABEL = "same"
 
 
 def _config(
@@ -273,6 +274,23 @@ def test_bundle_hash_covers_global_verifier_bindings():
     GLOBAL_VERIFIER_LABEL = "changed"
     changed = _config(verify)
     GLOBAL_VERIFIER_LABEL = "same"
+
+    assert first.verifier_bundle_hash != changed.verifier_bundle_hash
+
+
+def test_bundle_hash_covers_nested_global_verifier_bindings():
+    def verify(_: VerifierContext) -> VerifierResult:
+        def read_label() -> str:
+            return NESTED_GLOBAL_VERIFIER_LABEL
+
+        return VerifierResult("pass", read_label(), [])
+
+    global NESTED_GLOBAL_VERIFIER_LABEL
+    NESTED_GLOBAL_VERIFIER_LABEL = "same"
+    first = _config(verify)
+    NESTED_GLOBAL_VERIFIER_LABEL = "changed"
+    changed = _config(verify)
+    NESTED_GLOBAL_VERIFIER_LABEL = "same"
 
     assert first.verifier_bundle_hash != changed.verifier_bundle_hash
 

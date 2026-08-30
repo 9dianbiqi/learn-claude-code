@@ -145,7 +145,11 @@ def _stable_object_state(value: Any, seen: set[int]) -> dict[str, Any] | None:
     return state or None
 
 
-def _stable_value(value: Any, seen: set[int] | None = None) -> Any:
+def _stable_value(
+    value: Any,
+    seen: set[int] | None = None,
+    globals_dict: dict[str, Any] | None = None,
+) -> Any:
     if seen is None:
         seen = set()
     if value is None or isinstance(value, (bool, int, float, str)):
@@ -160,19 +164,22 @@ def _stable_value(value: Any, seen: set[int] | None = None) -> Any:
         if isinstance(value, partial):
             return {"partial": _stable_callable_payload(value, seen)}
         if isinstance(value, CodeType):
-            return {"code": _stable_code(value, seen)}
+            return {"code": _stable_code(value, seen, globals_dict)}
         if isinstance(value, list):
-            return {"list": [_stable_value(item, seen) for item in value]}
+            return {"list": [_stable_value(item, seen, globals_dict) for item in value]}
         if isinstance(value, tuple):
-            return {"tuple": [_stable_value(item, seen) for item in value]}
+            return {"tuple": [_stable_value(item, seen, globals_dict) for item in value]}
         if isinstance(value, dict):
             entries = [
-                [_stable_value(key, seen), _stable_value(item, seen)]
+                [
+                    _stable_value(key, seen, globals_dict),
+                    _stable_value(item, seen, globals_dict),
+                ]
                 for key, item in value.items()
             ]
             return {"dict": sorted(entries, key=lambda entry: _stable_json(entry[0]))}
         if isinstance(value, set):
-            values = [_stable_value(item, seen) for item in value]
+            values = [_stable_value(item, seen, globals_dict) for item in value]
             return {"set": sorted(values, key=_stable_json)}
         if isinstance(value, type):
             return {
@@ -200,27 +207,33 @@ def _stable_value(value: Any, seen: set[int] | None = None) -> Any:
         seen.remove(identity)
 
 
-def _stable_code(code: CodeType, seen: set[int] | None = None) -> dict[str, Any]:
-    return {
+def _stable_code(
+    code: CodeType,
+    seen: set[int] | None = None,
+    globals_dict: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = {
         "argcount": code.co_argcount,
         "posonlyargcount": code.co_posonlyargcount,
         "kwonlyargcount": code.co_kwonlyargcount,
         "flags": code.co_flags,
         "code": code.co_code.hex(),
-        "consts": [_stable_value(value, seen) for value in code.co_consts],
+        "consts": [_stable_value(value, seen, globals_dict) for value in code.co_consts],
         "names": list(code.co_names),
         "varnames": list(code.co_varnames),
         "freevars": list(code.co_freevars),
         "cellvars": list(code.co_cellvars),
     }
+    if globals_dict is not None:
+        payload["globals"] = _stable_global_bindings(globals_dict, code, seen)
+    return payload
 
 
 def _stable_global_bindings(
-    target: Any,
+    globals_dict: dict[str, Any] | None,
     code: CodeType,
     seen: set[int],
 ) -> dict[str, Any]:
-    globals_dict = getattr(target, "__globals__", None)
     if not isinstance(globals_dict, dict):
         return {}
     return {
@@ -250,7 +263,12 @@ def _stable_callable_payload(
         "qualname": getattr(target, "__qualname__", type(verifier).__qualname__),
     }
     if code is not None:
-        payload["code"] = _stable_code(code, seen)
+        globals_dict = getattr(target, "__globals__", None)
+        payload["code"] = _stable_code(
+            code,
+            seen,
+            globals_dict if isinstance(globals_dict, dict) else None,
+        )
         payload["defaults"] = _stable_value(getattr(target, "__defaults__", None), seen)
         payload["kwdefaults"] = _stable_value(getattr(target, "__kwdefaults__", None), seen)
         closure = getattr(target, "__closure__", None)
@@ -258,7 +276,7 @@ def _stable_callable_payload(
             [_stable_value(cell.cell_contents, seen) for cell in closure]
             if closure is not None else None
         )
-        payload["globals"] = _stable_global_bindings(target, code, seen)
+        payload["globals"] = _stable_global_bindings(globals_dict, code, seen)
         bound_self = getattr(target, "__self__", None)
         if bound_self is not None:
             payload["bound_self"] = {
