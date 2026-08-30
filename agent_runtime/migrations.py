@@ -10,13 +10,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 9
-MIGRATION_NAME = "v9_subagents_mailbox"
+SCHEMA_VERSION = 10
+MIGRATION_NAME = "v10_verified_subtask"
 V5_MIGRATION_NAME = "v5_effect_ledger"
 V6_MIGRATION_NAME = "v6_durable_context"
 V7_MIGRATION_NAME = "v7_background_jobs"
 V8_MIGRATION_NAME = "v8_tool_registry_mcp"
 V9_MIGRATION_NAME = "v9_subagents_mailbox"
+V10_MIGRATION_NAME = "v10_verified_subtask"
 MAX_EVENT_PAYLOAD_BYTES = 1 * 1024 * 1024
 
 _TASK_STATUSES = frozenset({
@@ -676,6 +677,62 @@ _V9_MIGRATION_SOURCE = "\n".join(
 V9_CHECKSUM = _sha256_text(_V9_MIGRATION_SOURCE)
 
 
+_V10_ADDITIONS = (
+    "ALTER TABLE plan_items ADD COLUMN verifier_bundle_hash TEXT",
+    """
+    CREATE TABLE IF NOT EXISTS verifier_runs (
+        verifier_run_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        plan_item_id INTEGER NOT NULL REFERENCES plan_items(plan_item_id),
+        subtask_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        completion_summary TEXT NOT NULL,
+        verifier_id TEXT NOT NULL,
+        verifier_version TEXT NOT NULL,
+        verification_rule TEXT NOT NULL,
+        verifier_bundle_hash TEXT NOT NULL,
+        evidence_manifest_json TEXT NOT NULL,
+        evidence_hash TEXT NOT NULL,
+        authoritative INTEGER NOT NULL DEFAULT 0,
+        execution_checkpoint_id INTEGER NOT NULL REFERENCES checkpoints(checkpoint_id),
+        created_at REAL NOT NULL,
+        CHECK (status IN ('pass', 'fail', 'uncertain')),
+        CHECK (authoritative IN (0, 1)),
+        CHECK (authoritative = 0 OR status = 'pass')
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS semantic_checkpoints (
+        semantic_checkpoint_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        plan_item_id INTEGER NOT NULL REFERENCES plan_items(plan_item_id),
+        subtask_id TEXT NOT NULL,
+        verifier_run_id TEXT NOT NULL UNIQUE REFERENCES verifier_runs(verifier_run_id),
+        execution_checkpoint_id INTEGER NOT NULL REFERENCES checkpoints(checkpoint_id),
+        completion_summary TEXT NOT NULL,
+        verifier_id TEXT NOT NULL,
+        verifier_version TEXT NOT NULL,
+        verification_rule TEXT NOT NULL,
+        verifier_bundle_hash TEXT NOT NULL,
+        evidence_manifest_json TEXT NOT NULL,
+        evidence_hash TEXT NOT NULL,
+        created_at REAL NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_verifier_runs_task ON verifier_runs(task_id, created_at, verifier_run_id)",
+    "CREATE INDEX IF NOT EXISTS idx_verifier_runs_plan_item ON verifier_runs(plan_item_id, created_at, verifier_run_id)",
+    "CREATE INDEX IF NOT EXISTS idx_semantic_checkpoints_task ON semantic_checkpoints(task_id, semantic_checkpoint_id)",
+    "CREATE INDEX IF NOT EXISTS idx_semantic_checkpoints_plan_item ON semantic_checkpoints(plan_item_id, semantic_checkpoint_id)",
+)
+
+_V10_MIGRATION_SOURCE = "\n".join(
+    [_V9_MIGRATION_SOURCE.strip()]
+    + [statement.strip() for statement in _V10_ADDITIONS]
+)
+V10_CHECKSUM = _sha256_text(_V10_MIGRATION_SOURCE)
+
+
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in columns:
@@ -1239,6 +1296,11 @@ def _apply_v9_subagents_mailbox(conn: sqlite3.Connection) -> None:
     _execute_all(conn, _V9_ADDITIONS)
 
 
+def _apply_v10_verified_subtask(conn: sqlite3.Connection) -> None:
+    _ensure_column(conn, "plan_items", "verifier_bundle_hash", "TEXT")
+    _execute_all(conn, _V10_ADDITIONS[1:])
+
+
 def _create_latest_schema(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys=ON")
     _execute_all(conn, _BASE_SCHEMA)
@@ -1246,6 +1308,7 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
     _apply_v7_background_jobs(conn)
     _apply_v8_tool_registry(conn)
     _apply_v9_subagents_mailbox(conn)
+    _apply_v10_verified_subtask(conn)
     row = conn.execute("SELECT 1 FROM schema_migrations WHERE version = ?", (SCHEMA_VERSION,)).fetchone()
     if row is None:
         conn.execute(
@@ -1254,7 +1317,7 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
                 version, name, checksum, applied_at, duration_ms, backup_filename, backup_sha256
             ) VALUES (?, ?, ?, ?, ?, NULL, NULL)
             """,
-            (SCHEMA_VERSION, MIGRATION_NAME, V9_CHECKSUM, _now(), 0.0),
+            (SCHEMA_VERSION, MIGRATION_NAME, V10_CHECKSUM, _now(), 0.0),
         )
 
 
@@ -1263,6 +1326,7 @@ V6_MIGRATION = Migration(6, V6_MIGRATION_NAME, V6_CHECKSUM, _apply_v6_durable_co
 V7_MIGRATION = Migration(7, V7_MIGRATION_NAME, V7_CHECKSUM, _apply_v7_background_jobs)
 V8_MIGRATION = Migration(8, V8_MIGRATION_NAME, V8_CHECKSUM, _apply_v8_tool_registry)
 V9_MIGRATION = Migration(9, V9_MIGRATION_NAME, V9_CHECKSUM, _apply_v9_subagents_mailbox)
+V10_MIGRATION = Migration(10, V10_MIGRATION_NAME, V10_CHECKSUM, _apply_v10_verified_subtask)
 
 
 class SchemaManager:
@@ -1289,7 +1353,14 @@ class SchemaManager:
 
     @property
     def migrations(self) -> tuple[Migration, ...]:
-        return (V5_MIGRATION, V6_MIGRATION, V7_MIGRATION, V8_MIGRATION, V9_MIGRATION)
+        return (
+            V5_MIGRATION,
+            V6_MIGRATION,
+            V7_MIGRATION,
+            V8_MIGRATION,
+            V9_MIGRATION,
+            V10_MIGRATION,
+        )
 
     def _connect(self, *, read_only: bool = False) -> sqlite3.Connection:
         if read_only:
@@ -1326,12 +1397,31 @@ class SchemaManager:
             raise MigrationValidationError(
                 f"database schema v{current} has no supported migration path to v{SCHEMA_VERSION}"
             )
+        known_migrations = {migration.version: migration for migration in self.migrations}
+        for row in rows:
+            version = int(row["version"])
+            migration = known_migrations.get(version)
+            if migration is None:
+                if version == 4:
+                    keys = set(row.keys())
+                    if "name" not in keys or "checksum" not in keys:
+                        continue
+                    if row["name"] is None and row["checksum"] is None:
+                        continue
+                    if str(row["name"]) == "legacy-v4" and str(row["checksum"]) == "legacy":
+                        continue
+                raise MigrationValidationError(f"unknown registered schema migration: v{version}")
+            if str(row["name"]) != migration.name or str(row["checksum"]) != migration.checksum:
+                raise MigrationChecksumMismatch(
+                    f"migration checksum mismatch for v{version}: "
+                    f"{row['name']!r}/{row['checksum']!r}"
+                )
         if current == SCHEMA_VERSION:
             columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(schema_migrations)").fetchall()}
             if not {"name", "checksum"} <= columns:
                 raise MigrationValidationError("schema_migrations is missing migration audit columns")
             latest = next(row for row in rows if int(row["version"]) == SCHEMA_VERSION)
-            if str(latest["name"]) != MIGRATION_NAME or str(latest["checksum"]) != V9_CHECKSUM:
+            if str(latest["name"]) != MIGRATION_NAME or str(latest["checksum"]) != V10_CHECKSUM:
                 raise MigrationChecksumMismatch(
                     f"migration checksum mismatch for v{SCHEMA_VERSION}: "
                     f"{latest['name']!r}/{latest['checksum']!r}"
@@ -1343,6 +1433,7 @@ class SchemaManager:
                 "agent_jobs", "job_runs", "cron_schedules",
                 "tool_registrations", "mcp_connections",
                 "subagent_runs", "mailboxes", "mailbox_messages", "plan_approvals",
+                "verifier_runs", "semantic_checkpoints",
             }
             missing = sorted(required - tables)
             if missing:
@@ -1379,7 +1470,7 @@ class SchemaManager:
                 "plan_items": {
                     "plan_item_id", "plan_id", "subtask_id", "description", "status",
                     "blocked_by_json", "completion_summary", "evidence_hash", "version",
-                    "created_at", "updated_at",
+                    "created_at", "updated_at", "verifier_bundle_hash",
                 },
                 "agent_jobs": {
                     "job_id", "task_id", "repo_root", "lane_id", "kind", "payload_json",
@@ -1420,6 +1511,19 @@ class SchemaManager:
                     "approval_id", "subagent_run_id", "plan_hash", "status",
                     "requested_by", "decided_by", "reason", "version",
                     "created_at", "updated_at",
+                },
+                "verifier_runs": {
+                    "verifier_run_id", "task_id", "plan_item_id", "subtask_id", "status",
+                    "summary", "completion_summary", "verifier_id", "verifier_version",
+                    "verification_rule", "verifier_bundle_hash", "evidence_manifest_json",
+                    "evidence_hash", "authoritative", "execution_checkpoint_id", "created_at",
+                },
+                "semantic_checkpoints": {
+                    "semantic_checkpoint_id", "task_id", "plan_item_id", "subtask_id",
+                    "verifier_run_id", "execution_checkpoint_id", "completion_summary",
+                    "verifier_id", "verifier_version", "verification_rule",
+                    "verifier_bundle_hash", "evidence_manifest_json", "evidence_hash",
+                    "created_at",
                 },
             }
             for table, columns in required_columns.items():
@@ -1551,7 +1655,7 @@ class SchemaManager:
             self.fault_injector(point, **context)
 
     def ensure_latest(self) -> None:
-        """Create a fresh database directly at v6; never upgrade an old database."""
+        """Create a fresh database directly at the latest schema; never upgrade an old database."""
         if self.database.exists():
             try:
                 status = self.inspect()
@@ -1723,6 +1827,8 @@ class SchemaManager:
                 _apply_v8_tool_registry(conn)
             if 9 in expected_versions:
                 _apply_v9_subagents_mailbox(conn)
+            if 10 in expected_versions:
+                _apply_v10_verified_subtask(conn)
 
             duration_ms = (time.perf_counter() - started) * 1000.0
             for migration in pending:
@@ -1803,4 +1909,5 @@ __all__ = [
     "V7_CHECKSUM",
     "V8_CHECKSUM",
     "V9_CHECKSUM",
+    "V10_CHECKSUM",
 ]

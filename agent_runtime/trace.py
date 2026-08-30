@@ -47,6 +47,7 @@ class TraceReporter:
         )
         projection_metrics = self._projection_metrics(models)
         plan_metrics = self._plan_metrics(task_id)
+        verified_metrics = self._verified_metrics(task_id)
         jobs = self.store.list_jobs(task_id)
         job_status_counts: dict[str, int] = {}
         job_run_count = 0
@@ -99,6 +100,11 @@ class TraceReporter:
                 len(item.get("items", [])) for item in plan_metrics["plans"]
             ),
             "plan_events": plan_metrics["events"],
+            "verifier_run_count": verified_metrics["verifier_run_count"],
+            "authoritative_verifier_run_count": verified_metrics["authoritative_verifier_run_count"],
+            "non_authoritative_verifier_run_count": verified_metrics["non_authoritative_verifier_run_count"],
+            "semantic_checkpoint_count": verified_metrics["semantic_checkpoint_count"],
+            "verified_subtask_bundle_count": verified_metrics["semantic_checkpoint_count"],
             "background_job_count": len(jobs),
             "background_job_runs": job_run_count,
             "background_job_statuses": job_status_counts,
@@ -147,6 +153,16 @@ class TraceReporter:
             if event["type"].startswith("plan_item_")
         ]
         return {"plans": result, "events": events}
+
+    def _verified_metrics(self, task_id: str) -> dict[str, int]:
+        runs = self.store.list_verifier_runs(task_id)
+        checkpoints = self.store.list_semantic_checkpoints(task_id)
+        return {
+            "verifier_run_count": len(runs),
+            "authoritative_verifier_run_count": sum(run["authoritative"] for run in runs),
+            "non_authoritative_verifier_run_count": sum(not run["authoritative"] for run in runs),
+            "semantic_checkpoint_count": len(checkpoints),
+        }
 
     def export_jsonl(self, task_id: str, output_path: str | Path) -> int:
         path = Path(output_path)
@@ -202,6 +218,24 @@ class TraceReporter:
                 handle.write(
                     json.dumps(
                         _redact({"record_type": "plan", **plan_copy}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+            for verifier_run in self.store.list_verifier_runs(task_id):
+                handle.write(
+                    json.dumps(
+                        _redact({"record_type": "verifier_run", **verifier_run}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+            for checkpoint in self.store.list_semantic_checkpoints(task_id):
+                handle.write(
+                    json.dumps(
+                        _redact({"record_type": "semantic_checkpoint", **checkpoint}),
                         ensure_ascii=False,
                         sort_keys=True,
                     )

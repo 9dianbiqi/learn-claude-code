@@ -1,6 +1,13 @@
 """A small, durable runtime for long-running coding-agent tasks."""
 
-from .models import ModelResponse, RunResult, ToolCall
+from .models import (
+    ModelResponse,
+    RunResult,
+    ToolCall,
+    VerifierContext,
+    VerifierResult,
+    VerifiedSubtaskConfig,
+)
 from .effects import EffectSemantics, OperationSpec, ReconcileEvidence
 from .runtime import Runtime
 
@@ -14,5 +21,8 @@ __all__ = [
     "RunResult",
     "Runtime",
     "ToolCall",
+    "VerifierContext",
+    "VerifierResult",
+    "VerifiedSubtaskConfig",
     "__version__",
 ]

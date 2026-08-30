@@ -16,7 +16,14 @@ from .effects import (
     semantics_for_effect,
     stable_dedupe_key,
 )
-from .models import ModelResponse, RunResult, ToolCall
+from .models import (
+    ModelResponse,
+    RunResult,
+    ToolCall,
+    VerifierContext,
+    VerifierResult,
+    VerifiedSubtaskConfig,
+)
 from .permissions import PermissionDecision, PermissionEngine
 from .store import EffectBlocked, EventStore, InvariantViolation, LeaseLost, StaleState
 from .tools import FileConflict, ShellResult, ToolExecutor
@@ -90,7 +97,8 @@ class Runtime:
                  approval_callback: Callable[[str, dict[str, Any], str], bool] | None = None,
                  interactive: bool = False, policy_path: str | Path | None = None,
                  lease_ttl: float = 300.0,
-                 tool_scope: set[str] | None = None):
+                 tool_scope: set[str] | None = None,
+                 verified_subtask: VerifiedSubtaskConfig | None = None):
         self.repo_root = Path(repo_root).resolve()
         self.model = model
         self.model_name = model_name or getattr(model, "name", "unknown")
@@ -101,6 +109,7 @@ class Runtime:
         self.interactive = interactive
         self.lease_ttl = lease_ttl
         self.tool_scope = self._normalize_tool_scope(tool_scope)
+        self.verified_subtask = verified_subtask
         model_timeout = getattr(model, "timeout", None)
         if model_timeout is not None and float(model_timeout) >= lease_ttl:
             raise ValueError("Model timeout must be smaller than lease TTL")
@@ -128,6 +137,160 @@ class Runtime:
         if self.fault_injector:
             self.fault_injector(point, **context)
 
+    @staticmethod
+    def _has_completion_marker(text: str) -> bool:
+        return any(line == "SUBTASK_COMPLETE" for line in str(text).splitlines())
+
+    @staticmethod
+    def _completion_summary(text: str) -> str:
+        return "\n".join(
+            line for line in str(text).splitlines() if line != "SUBTASK_COMPLETE"
+        ).strip()
+
+    @staticmethod
+    def _normalize_evidence_manifest(
+        manifest: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        normalized: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for entry in manifest:
+            if not isinstance(entry, dict) or "path" not in entry or "sha256" not in entry:
+                raise ValueError("evidence manifest entries require path and sha256")
+            path = str(entry["path"]).replace("\\", "/")
+            parts = [part for part in path.split("/") if part not in {"", "."}]
+            if not parts or path.startswith("/") or ".." in parts:
+                raise ValueError(f"evidence path must be repository-relative: {path!r}")
+            normalized_path = "/".join(parts)
+            if len(normalized_path) >= 2 and normalized_path[1] == ":" and normalized_path[0].isalpha():
+                raise ValueError(f"evidence path must be repository-relative: {path!r}")
+            if normalized_path in seen:
+                raise ValueError(f"duplicate evidence path: {normalized_path}")
+            seen.add(normalized_path)
+            normalized.append({"path": normalized_path, "sha256": str(entry["sha256"])})
+        return sorted(normalized, key=lambda entry: entry["path"])
+
+    @staticmethod
+    def _verifier_feedback(status: str, summary: str) -> str:
+        return (
+            f"Verifier result: {status}. {summary}\n"
+            "The subtask is not complete. Address the verifier feedback and emit "
+            "SUBTASK_COMPLETE on its own line when the completion criteria are satisfied."
+        )
+
+    def _append_verified_feedback(
+        self,
+        task_id: str,
+        messages: list[dict],
+        turn: int,
+        feedback: str,
+    ) -> None:
+        messages.append({"role": "user", "content": feedback})
+        self.store.save_checkpoint(
+            task_id,
+            "tool_results_appended",
+            messages,
+            {"turn": turn + 1},
+        )
+
+    def _handle_verified_marker(
+        self,
+        task_id: str,
+        messages: list[dict],
+        turn: int,
+        execution_checkpoint_id: int,
+        completion_summary: str,
+    ) -> RunResult | None:
+        config = self.verified_subtask
+        if config is None:
+            return None
+        item = self._verified_plan_item(task_id)
+        if item["status"] == "retryable":
+            self.store.start_plan_item(int(item["plan_item_id"]))
+            item = self._verified_plan_item(task_id)
+        if item["status"] == "in_progress":
+            self.store.submit_plan_item_for_verification(
+                int(item["plan_item_id"]),
+                completion_summary=completion_summary,
+            )
+            item = self._verified_plan_item(task_id)
+        if item["status"] == "completed":
+            completed = self.store.get_completed_result(task_id)
+            return RunResult(task_id, "completed", completed["final_text"])
+        if item["status"] != "verifying":
+            raise InvariantViolation(
+                f"verified subtask {config.subtask_id} cannot verify from {item['status']}"
+            )
+
+        context = VerifierContext(
+            repo_root=str(self.repo_root),
+            task_id=task_id,
+            plan_item_id=int(item["plan_item_id"]),
+            subtask_id=config.subtask_id,
+            completion_summary=completion_summary,
+            execution_checkpoint_id=execution_checkpoint_id,
+        )
+        verifier_result = config.verifier(context)
+        if not isinstance(verifier_result, VerifierResult):
+            raise TypeError("verifier must return VerifierResult")
+        manifest = self._normalize_evidence_manifest(verifier_result.evidence_manifest)
+        covered_paths = {entry["path"] for entry in manifest}
+        missing_paths = sorted(set(config.evidence_paths) - covered_paths)
+        if verifier_result.status == "pass" and missing_paths:
+            verifier_result = VerifierResult(
+                status="uncertain",
+                summary=(
+                    "Verifier pass rejected because evidence is incomplete: "
+                    + ", ".join(missing_paths)
+                ),
+                evidence_manifest=manifest,
+            )
+
+        if verifier_result.status == "pass":
+            self._fault(
+                "verified_subtask_f2_pre",
+                task_id=task_id,
+                plan_item_id=int(item["plan_item_id"]),
+                execution_checkpoint_id=execution_checkpoint_id,
+            )
+            self.store.commit_verified_subtask(
+                task_id=task_id,
+                plan_item_id=int(item["plan_item_id"]),
+                subtask_id=config.subtask_id,
+                completion_summary=completion_summary,
+                verifier_summary=verifier_result.summary,
+                evidence_manifest=manifest,
+                verifier_id=config.verifier_id,
+                verifier_version=config.verifier_version,
+                verification_rule=config.verification_rule,
+                verifier_bundle_hash=config.verifier_bundle_hash,
+                execution_checkpoint_id=execution_checkpoint_id,
+                fault_injector=self._fault,
+            )
+            return RunResult(task_id, "completed", completion_summary)
+
+        self.store.record_non_authoritative_verifier_run(
+            task_id=task_id,
+            plan_item_id=int(item["plan_item_id"]),
+            subtask_id=config.subtask_id,
+            status=verifier_result.status,
+            summary=verifier_result.summary,
+            completion_summary=completion_summary,
+            evidence_manifest=manifest,
+            verifier_id=config.verifier_id,
+            verifier_version=config.verifier_version,
+            verification_rule=config.verification_rule,
+            verifier_bundle_hash=config.verifier_bundle_hash,
+            execution_checkpoint_id=execution_checkpoint_id,
+        )
+        self._append_verified_feedback(
+            task_id,
+            messages,
+            turn,
+            self._verifier_feedback(verifier_result.status, verifier_result.summary),
+        )
+        self.store.start_plan_item(int(item["plan_item_id"]))
+        return None
+
     def run(self, prompt: str) -> RunResult:
         task_id = f"task_{uuid.uuid4().hex}"
         messages = [{"role": "user", "content": prompt}]
@@ -140,10 +303,42 @@ class Runtime:
             {"turn": 0},
             fault_injector=self._fault,
         )
+        if self.verified_subtask is not None:
+            plan_id = self.store.create_plan(
+                task_id,
+                [{
+                    "subtask_id": self.verified_subtask.subtask_id,
+                    "description": self.verified_subtask.description,
+                    "verifier_bundle_hash": self.verified_subtask.verifier_bundle_hash,
+                }],
+            )
+            self.store.start_plan_item(self.store.list_plan_items(plan_id)[0]["plan_item_id"])
         return self._run_task(task_id, messages, turn=0)
 
     def resume(self, task_id: str) -> RunResult:
+        if self.verified_subtask is not None or self.store.has_verified_subtask(task_id):
+            self._assert_verified_subtask_config(task_id)
+            task = self.store.get_task(task_id)
+            if task["status"] == "completed":
+                self.store.assert_invariants(task_id)
+                completed = self.store.get_completed_result(task_id)
+                return RunResult(task_id, "completed", completed["final_text"])
         return self._resume_task(task_id, lease_acquired=False)
+
+    def _assert_verified_subtask_config(self, task_id: str) -> dict[str, Any]:
+        if self.verified_subtask is None:
+            raise RuntimeError(
+                f"Task {task_id} requires its frozen verified-subtask configuration to resume"
+            )
+        item = self.store.get_plan_item(task_id, self.verified_subtask.subtask_id)
+        if item is None:
+            raise RuntimeError(f"Verified subtask is missing from task {task_id}")
+        if item.get("verifier_bundle_hash") != self.verified_subtask.verifier_bundle_hash:
+            raise RuntimeError(f"Verifier bundle hash mismatch for task {task_id}")
+        return item
+
+    def _verified_plan_item(self, task_id: str) -> dict[str, Any]:
+        return self._assert_verified_subtask_config(task_id)
 
     def _resume_task(self, task_id: str, lease_acquired: bool) -> RunResult:
         acquired_here = False
@@ -316,6 +511,7 @@ class Runtime:
                   resume_recovery: bool = False,
                   lease_acquired: bool = False) -> RunResult:
         recovered_completion_text: str | None = None
+        verified_marker_checkpoint_id: int | None = None
         self._pending_review = None
         previous_active_task = self._active_task_id
         self._active_task_id = task_id
@@ -340,7 +536,11 @@ class Runtime:
                 "model_responded", "waiting_approval", "needs_review"
             } else []
             if phase == "model_responded" and not pending_calls:
-                recovered_completion_text = self._last_text(messages)
+                last_text = self._last_text(messages)
+                if self.verified_subtask is not None and self._has_completion_marker(last_text):
+                    verified_marker_checkpoint_id = int(current_checkpoint["checkpoint_id"])
+                elif self.verified_subtask is None:
+                    recovered_completion_text = last_text
         try:
             if resume_recovery and self.store.abandon_open_model_calls(task_id):
                 self.store.append_event(task_id, "model_call_abandoned", {"reason": "resume"})
@@ -367,11 +567,31 @@ class Runtime:
                     )
                     return RunResult(task_id, "completed", recovered_completion_text)
 
+                if verified_marker_checkpoint_id is not None:
+                    marker_text = self._last_text(messages)
+                    marker_result = self._handle_verified_marker(
+                        task_id,
+                        messages,
+                        turn,
+                        verified_marker_checkpoint_id,
+                        self._completion_summary(marker_text),
+                    )
+                    verified_marker_checkpoint_id = None
+                    if marker_result is not None:
+                        return marker_result
+                    turn += 1
+                    continue
+
                 if pending_calls is not None:
                     self._append_tool_results(task_id, turn, messages, pending_calls)
                     pending_calls = None
                     turn += 1
                     continue
+
+                if self.verified_subtask is not None:
+                    current_item = self._verified_plan_item(task_id)
+                    if current_item["status"] == "retryable":
+                        self.store.start_plan_item(int(current_item["plan_item_id"]))
 
                 checkpoint_id = self.store.get_task(task_id)["checkpoint_id"]
                 projection = self.projector.project(task_id, messages, checkpoint_id)
@@ -417,10 +637,34 @@ class Runtime:
                 })
                 messages.append({"role": "assistant", "content": response.content})
                 self._fault("after_model_response", task_id=task_id, turn=turn)
-                self.store.save_checkpoint(task_id, "model_responded", messages, {"turn": turn})
+                execution_checkpoint_id = self.store.save_checkpoint(
+                    task_id, "model_responded", messages, {"turn": turn}
+                )
 
                 if not response.tool_calls:
                     text = response.text
+                    if self.verified_subtask is not None:
+                        if self._has_completion_marker(text):
+                            marker_result = self._handle_verified_marker(
+                                task_id,
+                                messages,
+                                turn,
+                                execution_checkpoint_id,
+                                self._completion_summary(text),
+                            )
+                            if marker_result is not None:
+                                return marker_result
+                            turn += 1
+                            continue
+                        self._append_verified_feedback(
+                            task_id,
+                            messages,
+                            turn,
+                            "The subtask is not complete. Emit SUBTASK_COMPLETE on its own line "
+                            "after satisfying the completion criteria.",
+                        )
+                        turn += 1
+                        continue
                     self.store.complete_task(task_id, messages, {"turn": turn}, text, fault_injector=self._fault)
                     return RunResult(task_id, "completed", text)
                 self._append_tool_results(task_id, turn, messages, response.tool_calls)

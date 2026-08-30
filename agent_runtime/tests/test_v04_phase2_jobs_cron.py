@@ -11,6 +11,7 @@ from agent_runtime.migrations import (
     V7_CHECKSUM,
     V8_CHECKSUM,
     V9_CHECKSUM,
+    V10_CHECKSUM,
     _apply_v6_durable_context,
     _execute_all,
     _BASE_SCHEMA,
@@ -125,7 +126,7 @@ def test_job_events_and_records_are_redacted_in_trace(tmp_path: Path):
     assert summary["background_job_count"] == 1
 
 
-def test_v6_database_migrates_through_v7_to_v9(tmp_path: Path):
+def test_v6_database_migrates_through_v7_to_v10(tmp_path: Path):
     db = tmp_path / "runtime.db"
     conn = sqlite3.connect(db)
     conn.execute("PRAGMA foreign_keys=ON")
@@ -141,11 +142,12 @@ def test_v6_database_migrates_through_v7_to_v9(tmp_path: Path):
     assert SchemaManager(db).inspect().current_version == 6
     report = SchemaManager(db).migrate()
     assert report.from_version == 6
-    assert report.to_version == 9
+    assert report.to_version == 10
     assert report.applied == (
         "v7_background_jobs",
         "v8_tool_registry_mcp",
         "v9_subagents_mailbox",
+        "v10_verified_subtask",
     )
 
     store = EventStore(db)
@@ -158,13 +160,17 @@ def test_v6_database_migrates_through_v7_to_v9(tmp_path: Path):
     assert store._fetchone(
         "SELECT checksum FROM schema_migrations WHERE version = 9"
     )["checksum"] == V9_CHECKSUM
+    assert store._fetchone(
+        "SELECT checksum FROM schema_migrations WHERE version = 10"
+    )["checksum"] == V10_CHECKSUM
     tables = {
         str(row[0])
         for row in store._fetchall(
             "SELECT name FROM sqlite_master WHERE type = 'table' "
             "AND name IN ('agent_jobs', 'job_runs', 'cron_schedules', "
             "'tool_registrations', 'mcp_connections', "
-            "'subagent_runs', 'mailboxes', 'mailbox_messages', 'plan_approvals')"
+            "'subagent_runs', 'mailboxes', 'mailbox_messages', 'plan_approvals', "
+            "'verifier_runs', 'semantic_checkpoints')"
         )
     }
     assert tables == {
@@ -177,6 +183,8 @@ def test_v6_database_migrates_through_v7_to_v9(tmp_path: Path):
         "mailboxes",
         "mailbox_messages",
         "plan_approvals",
+        "verifier_runs",
+        "semantic_checkpoints",
     }
     assert store.integrity_check() == []
 
