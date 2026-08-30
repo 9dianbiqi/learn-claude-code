@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import time
 import json
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -216,6 +217,18 @@ def test_bundle_hash_covers_callable_instance_state():
     first = _config(StatefulVerifier("same"))
     second = _config(StatefulVerifier("same"))
     changed = _config(StatefulVerifier("changed"))
+
+    assert first.verifier_bundle_hash == second.verifier_bundle_hash
+    assert first.verifier_bundle_hash != changed.verifier_bundle_hash
+
+
+def test_bundle_hash_covers_partial_verifier_arguments():
+    def verify_with_label(label: str, _: VerifierContext) -> VerifierResult:
+        return VerifierResult("pass", label, [])
+
+    first = _config(partial(verify_with_label, "same"))
+    second = _config(partial(verify_with_label, "same"))
+    changed = _config(partial(verify_with_label, "changed"))
 
     assert first.verifier_bundle_hash == second.verifier_bundle_hash
     assert first.verifier_bundle_hash != changed.verifier_bundle_hash

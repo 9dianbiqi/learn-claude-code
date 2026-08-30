@@ -5,6 +5,7 @@ import inspect
 import json
 import re
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import PurePosixPath
 from types import CodeType
 from typing import Any, Callable
@@ -108,6 +109,10 @@ def _stable_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _hash_payload(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(_stable_json(payload).encode("utf-8")).hexdigest()
+
+
 def _stable_value(value: Any, seen: set[int] | None = None) -> Any:
     if seen is None:
         seen = set()
@@ -166,6 +171,13 @@ def _stable_code(code: CodeType, seen: set[int] | None = None) -> dict[str, Any]
 
 
 def _verifier_implementation_hash(verifier: Callable[..., Any]) -> str:
+    if isinstance(verifier, partial):
+        return _hash_payload({
+            "kind": "partial",
+            "function": _verifier_implementation_hash(verifier.func),
+            "args": _stable_value(verifier.args),
+            "keywords": _stable_value(verifier.keywords),
+        })
     target = verifier if getattr(verifier, "__code__", None) is not None else getattr(verifier, "__call__", verifier)
     code = getattr(target, "__code__", None)
     payload: dict[str, Any] = {
@@ -191,8 +203,7 @@ def _verifier_implementation_hash(verifier: Callable[..., Any]) -> str:
             payload["source"] = None
         payload["callable_type"] = f"{type(verifier).__module__}.{type(verifier).__qualname__}"
         payload["state"] = _stable_value(getattr(verifier, "__dict__", None))
-    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return _hash_payload(payload)
 
 
 @dataclass(frozen=True)
@@ -271,5 +282,4 @@ class VerifiedSubtaskConfig:
             "evidence_paths": list(self.evidence_paths),
             "verifier_implementation_hash": self.verifier_implementation_hash,
         }
-        canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return _hash_payload(payload)
