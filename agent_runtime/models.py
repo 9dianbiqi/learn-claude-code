@@ -134,8 +134,11 @@ def _stable_object_state(value: Any, seen: set[int]) -> dict[str, Any] | None:
         for slot in slots:
             if slot in {"__dict__", "__weakref__"} or slot in slot_values:
                 continue
+            attribute = slot
+            if slot.startswith("__") and not slot.endswith("__"):
+                attribute = f"_{owner.__name__.lstrip('_')}{slot}"
             try:
-                slot_values[slot] = _stable_value(getattr(value, slot), seen)
+                slot_values[slot] = _stable_value(getattr(value, attribute), seen)
             except AttributeError:
                 continue
     if slot_values:

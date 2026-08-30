@@ -280,6 +280,24 @@ def test_bundle_hash_covers_slots_state():
     assert first.verifier_bundle_hash != changed.verifier_bundle_hash
 
 
+def test_bundle_hash_covers_name_mangled_slots_state():
+    class PrivateSlottedVerifier:
+        __slots__ = ("__expected",)
+
+        def __init__(self, expected: str):
+            self.__expected = expected
+
+        def __call__(self, _: VerifierContext) -> VerifierResult:
+            return VerifierResult("pass", self.__expected, [])
+
+    first = _config(PrivateSlottedVerifier("same"))
+    second = _config(PrivateSlottedVerifier("same"))
+    changed = _config(PrivateSlottedVerifier("changed"))
+
+    assert first.verifier_bundle_hash == second.verifier_bundle_hash
+    assert first.verifier_bundle_hash != changed.verifier_bundle_hash
+
+
 def test_bundle_hash_covers_global_verifier_bindings():
     def verify(_: VerifierContext) -> VerifierResult:
         return VerifierResult("pass", GLOBAL_VERIFIER_LABEL, [])
