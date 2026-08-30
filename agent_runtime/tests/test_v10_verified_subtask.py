@@ -205,6 +205,22 @@ def test_bundle_hash_is_stable_for_equivalent_callable_state():
     assert first.verifier_bundle_hash != changed.verifier_bundle_hash
 
 
+def test_bundle_hash_covers_callable_instance_state():
+    class StatefulVerifier:
+        def __init__(self, expected: str):
+            self.expected = expected
+
+        def __call__(self, _: VerifierContext) -> VerifierResult:
+            return VerifierResult("pass", self.expected, [])
+
+    first = _config(StatefulVerifier("same"))
+    second = _config(StatefulVerifier("same"))
+    changed = _config(StatefulVerifier("changed"))
+
+    assert first.verifier_bundle_hash == second.verifier_bundle_hash
+    assert first.verifier_bundle_hash != changed.verifier_bundle_hash
+
+
 def test_v9_migrates_to_v10_with_verified_subtask_schema(tmp_path: Path):
     database = _v9_database(tmp_path)
 
@@ -602,6 +618,30 @@ def test_recovered_marker_with_tool_calls_fails_closed_without_executing_tools(t
     assert not (tmp_path / "should-not-exist.txt").exists()
     assert recovered.store.list_tool_calls(task_id) == []
     assert recovered.store.list_verifier_runs(task_id) == []
+
+
+def test_duplicate_completion_markers_fail_closed_without_verification(tmp_path: Path):
+    seen: list[VerifierContext] = []
+
+    def verify(context: VerifierContext) -> VerifierResult:
+        seen.append(context)
+        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": ARTIFACT_SHA256}])
+
+    runtime = Runtime(
+        tmp_path,
+        ScriptedModel([
+            ModelResponse(text="first\nSUBTASK_COMPLETE\nsecond\nSUBTASK_COMPLETE"),
+        ]),
+        verified_subtask=_config(verify),
+    )
+
+    result = runtime.run("Create the artifact")
+
+    assert result.status == "failed"
+    assert result.error == "completion marker must appear exactly once"
+    assert seen == []
+    assert runtime.store.list_verifier_runs(result.task_id) == []
+    assert runtime.store.list_semantic_checkpoints(result.task_id) == []
 
 
 def test_completion_summary_removes_only_the_marker_line():

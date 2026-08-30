@@ -181,6 +181,9 @@ def _verifier_implementation_hash(verifier: Callable[..., Any]) -> str:
             [_stable_value(cell.cell_contents) for cell in closure]
             if closure is not None else None
         )
+        bound_self = getattr(target, "__self__", None)
+        if bound_self is not None:
+            payload["bound_self"] = _stable_value(bound_self)
     else:
         try:
             payload["source"] = inspect.getsource(target)

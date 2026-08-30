@@ -139,11 +139,15 @@ class Runtime:
             self.fault_injector(point, **context)
 
     @staticmethod
-    def _has_completion_marker(text: str) -> bool:
-        return any(
+    def _completion_marker_count(text: str) -> int:
+        return sum(
             Runtime._is_completion_marker_line(line)
             for line in str(text).splitlines(keepends=True)
         )
+
+    @staticmethod
+    def _has_completion_marker(text: str) -> bool:
+        return Runtime._completion_marker_count(text) > 0
 
     @staticmethod
     def _is_completion_marker_line(line: str) -> bool:
@@ -172,6 +176,16 @@ class Runtime:
         turn: int,
     ) -> RunResult:
         error = "completion marker cannot be combined with tool calls"
+        self.store.fail_task(task_id, messages, {"turn": turn}, error)
+        return RunResult(task_id, "failed", error=error)
+
+    def _fail_duplicate_markers(
+        self,
+        task_id: str,
+        messages: list[dict],
+        turn: int,
+    ) -> RunResult:
+        error = "completion marker must appear exactly once"
         self.store.fail_task(task_id, messages, {"turn": turn}, error)
         return RunResult(task_id, "failed", error=error)
 
@@ -573,6 +587,13 @@ class Runtime:
                     )
                     return RunResult(task_id, "completed", recovered_completion_text)
 
+                marker_count = (
+                    self._completion_marker_count(self._last_text(messages))
+                    if self.verified_subtask is not None else 0
+                )
+                if marker_count > 1:
+                    return self._fail_duplicate_markers(task_id, messages, turn)
+
                 if verified_marker_checkpoint_id is not None:
                     marker_text = self._last_text(messages)
                     marker_result = self._handle_verified_marker(
@@ -588,11 +609,7 @@ class Runtime:
                     turn += 1
                     continue
 
-                if (
-                    self.verified_subtask is not None
-                    and pending_calls
-                    and self._has_completion_marker(self._last_text(messages))
-                ):
+                if self.verified_subtask is not None and pending_calls and marker_count:
                     return self._fail_marker_with_tool_calls(task_id, messages, turn)
 
                 if pending_calls is not None:
@@ -654,12 +671,12 @@ class Runtime:
                     task_id, "model_responded", messages, {"turn": turn}
                 )
 
-                if (
-                    self.verified_subtask is not None
-                    and response.tool_calls
-                    and self._has_completion_marker(response.text)
-                ):
-                    return self._fail_marker_with_tool_calls(task_id, messages, turn)
+                if self.verified_subtask is not None:
+                    marker_count = self._completion_marker_count(response.text)
+                    if marker_count > 1:
+                        return self._fail_duplicate_markers(task_id, messages, turn)
+                    if response.tool_calls and marker_count:
+                        return self._fail_marker_with_tool_calls(task_id, messages, turn)
 
                 if not response.tool_calls:
                     text = response.text
