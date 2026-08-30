@@ -23,17 +23,34 @@ from agent_runtime.migrations import (
     _apply_v8_tool_registry,
     _apply_v9_subagents_mailbox,
 )
-from agent_runtime.models import ModelResponse, VerifierContext, VerifierResult, VerifiedSubtaskConfig
+from agent_runtime.models import (
+    ModelResponse,
+    ToolCall,
+    VerifierContext,
+    VerifierResult,
+    VerifiedSubtaskConfig,
+)
 from agent_runtime.runtime import InjectedCrash
 from agent_runtime.store import EventStore, InvariantViolation
 from agent_runtime.trace import TraceReporter
 
 
-def _config(verifier, evidence_paths: list[str] | tuple[str, ...] = ("artifact.txt",)) -> VerifiedSubtaskConfig:
+ARTIFACT_SHA256 = "a" * 64
+EVIDENCE_A_SHA256 = "a" * 64
+EVIDENCE_Z_SHA256 = "b" * 64
+
+
+def _config(
+    verifier,
+    evidence_paths: list[str] | tuple[str, ...] = ("artifact.txt",),
+    *,
+    description: str = "Create the artifact",
+    completion_criteria: str = "The artifact exists with the expected content.",
+) -> VerifiedSubtaskConfig:
     return VerifiedSubtaskConfig(
         subtask_id="s1",
-        description="Create the artifact",
-        completion_criteria="The artifact exists with the expected content.",
+        description=description,
+        completion_criteria=completion_criteria,
         evidence_paths=evidence_paths,
         verifier_id="artifact-verifier",
         verifier_version="1.0",
@@ -78,7 +95,7 @@ def test_public_run_commits_a_verified_subtask_bundle(tmp_path: Path):
         return VerifierResult(
             status="pass",
             summary="artifact checks passed",
-            evidence_manifest=[{"path": "artifact.txt", "sha256": "abc123"}],
+            evidence_manifest=[{"path": "artifact.txt", "sha256": ARTIFACT_SHA256}],
         )
 
     runtime = Runtime(
@@ -90,12 +107,12 @@ def test_public_run_commits_a_verified_subtask_bundle(tmp_path: Path):
     result = runtime.run("Create the artifact")
 
     assert result.status == "completed"
-    assert result.final_text == "summary"
+    assert result.final_text == "summary\n"
     assert len(seen) == 1
     assert seen[0].repo_root == str(tmp_path.resolve())
     assert seen[0].task_id == result.task_id
     assert seen[0].subtask_id == "s1"
-    assert seen[0].completion_summary == "summary"
+    assert seen[0].completion_summary == "summary\n"
 
     item = runtime.store.get_plan_item(result.task_id, "s1")
     assert item is not None
@@ -105,7 +122,7 @@ def test_public_run_commits_a_verified_subtask_bundle(tmp_path: Path):
     assert len(runs) == 1
     assert runs[0]["status"] == "pass"
     assert runs[0]["authoritative"] is True
-    assert runs[0]["evidence_manifest"] == [{"path": "artifact.txt", "sha256": "abc123"}]
+    assert runs[0]["evidence_manifest"] == [{"path": "artifact.txt", "sha256": ARTIFACT_SHA256}]
 
     checkpoints = runtime.store.list_semantic_checkpoints(result.task_id)
     assert len(checkpoints) == 1
@@ -134,8 +151,8 @@ def test_bundle_hash_and_evidence_manifest_are_deterministic(tmp_path: Path):
                 "pass",
                 "ok",
                 [
-                    {"path": "z.txt", "sha256": "z"},
-                    {"path": "a.txt", "sha256": "a"},
+                    {"path": "z.txt", "sha256": EVIDENCE_Z_SHA256},
+                    {"path": "a.txt", "sha256": EVIDENCE_A_SHA256},
                 ],
             ),
         ),
@@ -145,9 +162,27 @@ def test_bundle_hash_and_evidence_manifest_are_deterministic(tmp_path: Path):
 
     assert result.status == "completed"
     assert runtime.store.list_verifier_runs(result.task_id)[0]["evidence_manifest"] == [
-        {"path": "a.txt", "sha256": "a"},
-        {"path": "z.txt", "sha256": "z"},
+        {"path": "a.txt", "sha256": EVIDENCE_A_SHA256},
+        {"path": "z.txt", "sha256": EVIDENCE_Z_SHA256},
     ]
+
+
+def test_bundle_hash_covers_the_full_frozen_config_and_verifier_implementation():
+    def verify_v1(_: VerifierContext) -> VerifierResult:
+        return VerifierResult("pass", "ok", [])
+
+    def verify_v2(_: VerifierContext) -> VerifierResult:
+        return VerifierResult("pass", "changed", [])
+
+    baseline = _config(verify_v1)
+    changed_description = _config(verify_v1, description="A different artifact")
+    changed_criteria = _config(verify_v1, completion_criteria="A different criterion")
+    changed_verifier = _config(verify_v2)
+
+    assert baseline.verifier_bundle_hash != changed_description.verifier_bundle_hash
+    assert baseline.verifier_bundle_hash != changed_criteria.verifier_bundle_hash
+    assert baseline.verifier_bundle_hash != changed_verifier.verifier_bundle_hash
+    assert len(baseline.verifier_implementation_hash or "") == 64
 
 
 def test_v9_migrates_to_v10_with_verified_subtask_schema(tmp_path: Path):
@@ -220,7 +255,7 @@ def test_f2_pre_recovery_reverifies_without_leaving_a_partial_bundle(tmp_path: P
 
     def verify(_: VerifierContext) -> VerifierResult:
         verifier_calls.append(1)
-        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": "abc123"}])
+        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": ARTIFACT_SHA256}])
 
     config = _config(verify)
 
@@ -256,7 +291,7 @@ def test_f2_mid_recovery_rolls_back_all_authoritative_writes(tmp_path: Path):
 
     def verify(_: VerifierContext) -> VerifierResult:
         verifier_calls.append(1)
-        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": "abc123"}])
+        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": ARTIFACT_SHA256}])
 
     config = _config(verify)
 
@@ -297,7 +332,7 @@ def test_f3_recovery_exposes_one_bundle_and_deduplicates_resume(tmp_path: Path):
 
     def verify(_: VerifierContext) -> VerifierResult:
         verifier_calls.append(1)
-        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": "abc123"}])
+        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": ARTIFACT_SHA256}])
 
     config = _config(verify)
 
@@ -325,7 +360,7 @@ def test_f3_recovery_exposes_one_bundle_and_deduplicates_resume(tmp_path: Path):
     repeated = recovered.resume(task_id)
 
     assert result.status == "completed"
-    assert repeated.final_text == "done"
+    assert repeated.final_text == "done\n"
     assert verifier_calls == [1]
     assert len(recovered.store.list_verifier_runs(task_id)) == 1
     assert len(recovered.store.list_semantic_checkpoints(task_id)) == 1
@@ -334,7 +369,7 @@ def test_f3_recovery_exposes_one_bundle_and_deduplicates_resume(tmp_path: Path):
 def test_trace_exposes_verifier_runs_and_semantic_checkpoints(tmp_path: Path):
     config = _config(
         lambda _: VerifierResult(
-            "pass", "ok", [{"path": "artifact.txt", "sha256": "abc123"}]
+            "pass", "ok", [{"path": "artifact.txt", "sha256": ARTIFACT_SHA256}]
         )
     )
     runtime = Runtime(
@@ -366,7 +401,7 @@ def test_trace_exposes_verifier_runs_and_semantic_checkpoints(tmp_path: Path):
 def test_verified_resume_fails_closed_when_bundle_is_inconsistent(tmp_path: Path):
     config = _config(
         lambda _: VerifierResult(
-            "pass", "ok", [{"path": "artifact.txt", "sha256": "abc123"}]
+            "pass", "ok", [{"path": "artifact.txt", "sha256": ARTIFACT_SHA256}]
         )
     )
     runtime = Runtime(
@@ -390,7 +425,7 @@ def test_completion_marker_requires_an_exclusive_line(tmp_path: Path):
 
     def verify(context: VerifierContext) -> VerifierResult:
         seen.append(context.completion_summary)
-        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": "abc123"}])
+        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": ARTIFACT_SHA256}])
 
     runtime = Runtime(
         tmp_path,
@@ -404,8 +439,175 @@ def test_completion_marker_requires_an_exclusive_line(tmp_path: Path):
     result = runtime.run("Create the artifact")
 
     assert result.status == "completed"
-    assert result.final_text == "summary"
-    assert seen == ["summary"]
+    assert result.final_text == "summary\n"
+    assert seen == ["summary\n"]
+
+
+def test_marker_with_tool_calls_fails_closed_without_executing_tools(tmp_path: Path):
+    model = ScriptedModel([
+        ModelResponse(
+            text="done\nSUBTASK_COMPLETE",
+            tool_calls=[ToolCall("write-1", "write_file", {
+                "path": "should-not-exist.txt",
+                "content": "must not be written",
+            })],
+        ),
+    ])
+    runtime = Runtime(
+        tmp_path,
+        model,
+        verified_subtask=_config(
+            lambda _: VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": ARTIFACT_SHA256}])
+        ),
+    )
+
+    result = runtime.run("Create the artifact")
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert "completion marker" in result.error
+    assert model.call_count == 1
+    assert not (tmp_path / "should-not-exist.txt").exists()
+    assert runtime.store.list_tool_calls(result.task_id) == []
+    assert runtime.store.list_verifier_runs(result.task_id) == []
+    assert runtime.store.list_semantic_checkpoints(result.task_id) == []
+
+
+def test_recovered_marker_with_tool_calls_fails_closed_without_executing_tools(tmp_path: Path):
+    def crash(point: str, **_: object) -> None:
+        if point == "after_model_response_before_persist":
+            raise InjectedCrash(point)
+
+    model = ScriptedModel([
+        ModelResponse(
+            text="done\nSUBTASK_COMPLETE",
+            tool_calls=[ToolCall("write-1", "write_file", {
+                "path": "should-not-exist.txt",
+                "content": "must not be written",
+            })],
+        ),
+    ])
+    config = _config(
+        lambda _: VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": ARTIFACT_SHA256}])
+    )
+    first = Runtime(tmp_path, model, verified_subtask=config, fault_injector=crash)
+
+    with pytest.raises(InjectedCrash, match="after_model_response_before_persist"):
+        first.run("Create the artifact")
+
+    task_id = first.store.list_tasks()[0]["task_id"]
+    recovered = Runtime(tmp_path, ScriptedModel([]), verified_subtask=config)
+    result = recovered.resume(task_id)
+
+    assert result.status == "failed"
+    assert not (tmp_path / "should-not-exist.txt").exists()
+    assert recovered.store.list_tool_calls(task_id) == []
+    assert recovered.store.list_verifier_runs(task_id) == []
+
+
+def test_completion_summary_removes_only_the_marker_line():
+    text = "  leading  \nSUBTASK_COMPLETE\ntrailing  \n"
+
+    assert Runtime._completion_summary(text) == "  leading  \ntrailing  \n"
+
+
+@pytest.mark.parametrize("failure", ["raises", "malformed_result"])
+def test_verifier_failures_are_audited_as_uncertain_and_retryable(
+    tmp_path: Path,
+    failure: str,
+):
+    attempts = 0
+
+    def verify(_: VerifierContext):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1 and failure == "raises":
+            raise RuntimeError("verifier backend unavailable")
+        if attempts == 1:
+            return {"status": "pass"}
+        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": ARTIFACT_SHA256}])
+
+    model = ScriptedModel([
+        ModelResponse(text="first attempt\nSUBTASK_COMPLETE"),
+        ModelResponse(text="retry attempt\nSUBTASK_COMPLETE"),
+    ])
+    runtime = Runtime(tmp_path, model, verified_subtask=_config(verify))
+
+    result = runtime.run("Create the artifact")
+
+    assert result.status == "completed"
+    runs = runtime.store.list_verifier_runs(result.task_id)
+    assert runs[0]["status"] == "uncertain"
+    assert runs[0]["authoritative"] is False
+    assert "Verifier invocation failed" in runs[0]["summary"]
+    assert runs[1]["status"] == "pass"
+    assert runs[1]["authoritative"] is True
+
+
+@pytest.mark.parametrize("digest", ["abc123", "A" * 64, "g" * 64])
+def test_evidence_manifest_requires_lowercase_sha256(digest: str):
+    with pytest.raises(ValueError, match="lowercase 64-hex SHA-256"):
+        VerifierResult(
+            "fail",
+            "evidence is unavailable",
+            [{"path": r".\evidence.txt", "sha256": digest}],
+        )
+
+
+def test_evidence_manifest_uses_normalized_repository_relative_paths():
+    result = VerifierResult(
+        "uncertain",
+        "partial evidence",
+        [{"path": r".\evidence.txt", "sha256": ARTIFACT_SHA256}],
+    )
+
+    assert result.evidence_manifest == [{
+        "path": "evidence.txt",
+        "sha256": ARTIFACT_SHA256,
+    }]
+
+
+def test_pass_requires_complete_configured_evidence_coverage(tmp_path: Path):
+    outcomes = iter([
+        VerifierResult(
+            "pass",
+            "reported pass",
+            [{"path": "artifact.txt", "sha256": ARTIFACT_SHA256}],
+        ),
+        VerifierResult(
+            "pass",
+            "all evidence present",
+            [
+                {"path": "metadata.json", "sha256": EVIDENCE_Z_SHA256},
+                {"path": "artifact.txt", "sha256": ARTIFACT_SHA256},
+            ],
+        ),
+    ])
+
+    def verify(_: VerifierContext) -> VerifierResult:
+        return next(outcomes)
+
+    runtime = Runtime(
+        tmp_path,
+        ScriptedModel([
+            ModelResponse(text="first attempt\nSUBTASK_COMPLETE"),
+            ModelResponse(text="retry attempt\nSUBTASK_COMPLETE"),
+        ]),
+        verified_subtask=_config(
+            verify,
+            ("artifact.txt", "metadata.json"),
+        ),
+    )
+
+    result = runtime.run("Create the artifact and metadata")
+
+    assert result.status == "completed"
+    runs = runtime.store.list_verifier_runs(result.task_id)
+    assert [(run["status"], run["authoritative"]) for run in runs] == [
+        ("uncertain", False),
+        ("pass", True),
+    ]
+    assert "metadata.json" in runs[0]["summary"]
 
 
 def test_default_exec_full_behavior_remains_unchanged(tmp_path: Path):
@@ -422,7 +624,7 @@ def test_default_exec_full_behavior_remains_unchanged(tmp_path: Path):
 def test_failed_verification_is_retryable_and_non_authoritative(tmp_path: Path):
     outcomes = iter([
         VerifierResult("fail", "artifact is missing", []),
-        VerifierResult("pass", "artifact checks passed", [{"path": "artifact.txt", "sha256": "abc123"}]),
+        VerifierResult("pass", "artifact checks passed", [{"path": "artifact.txt", "sha256": ARTIFACT_SHA256}]),
     ])
     model = ScriptedModel([
         ModelResponse(text="first attempt\nSUBTASK_COMPLETE"),
@@ -461,7 +663,7 @@ def test_verified_resume_is_idempotent_and_rejects_a_mismatched_bundle(tmp_path:
 
     def verify(_: VerifierContext) -> VerifierResult:
         verifier_calls.append(1)
-        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": "abc123"}])
+        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": ARTIFACT_SHA256}])
 
     config = _config(verify)
     first = Runtime(
@@ -476,7 +678,7 @@ def test_verified_resume_is_idempotent_and_rejects_a_mismatched_bundle(tmp_path:
     resumed = recovered.resume(completed.task_id)
 
     assert resumed.status == "completed"
-    assert resumed.final_text == "done"
+    assert resumed.final_text == "done\n"
     assert recovered_model.call_count == 0
     assert len(verifier_calls) == 1
     assert len(recovered.store.list_verifier_runs(completed.task_id)) == 1
@@ -499,7 +701,7 @@ def test_verified_resume_is_idempotent_and_rejects_a_mismatched_bundle(tmp_path:
 def test_uncertain_verification_is_distinct_non_authoritative_retry(tmp_path: Path):
     outcomes = iter([
         VerifierResult("uncertain", "the check could not run", []),
-        VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": "abc123"}]),
+        VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": ARTIFACT_SHA256}]),
     ])
 
     def verify(_: VerifierContext) -> VerifierResult:

@@ -23,6 +23,7 @@ from .models import (
     VerifierContext,
     VerifierResult,
     VerifiedSubtaskConfig,
+    normalize_evidence_manifest,
 )
 from .permissions import PermissionDecision, PermissionEngine
 from .store import EffectBlocked, EventStore, InvariantViolation, LeaseLost, StaleState
@@ -139,35 +140,22 @@ class Runtime:
 
     @staticmethod
     def _has_completion_marker(text: str) -> bool:
-        return any(line == "SUBTASK_COMPLETE" for line in str(text).splitlines())
+        return any(
+            Runtime._is_completion_marker_line(line)
+            for line in str(text).splitlines(keepends=True)
+        )
+
+    @staticmethod
+    def _is_completion_marker_line(line: str) -> bool:
+        return line == "SUBTASK_COMPLETE" or line.splitlines() == ["SUBTASK_COMPLETE"]
 
     @staticmethod
     def _completion_summary(text: str) -> str:
-        return "\n".join(
-            line for line in str(text).splitlines() if line != "SUBTASK_COMPLETE"
-        ).strip()
-
-    @staticmethod
-    def _normalize_evidence_manifest(
-        manifest: list[dict[str, str]],
-    ) -> list[dict[str, str]]:
-        normalized: list[dict[str, str]] = []
-        seen: set[str] = set()
-        for entry in manifest:
-            if not isinstance(entry, dict) or "path" not in entry or "sha256" not in entry:
-                raise ValueError("evidence manifest entries require path and sha256")
-            path = str(entry["path"]).replace("\\", "/")
-            parts = [part for part in path.split("/") if part not in {"", "."}]
-            if not parts or path.startswith("/") or ".." in parts:
-                raise ValueError(f"evidence path must be repository-relative: {path!r}")
-            normalized_path = "/".join(parts)
-            if len(normalized_path) >= 2 and normalized_path[1] == ":" and normalized_path[0].isalpha():
-                raise ValueError(f"evidence path must be repository-relative: {path!r}")
-            if normalized_path in seen:
-                raise ValueError(f"duplicate evidence path: {normalized_path}")
-            seen.add(normalized_path)
-            normalized.append({"path": normalized_path, "sha256": str(entry["sha256"])})
-        return sorted(normalized, key=lambda entry: entry["path"])
+        return "".join(
+            line
+            for line in str(text).splitlines(keepends=True)
+            if not Runtime._is_completion_marker_line(line)
+        )
 
     @staticmethod
     def _verifier_feedback(status: str, summary: str) -> str:
@@ -176,6 +164,16 @@ class Runtime:
             "The subtask is not complete. Address the verifier feedback and emit "
             "SUBTASK_COMPLETE on its own line when the completion criteria are satisfied."
         )
+
+    def _fail_marker_with_tool_calls(
+        self,
+        task_id: str,
+        messages: list[dict],
+        turn: int,
+    ) -> RunResult:
+        error = "completion marker cannot be combined with tool calls"
+        self.store.fail_task(task_id, messages, {"turn": turn}, error)
+        return RunResult(task_id, "failed", error=error)
 
     def _append_verified_feedback(
         self,
@@ -229,10 +227,18 @@ class Runtime:
             completion_summary=completion_summary,
             execution_checkpoint_id=execution_checkpoint_id,
         )
-        verifier_result = config.verifier(context)
-        if not isinstance(verifier_result, VerifierResult):
-            raise TypeError("verifier must return VerifierResult")
-        manifest = self._normalize_evidence_manifest(verifier_result.evidence_manifest)
+        try:
+            verifier_result = config.verifier(context)
+            if not isinstance(verifier_result, VerifierResult):
+                raise TypeError("verifier must return VerifierResult")
+            manifest = normalize_evidence_manifest(verifier_result.evidence_manifest)
+        except Exception as exc:
+            verifier_result = VerifierResult(
+                status="uncertain",
+                summary=f"Verifier invocation failed: {type(exc).__name__}: {exc}",
+                evidence_manifest=[],
+            )
+            manifest = []
         covered_paths = {entry["path"] for entry in manifest}
         missing_paths = sorted(set(config.evidence_paths) - covered_paths)
         if verifier_result.status == "pass" and missing_paths:
@@ -582,6 +588,13 @@ class Runtime:
                     turn += 1
                     continue
 
+                if (
+                    self.verified_subtask is not None
+                    and pending_calls
+                    and self._has_completion_marker(self._last_text(messages))
+                ):
+                    return self._fail_marker_with_tool_calls(task_id, messages, turn)
+
                 if pending_calls is not None:
                     self._append_tool_results(task_id, turn, messages, pending_calls)
                     pending_calls = None
@@ -640,6 +653,13 @@ class Runtime:
                 execution_checkpoint_id = self.store.save_checkpoint(
                     task_id, "model_responded", messages, {"turn": turn}
                 )
+
+                if (
+                    self.verified_subtask is not None
+                    and response.tool_calls
+                    and self._has_completion_marker(response.text)
+                ):
+                    return self._fail_marker_with_tool_calls(task_id, messages, turn)
 
                 if not response.tool_calls:
                     text = response.text
