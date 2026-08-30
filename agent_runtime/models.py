@@ -113,6 +113,38 @@ def _hash_payload(payload: dict[str, Any]) -> str:
     return hashlib.sha256(_stable_json(payload).encode("utf-8")).hexdigest()
 
 
+def _source_for(value: Any) -> str | None:
+    try:
+        return inspect.getsource(value)
+    except (OSError, TypeError):
+        return None
+
+
+def _stable_object_state(value: Any, seen: set[int]) -> dict[str, Any] | None:
+    state: dict[str, Any] = {}
+    object_dict = getattr(value, "__dict__", None)
+    if isinstance(object_dict, dict):
+        state["dict"] = _stable_value(object_dict, seen)
+
+    slot_values: dict[str, Any] = {}
+    for owner in getattr(type(value), "__mro__", (type(value),)):
+        slots = owner.__dict__.get("__slots__", ())
+        if isinstance(slots, str):
+            slots = (slots,)
+        for slot in slots:
+            if slot in {"__dict__", "__weakref__"} or slot in slot_values:
+                continue
+            try:
+                slot_values[slot] = _stable_value(getattr(value, slot), seen)
+            except AttributeError:
+                continue
+    if slot_values:
+        state["slots"] = {
+            slot: slot_values[slot] for slot in sorted(slot_values)
+        }
+    return state or None
+
+
 def _stable_value(value: Any, seen: set[int] | None = None) -> Any:
     if seen is None:
         seen = set()
@@ -125,31 +157,44 @@ def _stable_value(value: Any, seen: set[int] | None = None) -> Any:
         return {"cycle": f"{type(value).__module__}.{type(value).__qualname__}"}
     seen.add(identity)
     try:
+        if isinstance(value, partial):
+            return {"partial": _stable_callable_payload(value, seen)}
         if isinstance(value, CodeType):
             return {"code": _stable_code(value, seen)}
-        if isinstance(value, (list, tuple)):
-            return [_stable_value(item, seen) for item in value]
+        if isinstance(value, list):
+            return {"list": [_stable_value(item, seen) for item in value]}
+        if isinstance(value, tuple):
+            return {"tuple": [_stable_value(item, seen) for item in value]}
         if isinstance(value, dict):
             entries = [
                 [_stable_value(key, seen), _stable_value(item, seen)]
                 for key, item in value.items()
             ]
-            return {
-                "dict": sorted(entries, key=lambda entry: _stable_json(entry[0]))
-            }
+            return {"dict": sorted(entries, key=lambda entry: _stable_json(entry[0]))}
         if isinstance(value, set):
             values = [_stable_value(item, seen) for item in value]
             return {"set": sorted(values, key=_stable_json)}
+        if isinstance(value, type):
+            return {
+                "kind": "type",
+                "module": value.__module__,
+                "qualname": value.__qualname__,
+                "source": _source_for(value),
+            }
+        if inspect.isfunction(value) or inspect.ismethod(value):
+            return {"callable": _stable_callable_payload(value, seen)}
+
         qualified_type = f"{type(value).__module__}.{type(value).__qualname__}"
-        try:
-            source = inspect.getsource(type(value))
-        except (OSError, TypeError):
-            source = None
-        state = getattr(value, "__dict__", None)
+        callable_target = getattr(value, "__call__", None)
         return {
+            "kind": "object",
             "type": qualified_type,
-            "source": source,
-            "state": _stable_value(state, seen) if state is not None else None,
+            "source": _source_for(type(value)),
+            "callable": (
+                _stable_callable_payload(value, seen)
+                if callable_target is not None else None
+            ),
+            "state": _stable_object_state(value, seen),
         }
     finally:
         seen.remove(identity)
@@ -170,14 +215,34 @@ def _stable_code(code: CodeType, seen: set[int] | None = None) -> dict[str, Any]
     }
 
 
-def _verifier_implementation_hash(verifier: Callable[..., Any]) -> str:
+def _stable_global_bindings(
+    target: Any,
+    code: CodeType,
+    seen: set[int],
+) -> dict[str, Any]:
+    globals_dict = getattr(target, "__globals__", None)
+    if not isinstance(globals_dict, dict):
+        return {}
+    return {
+        name: _stable_value(globals_dict[name], seen)
+        for name in sorted(code.co_names)
+        if name != "__builtins__" and name in globals_dict
+    }
+
+
+def _stable_callable_payload(
+    verifier: Callable[..., Any],
+    seen: set[int] | None = None,
+) -> dict[str, Any]:
+    if seen is None:
+        seen = set()
     if isinstance(verifier, partial):
-        return _hash_payload({
+        return {
             "kind": "partial",
-            "function": _verifier_implementation_hash(verifier.func),
-            "args": _stable_value(verifier.args),
-            "keywords": _stable_value(verifier.keywords),
-        })
+            "function": _stable_callable_payload(verifier.func, seen),
+            "args": _stable_value(verifier.args, seen),
+            "keywords": _stable_value(verifier.keywords, seen),
+        }
     target = verifier if getattr(verifier, "__code__", None) is not None else getattr(verifier, "__call__", verifier)
     code = getattr(target, "__code__", None)
     payload: dict[str, Any] = {
@@ -185,25 +250,31 @@ def _verifier_implementation_hash(verifier: Callable[..., Any]) -> str:
         "qualname": getattr(target, "__qualname__", type(verifier).__qualname__),
     }
     if code is not None:
-        payload["code"] = _stable_code(code)
-        payload["defaults"] = _stable_value(getattr(target, "__defaults__", None))
-        payload["kwdefaults"] = _stable_value(getattr(target, "__kwdefaults__", None))
+        payload["code"] = _stable_code(code, seen)
+        payload["defaults"] = _stable_value(getattr(target, "__defaults__", None), seen)
+        payload["kwdefaults"] = _stable_value(getattr(target, "__kwdefaults__", None), seen)
         closure = getattr(target, "__closure__", None)
         payload["closure"] = (
-            [_stable_value(cell.cell_contents) for cell in closure]
+            [_stable_value(cell.cell_contents, seen) for cell in closure]
             if closure is not None else None
         )
+        payload["globals"] = _stable_global_bindings(target, code, seen)
         bound_self = getattr(target, "__self__", None)
         if bound_self is not None:
-            payload["bound_self"] = _stable_value(bound_self)
+            payload["bound_self"] = {
+                "type": f"{type(bound_self).__module__}.{type(bound_self).__qualname__}",
+                "source": _source_for(type(bound_self)),
+                "state": _stable_object_state(bound_self, seen),
+            }
     else:
-        try:
-            payload["source"] = inspect.getsource(target)
-        except (OSError, TypeError):
-            payload["source"] = None
+        payload["source"] = _source_for(target)
         payload["callable_type"] = f"{type(verifier).__module__}.{type(verifier).__qualname__}"
-        payload["state"] = _stable_value(getattr(verifier, "__dict__", None))
-    return _hash_payload(payload)
+        payload["state"] = _stable_object_state(verifier, seen)
+    return payload
+
+
+def _verifier_implementation_hash(verifier: Callable[..., Any]) -> str:
+    return _hash_payload(_stable_callable_payload(verifier))
 
 
 @dataclass(frozen=True)

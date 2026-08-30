@@ -40,6 +40,7 @@ from agent_runtime.trace import TraceReporter
 ARTIFACT_SHA256 = "a" * 64
 EVIDENCE_A_SHA256 = "a" * 64
 EVIDENCE_Z_SHA256 = "b" * 64
+GLOBAL_VERIFIER_LABEL = "same"
 
 
 def _config(
@@ -231,6 +232,48 @@ def test_bundle_hash_covers_partial_verifier_arguments():
     changed = _config(partial(verify_with_label, "changed"))
 
     assert first.verifier_bundle_hash == second.verifier_bundle_hash
+    assert first.verifier_bundle_hash != changed.verifier_bundle_hash
+
+
+def test_bundle_hash_distinguishes_partial_argument_types():
+    def verify_with_value(value, _: VerifierContext) -> VerifierResult:
+        return VerifierResult("pass", str(value), [])
+
+    list_config = _config(partial(verify_with_value, ["same"]))
+    tuple_config = _config(partial(verify_with_value, ("same",)))
+
+    assert list_config.verifier_bundle_hash != tuple_config.verifier_bundle_hash
+
+
+def test_bundle_hash_covers_slots_state():
+    class SlottedVerifier:
+        __slots__ = ("expected",)
+
+        def __init__(self, expected: str):
+            self.expected = expected
+
+        def __call__(self, _: VerifierContext) -> VerifierResult:
+            return VerifierResult("pass", self.expected, [])
+
+    first = _config(SlottedVerifier("same"))
+    second = _config(SlottedVerifier("same"))
+    changed = _config(SlottedVerifier("changed"))
+
+    assert first.verifier_bundle_hash == second.verifier_bundle_hash
+    assert first.verifier_bundle_hash != changed.verifier_bundle_hash
+
+
+def test_bundle_hash_covers_global_verifier_bindings():
+    def verify(_: VerifierContext) -> VerifierResult:
+        return VerifierResult("pass", GLOBAL_VERIFIER_LABEL, [])
+
+    global GLOBAL_VERIFIER_LABEL
+    GLOBAL_VERIFIER_LABEL = "same"
+    first = _config(verify)
+    GLOBAL_VERIFIER_LABEL = "changed"
+    changed = _config(verify)
+    GLOBAL_VERIFIER_LABEL = "same"
+
     assert first.verifier_bundle_hash != changed.verifier_bundle_hash
 
 
