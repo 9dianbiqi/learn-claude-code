@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.3.0.dev5 - Ticket #7 Verified-Subtask Checkpoints
+
+- Hardened frozen verified-subtask configuration validation with complete
+  configuration and verifier implementation hashes.
+- Added fail-closed completion-marker handling, strict SHA-256 evidence
+  manifests, and auditable uncertain verifier outcomes.
+- Added the v10 verified-subtask schema, append-only history-compatible
+  invariants, and verified-subtask checkpoint trace terminology.
+
 ## v0.3.0.dev4 - Phase 3 Durable Subagents, Plan Approval & Team Mailbox
 
 - Stabilized and froze the reproducible v0.3 Exec-Full baseline at package

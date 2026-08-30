@@ -774,6 +774,8 @@ def _business_tables(table_names: set[str]) -> set[str]:
         "mailboxes",
         "mailbox_messages",
         "plan_approvals",
+        "verifier_runs",
+        "semantic_checkpoints",
     }
 
 

@@ -17,6 +17,7 @@ from agent_runtime.migrations import (
     V8_CHECKSUM,
     V9_CHECKSUM,
     V10_CHECKSUM,
+    MigrationValidationError,
     _BASE_SCHEMA,
     _apply_v6_durable_context,
     _apply_v7_background_jobs,
@@ -314,7 +315,7 @@ def test_f2_mid_recovery_rolls_back_all_authoritative_writes(tmp_path: Path):
     assert first.store.list_verifier_runs(task_id) == []
     assert first.store.list_semantic_checkpoints(task_id) == []
     assert not any(
-        event["type"] in {"verified_subtask_committed", "semantic_checkpoint_created"}
+        event["type"] in {"verified_subtask_committed", "verified_subtask_checkpoint_created"}
         for event in first.store.list_events(task_id)
     )
 
@@ -366,7 +367,7 @@ def test_f3_recovery_exposes_one_bundle_and_deduplicates_resume(tmp_path: Path):
     assert len(recovered.store.list_semantic_checkpoints(task_id)) == 1
 
 
-def test_trace_exposes_verifier_runs_and_semantic_checkpoints(tmp_path: Path):
+def test_trace_exposes_verified_subtask_checkpoints(tmp_path: Path):
     config = _config(
         lambda _: VerifierResult(
             "pass", "ok", [{"path": "artifact.txt", "sha256": ARTIFACT_SHA256}]
@@ -382,7 +383,8 @@ def test_trace_exposes_verifier_runs_and_semantic_checkpoints(tmp_path: Path):
     summary = TraceReporter(runtime.store).summary(result.task_id)
     assert summary["verifier_run_count"] == 1
     assert summary["authoritative_verifier_run_count"] == 1
-    assert summary["semantic_checkpoint_count"] == 1
+    assert summary["verified_subtask_checkpoint_count"] == 1
+    assert "semantic_checkpoint_count" not in summary
     assert summary["verified_subtask_bundle_count"] == 1
 
     output = tmp_path / "trace.jsonl"
@@ -394,8 +396,80 @@ def test_trace_exposes_verifier_runs_and_semantic_checkpoints(tmp_path: Path):
     ]
     assert {record["record_type"] for record in records} >= {
         "verifier_run",
-        "semantic_checkpoint",
+        "verified_subtask_checkpoint",
     }
+    assert "semantic_checkpoint" not in {record["record_type"] for record in records}
+
+
+def test_v10_business_tables_without_migration_history_fail_closed(tmp_path: Path):
+    database = tmp_path / "runtime.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE verifier_runs(verifier_run_id TEXT PRIMARY KEY)"
+        )
+
+    with pytest.raises(MigrationValidationError):
+        SchemaManager(database).inspect()
+
+
+def test_resume_allows_append_only_verified_history(tmp_path: Path):
+    verifier_calls: list[int] = []
+
+    def verify(_: VerifierContext) -> VerifierResult:
+        verifier_calls.append(1)
+        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": ARTIFACT_SHA256}])
+
+    config = _config(verify)
+    first = Runtime(
+        tmp_path,
+        ScriptedModel([ModelResponse(text="done\nSUBTASK_COMPLETE")]),
+        verified_subtask=config,
+    )
+    completed = first.run("Create the artifact")
+    run_id = first.store.list_verifier_runs(completed.task_id)[0]["verifier_run_id"]
+    checkpoint_id = first.store.list_semantic_checkpoints(completed.task_id)[0]["semantic_checkpoint_id"]
+
+    with sqlite3.connect(first.store.path) as connection:
+        connection.execute(
+            """
+            INSERT INTO verifier_runs(
+                verifier_run_id, task_id, plan_item_id, subtask_id, status, summary,
+                completion_summary, verifier_id, verifier_version, verification_rule,
+                verifier_bundle_hash, evidence_manifest_json, evidence_hash,
+                authoritative, execution_checkpoint_id, created_at
+            )
+            SELECT ?, task_id, plan_item_id, subtask_id, status, summary,
+                   completion_summary, verifier_id, verifier_version, verification_rule,
+                   verifier_bundle_hash, evidence_manifest_json, evidence_hash,
+                   authoritative, execution_checkpoint_id, created_at
+            FROM verifier_runs WHERE verifier_run_id = ?
+            """,
+            ("verifier_history_2", run_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO semantic_checkpoints(
+                task_id, plan_item_id, subtask_id, verifier_run_id,
+                execution_checkpoint_id, completion_summary, verifier_id,
+                verifier_version, verification_rule, verifier_bundle_hash,
+                evidence_manifest_json, evidence_hash, created_at
+            )
+            SELECT task_id, plan_item_id, subtask_id, ?, execution_checkpoint_id,
+                   completion_summary, verifier_id, verifier_version, verification_rule,
+                   verifier_bundle_hash, evidence_manifest_json, evidence_hash, created_at
+            FROM semantic_checkpoints WHERE semantic_checkpoint_id = ?
+            """,
+            ("verifier_history_2", checkpoint_id),
+        )
+
+    recovered = Runtime(tmp_path, ScriptedModel([]), verified_subtask=config)
+    result = recovered.resume(completed.task_id)
+
+    assert result.status == "completed"
+    assert verifier_calls == [1]
+    assert len(recovered.store.list_verifier_runs(completed.task_id)) == 2
+    assert len(recovered.store.list_semantic_checkpoints(completed.task_id)) == 2
+    assert recovered.store.scan_invariants(completed.task_id) == []
 
 
 def test_verified_resume_fails_closed_when_bundle_is_inconsistent(tmp_path: Path):

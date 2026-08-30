@@ -1594,7 +1594,7 @@ class EventStore:
                     "plan_item_id": plan_item_id,
                     "subtask_id": subtask_id,
                     "verifier_run_id": verifier_run_id,
-                    "semantic_checkpoint_id": semantic_checkpoint_id,
+                    "verified_subtask_checkpoint_id": semantic_checkpoint_id,
                     "status": "pass",
                     "authoritative": True,
                     "verifier_bundle_hash": verifier_bundle_hash,
@@ -1610,7 +1610,7 @@ class EventStore:
                 )
                 conn.execute(
                     "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
-                    (task_id, "semantic_checkpoint_created", _checked_json({"semantic_checkpoint_id": semantic_checkpoint_id, "verifier_run_id": verifier_run_id, "execution_checkpoint_id": execution_checkpoint_id}, MAX_EVENT_PAYLOAD_BYTES, "event payload"), now),
+                    (task_id, "verified_subtask_checkpoint_created", _checked_json({"verified_subtask_checkpoint_id": semantic_checkpoint_id, "verifier_run_id": verifier_run_id, "execution_checkpoint_id": execution_checkpoint_id}, MAX_EVENT_PAYLOAD_BYTES, "event payload"), now),
                 )
                 conn.execute(
                     "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
@@ -4329,13 +4329,19 @@ class EventStore:
                 if int(semantic["plan_item_id"]) == item_id
             ]
             if item["status"] == "completed":
-                if len(authoritative) != 1:
+                if not authoritative:
                     violations.append(
-                        f"plan_item {item_id}: completed with {len(authoritative)} authoritative verifier runs"
+                        f"plan_item {item_id}: completed without an authoritative verifier run"
                     )
-                if len(linked) != 1:
+                if not linked:
                     violations.append(
-                        f"plan_item {item_id}: completed with {len(linked)} semantic checkpoints"
+                        f"plan_item {item_id}: completed without a verified-subtask checkpoint"
+                    )
+                authoritative_ids = {str(run["verifier_run_id"]) for run in authoritative}
+                linked_ids = {str(semantic["verifier_run_id"]) for semantic in linked}
+                if authoritative_ids != linked_ids:
+                    violations.append(
+                        f"plan_item {item_id}: authoritative runs and verified-subtask checkpoints differ"
                     )
             elif authoritative or linked:
                 violations.append(f"plan_item {item_id}: non-completed item has an authoritative bundle")
