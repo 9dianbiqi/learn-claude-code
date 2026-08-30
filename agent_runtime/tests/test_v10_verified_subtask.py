@@ -50,6 +50,7 @@ def _config(
     *,
     description: str = "Create the artifact",
     completion_criteria: str = "The artifact exists with the expected content.",
+    verifier_implementation_hash: str | None = None,
 ) -> VerifiedSubtaskConfig:
     return VerifiedSubtaskConfig(
         subtask_id="s1",
@@ -60,6 +61,7 @@ def _config(
         verifier_version="1.0",
         verification_rule="artifact-v1",
         verifier=verifier,
+        verifier_implementation_hash=verifier_implementation_hash,
     )
 
 
@@ -187,6 +189,20 @@ def test_bundle_hash_covers_the_full_frozen_config_and_verifier_implementation()
     assert baseline.verifier_bundle_hash != changed_criteria.verifier_bundle_hash
     assert baseline.verifier_bundle_hash != changed_verifier.verifier_bundle_hash
     assert len(baseline.verifier_implementation_hash or "") == 64
+
+
+def test_explicit_verifier_implementation_hash_must_match_callable():
+    def verify(_: VerifierContext) -> VerifierResult:
+        return VerifierResult("pass", "ok", [])
+
+    computed = _config(verify).verifier_implementation_hash
+    assert computed is not None
+    assert _config(verify, verifier_implementation_hash=computed).verifier_bundle_hash == _config(
+        verify
+    ).verifier_bundle_hash
+
+    with pytest.raises(ValueError, match="does not match verifier"):
+        _config(verify, verifier_implementation_hash="0" * 64)
 
 
 def test_bundle_hash_is_stable_for_equivalent_callable_state():

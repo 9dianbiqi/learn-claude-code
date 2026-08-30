@@ -348,14 +348,17 @@ class VerifiedSubtaskConfig:
             raise ValueError("evidence_paths must not contain duplicates")
         if not callable(self.verifier):
             raise TypeError("verifier must be callable")
+        computed_implementation_hash = _verifier_implementation_hash(self.verifier)
         implementation_hash = self.verifier_implementation_hash
         if implementation_hash is None:
-            implementation_hash = _verifier_implementation_hash(self.verifier)
+            implementation_hash = computed_implementation_hash
         else:
             implementation_hash = _normalize_sha256(
                 implementation_hash,
                 "verifier_implementation_hash",
             )
+            if implementation_hash != computed_implementation_hash:
+                raise ValueError("verifier_implementation_hash does not match verifier")
         object.__setattr__(self, "evidence_paths", normalized)
         object.__setattr__(self, "verifier_implementation_hash", implementation_hash)
 
