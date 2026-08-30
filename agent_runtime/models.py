@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import dis
 import inspect
 import json
 import re
@@ -235,31 +234,6 @@ def _stable_code(
     return payload
 
 
-def _stable_closure_binding(value: Any, seen: set[int]) -> Any:
-    if isinstance(value, (list, dict, set)):
-        return {
-            "mutable_binding_type": f"{type(value).__module__}.{type(value).__qualname__}"
-        }
-    if isinstance(value, tuple):
-        return {
-            "tuple": [_stable_closure_binding(item, seen) for item in value]
-        }
-    return _stable_value(value, seen)
-
-
-def _assigned_freevars(code: CodeType) -> set[str]:
-    assigned = {
-        instruction.argval
-        for instruction in dis.get_instructions(code)
-        if instruction.opname in {"STORE_DEREF", "DELETE_DEREF"}
-        and isinstance(instruction.argval, str)
-    }
-    for value in code.co_consts:
-        if isinstance(value, CodeType):
-            assigned.update(_assigned_freevars(value))
-    return assigned
-
-
 def _stable_global_bindings(
     globals_dict: dict[str, Any] | None,
     code: CodeType,
@@ -303,16 +277,11 @@ def _stable_callable_payload(
         payload["defaults"] = _stable_value(getattr(target, "__defaults__", None), seen)
         payload["kwdefaults"] = _stable_value(getattr(target, "__kwdefaults__", None), seen)
         closure = getattr(target, "__closure__", None)
-        assigned_freevars = _assigned_freevars(code)
         payload["closure"] = (
             [
                 {
                     "name": name,
-                    "value": (
-                        {"mutable_binding": name}
-                        if name in assigned_freevars
-                        else _stable_closure_binding(cell.cell_contents, seen)
-                    ),
+                    "value": _stable_value(cell.cell_contents, seen),
                 }
                 for name, cell in zip(code.co_freevars, closure)
             ]
@@ -416,6 +385,6 @@ class VerifiedSubtaskConfig:
             "verifier_version": self.verifier_version,
             "verification_rule": self.verification_rule,
             "evidence_paths": list(self.evidence_paths),
-            "verifier_implementation_hash": _verifier_implementation_hash(self.verifier),
+            "verifier_implementation_hash": self.verifier_implementation_hash,
         }
         return _hash_payload(payload)

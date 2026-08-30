@@ -326,7 +326,7 @@ def test_bundle_hash_covers_parent_and_child_name_mangled_slots():
     assert first.verifier_bundle_hash != changed_child.verifier_bundle_hash
 
 
-def test_mutating_a_callable_after_configuration_changes_the_bundle_hash():
+def test_new_configuration_captures_mutated_callable_state():
     class MutableVerifier:
         def __init__(self, expected: str):
             self.expected = expected
@@ -338,8 +338,10 @@ def test_mutating_a_callable_after_configuration_changes_the_bundle_hash():
     config = _config(verifier)
     original_hash = config.verifier_bundle_hash
     verifier.expected = "changed"
+    changed_config = _config(verifier)
 
-    assert config.verifier_bundle_hash != original_hash
+    assert config.verifier_bundle_hash == original_hash
+    assert changed_config.verifier_bundle_hash != original_hash
 
 
 def test_evidence_paths_must_be_a_sequence_not_a_string():
