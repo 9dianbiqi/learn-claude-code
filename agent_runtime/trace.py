@@ -104,7 +104,7 @@ class TraceReporter:
             "authoritative_verifier_run_count": verified_metrics["authoritative_verifier_run_count"],
             "non_authoritative_verifier_run_count": verified_metrics["non_authoritative_verifier_run_count"],
             "verified_subtask_checkpoint_count": verified_metrics["verified_subtask_checkpoint_count"],
-            "verified_subtask_bundle_count": verified_metrics["verified_subtask_checkpoint_count"],
+            "verified_subtask_bundle_count": verified_metrics["verified_subtask_bundle_count"],
             "background_job_count": len(jobs),
             "background_job_runs": job_run_count,
             "background_job_statuses": job_status_counts,
@@ -157,11 +157,17 @@ class TraceReporter:
     def _verified_metrics(self, task_id: str) -> dict[str, int]:
         runs = self.store.list_verifier_runs(task_id)
         checkpoints = self.store.list_verified_subtask_checkpoints(task_id)
+        bundle_hashes = {
+            str(run["verifier_bundle_hash"])
+            for run in runs
+            if run["authoritative"]
+        }
         return {
             "verifier_run_count": len(runs),
             "authoritative_verifier_run_count": sum(run["authoritative"] for run in runs),
             "non_authoritative_verifier_run_count": sum(not run["authoritative"] for run in runs),
             "verified_subtask_checkpoint_count": len(checkpoints),
+            "verified_subtask_bundle_count": len(bundle_hashes),
         }
 
     def export_jsonl(self, task_id: str, output_path: str | Path) -> int:

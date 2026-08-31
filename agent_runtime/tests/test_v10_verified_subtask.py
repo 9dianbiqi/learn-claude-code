@@ -691,3 +691,6 @@ def test_verified_subtask_history_remains_append_only(tmp_path: Path):
     assert len(runtime.store.list_verifier_runs(result.task_id)) == 2
     assert len(runtime.store.list_verified_subtask_checkpoints(result.task_id)) == 2
     assert runtime.store.scan_invariants(result.task_id) == []
+    trace = TraceReporter(runtime.store).summary(result.task_id)
+    assert trace["verified_subtask_checkpoint_count"] == 2
+    assert trace["verified_subtask_bundle_count"] == 1
