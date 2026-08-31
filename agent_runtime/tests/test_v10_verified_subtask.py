@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
-import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from agent_runtime import Runtime
 from agent_runtime.fake_model import ScriptedModel
 from agent_runtime.migrations import (
+    MigrationValidationError,
     SchemaManager,
     V5_CHECKSUM,
     V6_CHECKSUM,
@@ -23,10 +25,13 @@ from agent_runtime.migrations import (
     _apply_v8_tool_registry,
     _apply_v9_subagents_mailbox,
 )
-from agent_runtime.models import ModelResponse, VerifierContext, VerifierResult, VerifiedSubtaskConfig
+from agent_runtime.models import ModelResponse, ToolCall, VerifierContext, VerifierResult, VerifiedSubtaskConfig
 from agent_runtime.runtime import InjectedCrash
 from agent_runtime.store import EventStore, InvariantViolation
 from agent_runtime.trace import TraceReporter
+
+
+VALID_SHA256 = "a" * 64
 
 
 def _config(verifier, evidence_paths: list[str] | tuple[str, ...] = ("artifact.txt",)) -> VerifiedSubtaskConfig:
@@ -78,7 +83,7 @@ def test_public_run_commits_a_verified_subtask_bundle(tmp_path: Path):
         return VerifierResult(
             status="pass",
             summary="artifact checks passed",
-            evidence_manifest=[{"path": "artifact.txt", "sha256": "abc123"}],
+            evidence_manifest=[{"path": "artifact.txt", "sha256": VALID_SHA256}],
         )
 
     runtime = Runtime(
@@ -90,12 +95,12 @@ def test_public_run_commits_a_verified_subtask_bundle(tmp_path: Path):
     result = runtime.run("Create the artifact")
 
     assert result.status == "completed"
-    assert result.final_text == "summary"
+    assert result.final_text == "summary\n"
     assert len(seen) == 1
     assert seen[0].repo_root == str(tmp_path.resolve())
     assert seen[0].task_id == result.task_id
     assert seen[0].subtask_id == "s1"
-    assert seen[0].completion_summary == "summary"
+    assert seen[0].completion_summary == "summary\n"
 
     item = runtime.store.get_plan_item(result.task_id, "s1")
     assert item is not None
@@ -105,9 +110,9 @@ def test_public_run_commits_a_verified_subtask_bundle(tmp_path: Path):
     assert len(runs) == 1
     assert runs[0]["status"] == "pass"
     assert runs[0]["authoritative"] is True
-    assert runs[0]["evidence_manifest"] == [{"path": "artifact.txt", "sha256": "abc123"}]
+    assert runs[0]["evidence_manifest"] == [{"path": "artifact.txt", "sha256": VALID_SHA256}]
 
-    checkpoints = runtime.store.list_semantic_checkpoints(result.task_id)
+    checkpoints = runtime.store.list_verified_subtask_checkpoints(result.task_id)
     assert len(checkpoints) == 1
     assert checkpoints[0]["verifier_run_id"] == runs[0]["verifier_run_id"]
     assert checkpoints[0]["execution_checkpoint_id"] == seen[0].execution_checkpoint_id
@@ -118,6 +123,7 @@ def test_bundle_hash_and_evidence_manifest_are_deterministic(tmp_path: Path):
     config_a = _config(lambda _: VerifierResult("pass", "ok", []), ["z.txt", "a.txt"])
     config_b = _config(lambda _: VerifierResult("pass", "ok", []), ["a.txt", "z.txt"])
     assert config_a.verifier_bundle_hash == config_b.verifier_bundle_hash
+    assert replace(config_a, verifier_implementation_hash="b" * 64).verifier_bundle_hash != config_a.verifier_bundle_hash
 
     runtime = Runtime(
         tmp_path,
@@ -134,8 +140,8 @@ def test_bundle_hash_and_evidence_manifest_are_deterministic(tmp_path: Path):
                 "pass",
                 "ok",
                 [
-                    {"path": "z.txt", "sha256": "z"},
-                    {"path": "a.txt", "sha256": "a"},
+                    {"path": "z.txt", "sha256": "b" * 64},
+                    {"path": "a.txt", "sha256": "c" * 64},
                 ],
             ),
         ),
@@ -145,8 +151,8 @@ def test_bundle_hash_and_evidence_manifest_are_deterministic(tmp_path: Path):
 
     assert result.status == "completed"
     assert runtime.store.list_verifier_runs(result.task_id)[0]["evidence_manifest"] == [
-        {"path": "a.txt", "sha256": "a"},
-        {"path": "z.txt", "sha256": "z"},
+        {"path": "a.txt", "sha256": "c" * 64},
+        {"path": "z.txt", "sha256": "b" * 64},
     ]
 
 
@@ -173,6 +179,12 @@ def test_v9_migrates_to_v10_with_verified_subtask_schema(tmp_path: Path):
         ).fetchone()[0] == V10_CHECKSUM
         assert "verifier_bundle_hash" in {
             row[1] for row in connection.execute("PRAGMA table_info(plan_items)")
+        }
+        assert "verifier_implementation_hash" in {
+            row[1] for row in connection.execute("PRAGMA table_info(verifier_runs)")
+        }
+        assert "verifier_implementation_hash" in {
+            row[1] for row in connection.execute("PRAGMA table_info(semantic_checkpoints)")
         }
 
 
@@ -215,12 +227,24 @@ def test_fresh_database_is_v10_and_integrity_checked(tmp_path: Path):
         ).fetchone()[0] == V10_CHECKSUM
 
 
+def test_verified_tables_without_migration_history_fail_closed(tmp_path: Path):
+    database = tmp_path / "runtime.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE verifier_runs(verifier_run_id TEXT PRIMARY KEY)"
+        )
+        connection.commit()
+
+    with pytest.raises(MigrationValidationError):
+        SchemaManager(database).inspect()
+
+
 def test_f2_pre_recovery_reverifies_without_leaving_a_partial_bundle(tmp_path: Path):
     verifier_calls: list[int] = []
 
     def verify(_: VerifierContext) -> VerifierResult:
         verifier_calls.append(1)
-        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": "abc123"}])
+        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": VALID_SHA256}])
 
     config = _config(verify)
 
@@ -240,7 +264,7 @@ def test_f2_pre_recovery_reverifies_without_leaving_a_partial_bundle(tmp_path: P
     task_id = first.store.list_tasks()[0]["task_id"]
     assert first.store.get_active_plan(task_id)["items"][0]["status"] == "verifying"
     assert first.store.list_verifier_runs(task_id) == []
-    assert first.store.list_semantic_checkpoints(task_id) == []
+    assert first.store.list_verified_subtask_checkpoints(task_id) == []
 
     recovered = Runtime(tmp_path, ScriptedModel([]), verified_subtask=config)
     result = recovered.resume(task_id)
@@ -248,7 +272,7 @@ def test_f2_pre_recovery_reverifies_without_leaving_a_partial_bundle(tmp_path: P
     assert result.status == "completed"
     assert len(verifier_calls) == 2
     assert len(recovered.store.list_verifier_runs(task_id)) == 1
-    assert len(recovered.store.list_semantic_checkpoints(task_id)) == 1
+    assert len(recovered.store.list_verified_subtask_checkpoints(task_id)) == 1
 
 
 def test_f2_mid_recovery_rolls_back_all_authoritative_writes(tmp_path: Path):
@@ -256,7 +280,7 @@ def test_f2_mid_recovery_rolls_back_all_authoritative_writes(tmp_path: Path):
 
     def verify(_: VerifierContext) -> VerifierResult:
         verifier_calls.append(1)
-        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": "abc123"}])
+        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": VALID_SHA256}])
 
     config = _config(verify)
 
@@ -277,9 +301,9 @@ def test_f2_mid_recovery_rolls_back_all_authoritative_writes(tmp_path: Path):
     assert first.store.get_task(task_id)["status"] != "completed"
     assert first.store.get_active_plan(task_id)["items"][0]["status"] == "verifying"
     assert first.store.list_verifier_runs(task_id) == []
-    assert first.store.list_semantic_checkpoints(task_id) == []
+    assert first.store.list_verified_subtask_checkpoints(task_id) == []
     assert not any(
-        event["type"] in {"verified_subtask_committed", "semantic_checkpoint_created"}
+        event["type"] in {"verified_subtask_committed", "verified_subtask_checkpoint_created"}
         for event in first.store.list_events(task_id)
     )
 
@@ -289,7 +313,7 @@ def test_f2_mid_recovery_rolls_back_all_authoritative_writes(tmp_path: Path):
     assert result.status == "completed"
     assert len(verifier_calls) == 2
     assert len(recovered.store.list_verifier_runs(task_id)) == 1
-    assert len(recovered.store.list_semantic_checkpoints(task_id)) == 1
+    assert len(recovered.store.list_verified_subtask_checkpoints(task_id)) == 1
 
 
 def test_f3_recovery_exposes_one_bundle_and_deduplicates_resume(tmp_path: Path):
@@ -297,7 +321,7 @@ def test_f3_recovery_exposes_one_bundle_and_deduplicates_resume(tmp_path: Path):
 
     def verify(_: VerifierContext) -> VerifierResult:
         verifier_calls.append(1)
-        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": "abc123"}])
+        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": VALID_SHA256}])
 
     config = _config(verify)
 
@@ -318,23 +342,23 @@ def test_f3_recovery_exposes_one_bundle_and_deduplicates_resume(tmp_path: Path):
     assert first.store.get_task(task_id)["status"] == "completed"
     assert first.store.get_plan_item(task_id, "s1")["status"] == "completed"
     assert len(first.store.list_verifier_runs(task_id)) == 1
-    assert len(first.store.list_semantic_checkpoints(task_id)) == 1
+    assert len(first.store.list_verified_subtask_checkpoints(task_id)) == 1
 
     recovered = Runtime(tmp_path, ScriptedModel([]), verified_subtask=config)
     result = recovered.resume(task_id)
     repeated = recovered.resume(task_id)
 
     assert result.status == "completed"
-    assert repeated.final_text == "done"
+    assert repeated.final_text == "done\n"
     assert verifier_calls == [1]
     assert len(recovered.store.list_verifier_runs(task_id)) == 1
-    assert len(recovered.store.list_semantic_checkpoints(task_id)) == 1
+    assert len(recovered.store.list_verified_subtask_checkpoints(task_id)) == 1
 
 
-def test_trace_exposes_verifier_runs_and_semantic_checkpoints(tmp_path: Path):
+def test_trace_exposes_verifier_runs_and_verified_subtask_checkpoints(tmp_path: Path):
     config = _config(
         lambda _: VerifierResult(
-            "pass", "ok", [{"path": "artifact.txt", "sha256": "abc123"}]
+            "pass", "ok", [{"path": "artifact.txt", "sha256": VALID_SHA256}]
         )
     )
     runtime = Runtime(
@@ -347,7 +371,7 @@ def test_trace_exposes_verifier_runs_and_semantic_checkpoints(tmp_path: Path):
     summary = TraceReporter(runtime.store).summary(result.task_id)
     assert summary["verifier_run_count"] == 1
     assert summary["authoritative_verifier_run_count"] == 1
-    assert summary["semantic_checkpoint_count"] == 1
+    assert summary["verified_subtask_checkpoint_count"] == 1
     assert summary["verified_subtask_bundle_count"] == 1
 
     output = tmp_path / "trace.jsonl"
@@ -359,14 +383,14 @@ def test_trace_exposes_verifier_runs_and_semantic_checkpoints(tmp_path: Path):
     ]
     assert {record["record_type"] for record in records} >= {
         "verifier_run",
-        "semantic_checkpoint",
+        "verified_subtask_checkpoint",
     }
 
 
 def test_verified_resume_fails_closed_when_bundle_is_inconsistent(tmp_path: Path):
     config = _config(
         lambda _: VerifierResult(
-            "pass", "ok", [{"path": "artifact.txt", "sha256": "abc123"}]
+            "pass", "ok", [{"path": "artifact.txt", "sha256": VALID_SHA256}]
         )
     )
     runtime = Runtime(
@@ -390,13 +414,13 @@ def test_completion_marker_requires_an_exclusive_line(tmp_path: Path):
 
     def verify(context: VerifierContext) -> VerifierResult:
         seen.append(context.completion_summary)
-        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": "abc123"}])
+        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": VALID_SHA256}])
 
     runtime = Runtime(
         tmp_path,
         ScriptedModel([
             ModelResponse(text="This text mentions SUBTASK_COMPLETE inline."),
-            ModelResponse(text="summary\nSUBTASK_COMPLETE\n"),
+            ModelResponse(text="  summary  \nSUBTASK_COMPLETE\n\n"),
         ]),
         verified_subtask=_config(verify),
     )
@@ -404,8 +428,37 @@ def test_completion_marker_requires_an_exclusive_line(tmp_path: Path):
     result = runtime.run("Create the artifact")
 
     assert result.status == "completed"
-    assert result.final_text == "summary"
-    assert seen == ["summary"]
+    assert result.final_text == "  summary  \n\n"
+    assert seen == ["  summary  \n\n"]
+
+
+def test_marker_with_tool_calls_fails_closed_without_running_tools(tmp_path: Path):
+    seen: list[VerifierContext] = []
+    target = tmp_path / "artifact.txt"
+    target.write_text("unchanged", encoding="utf-8")
+
+    def verify(context: VerifierContext) -> VerifierResult:
+        seen.append(context)
+        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": VALID_SHA256}])
+
+    runtime = Runtime(
+        tmp_path,
+        ScriptedModel([
+            ModelResponse(
+                text="done\nSUBTASK_COMPLETE",
+                tool_calls=[ToolCall("read", "read_file", {"path": "artifact.txt"})],
+            )
+        ]),
+        verified_subtask=_config(verify),
+    )
+
+    result = runtime.run("Create the artifact")
+
+    assert result.status == "failed"
+    assert seen == []
+    assert runtime.store.list_tool_calls(result.task_id) == []
+    assert runtime.store.list_verified_subtask_checkpoints(result.task_id) == []
+    assert target.read_text(encoding="utf-8") == "unchanged"
 
 
 def test_default_exec_full_behavior_remains_unchanged(tmp_path: Path):
@@ -422,7 +475,7 @@ def test_default_exec_full_behavior_remains_unchanged(tmp_path: Path):
 def test_failed_verification_is_retryable_and_non_authoritative(tmp_path: Path):
     outcomes = iter([
         VerifierResult("fail", "artifact is missing", []),
-        VerifierResult("pass", "artifact checks passed", [{"path": "artifact.txt", "sha256": "abc123"}]),
+        VerifierResult("pass", "artifact checks passed", [{"path": "artifact.txt", "sha256": VALID_SHA256}]),
     ])
     model = ScriptedModel([
         ModelResponse(text="first attempt\nSUBTASK_COMPLETE"),
@@ -442,7 +495,7 @@ def test_failed_verification_is_retryable_and_non_authoritative(tmp_path: Path):
         ("fail", False),
         ("pass", True),
     ]
-    assert len(runtime.store.list_semantic_checkpoints(result.task_id)) == 1
+    assert len(runtime.store.list_verified_subtask_checkpoints(result.task_id)) == 1
     assert any(
         "Verifier result: fail. artifact is missing" in str(message.get("content"))
         for message in model.calls[1]
@@ -461,7 +514,7 @@ def test_verified_resume_is_idempotent_and_rejects_a_mismatched_bundle(tmp_path:
 
     def verify(_: VerifierContext) -> VerifierResult:
         verifier_calls.append(1)
-        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": "abc123"}])
+        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": VALID_SHA256}])
 
     config = _config(verify)
     first = Runtime(
@@ -476,11 +529,11 @@ def test_verified_resume_is_idempotent_and_rejects_a_mismatched_bundle(tmp_path:
     resumed = recovered.resume(completed.task_id)
 
     assert resumed.status == "completed"
-    assert resumed.final_text == "done"
+    assert resumed.final_text == "done\n"
     assert recovered_model.call_count == 0
     assert len(verifier_calls) == 1
     assert len(recovered.store.list_verifier_runs(completed.task_id)) == 1
-    assert len(recovered.store.list_semantic_checkpoints(completed.task_id)) == 1
+    assert len(recovered.store.list_verified_subtask_checkpoints(completed.task_id)) == 1
 
     mismatched = VerifiedSubtaskConfig(
         subtask_id=config.subtask_id,
@@ -495,11 +548,18 @@ def test_verified_resume_is_idempotent_and_rejects_a_mismatched_bundle(tmp_path:
     with pytest.raises(RuntimeError, match="bundle hash mismatch"):
         Runtime(tmp_path, ScriptedModel([]), verified_subtask=mismatched).resume(completed.task_id)
 
+    for changed in (
+        replace(config, description="Changed description"),
+        replace(config, completion_criteria="Changed criteria"),
+    ):
+        with pytest.raises(RuntimeError, match="bundle hash mismatch"):
+            Runtime(tmp_path, ScriptedModel([]), verified_subtask=changed).resume(completed.task_id)
+
 
 def test_uncertain_verification_is_distinct_non_authoritative_retry(tmp_path: Path):
     outcomes = iter([
         VerifierResult("uncertain", "the check could not run", []),
-        VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": "abc123"}]),
+        VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": VALID_SHA256}]),
     ])
 
     def verify(_: VerifierContext) -> VerifierResult:
@@ -523,3 +583,106 @@ def test_uncertain_verification_is_distinct_non_authoritative_retry(tmp_path: Pa
     assert runs[1]["status"] == "pass"
     assert runs[1]["authoritative"] is True
     assert runtime.store.get_plan_item(result.task_id, "s1")["status"] == "completed"
+
+
+@pytest.mark.parametrize("failure_kind", ["raises", "malformed"])
+def test_verifier_failure_is_audited_as_uncertain_and_retried(
+    tmp_path: Path, failure_kind: str
+):
+    calls = 0
+
+    def verify(_: VerifierContext) -> VerifierResult:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if failure_kind == "raises":
+                raise RuntimeError("verifier unavailable")
+            return {"status": "pass"}  # type: ignore[return-value]
+        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": VALID_SHA256}])
+
+    model = ScriptedModel([
+        ModelResponse(text="first\nSUBTASK_COMPLETE"),
+        ModelResponse(text="second\nSUBTASK_COMPLETE"),
+    ])
+    runtime = Runtime(tmp_path, model, verified_subtask=_config(verify))
+
+    result = runtime.run("Create the artifact")
+
+    assert result.status == "completed"
+    runs = runtime.store.list_verifier_runs(result.task_id)
+    assert runs[0]["status"] == "uncertain"
+    assert runs[0]["authoritative"] is False
+    assert runs[1]["status"] == "pass"
+    assert any("Verifier result: uncertain." in str(message.get("content")) for message in model.calls[1])
+
+
+def test_pass_with_invalid_evidence_hash_cannot_create_authority(tmp_path: Path):
+    runtime = Runtime(
+        tmp_path,
+        ScriptedModel([ModelResponse(text="done\nSUBTASK_COMPLETE")]),
+        verified_subtask=_config(
+            lambda _: VerifierResult(
+                "pass", "bad evidence", [{"path": "artifact.txt", "sha256": "abc123"}]
+            )
+        ),
+    )
+
+    result = runtime.run("Create the artifact")
+
+    assert result.status == "failed"
+    runs = runtime.store.list_verifier_runs(result.task_id)
+    assert len(runs) == 1
+    assert runs[0]["status"] == "uncertain"
+    assert runs[0]["authoritative"] is False
+    assert runtime.store.list_verified_subtask_checkpoints(result.task_id) == []
+
+
+def test_verified_subtask_history_remains_append_only(tmp_path: Path):
+    runtime = Runtime(
+        tmp_path,
+        ScriptedModel([ModelResponse(text="done\nSUBTASK_COMPLETE")]),
+        verified_subtask=_config(
+            lambda _: VerifierResult(
+                "pass", "ok", [{"path": "artifact.txt", "sha256": VALID_SHA256}]
+            )
+        ),
+    )
+    result = runtime.run("Create the artifact")
+    run = runtime.store.list_verifier_runs(result.task_id)[0]
+    checkpoint = runtime.store.list_verified_subtask_checkpoints(result.task_id)[0]
+    manifest_json = json.dumps(
+        run["evidence_manifest"], ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+    with sqlite3.connect(runtime.store.path) as connection:
+        connection.execute(
+            "INSERT INTO verifier_runs("
+            "verifier_run_id, task_id, plan_item_id, subtask_id, status, summary, "
+            "completion_summary, verifier_id, verifier_version, verification_rule, "
+            "verifier_bundle_hash, verifier_implementation_hash, evidence_manifest_json, "
+            "evidence_hash, authoritative, execution_checkpoint_id, created_at) "
+            "SELECT ?, task_id, plan_item_id, subtask_id, status, summary, completion_summary, "
+            "verifier_id, verifier_version, verification_rule, verifier_bundle_hash, "
+            "verifier_implementation_hash, ?, evidence_hash, authoritative, "
+            "execution_checkpoint_id, created_at + 1 FROM verifier_runs "
+            "WHERE verifier_run_id = ?",
+            ("verifier-history-2", manifest_json, run["verifier_run_id"]),
+        )
+        connection.execute(
+            "INSERT INTO semantic_checkpoints("
+            "task_id, plan_item_id, subtask_id, verifier_run_id, execution_checkpoint_id, "
+            "completion_summary, verifier_id, verifier_version, verification_rule, "
+            "verifier_bundle_hash, verifier_implementation_hash, evidence_manifest_json, "
+            "evidence_hash, created_at) "
+            "SELECT task_id, plan_item_id, subtask_id, 'verifier-history-2', "
+            "execution_checkpoint_id, completion_summary, verifier_id, verifier_version, "
+            "verification_rule, verifier_bundle_hash, verifier_implementation_hash, ?, "
+            "evidence_hash, created_at + 1 FROM semantic_checkpoints "
+            "WHERE semantic_checkpoint_id = ?",
+            (manifest_json, checkpoint["verified_subtask_checkpoint_id"]),
+        )
+        connection.commit()
+
+    assert len(runtime.store.list_verifier_runs(result.task_id)) == 2
+    assert len(runtime.store.list_verified_subtask_checkpoints(result.task_id)) == 2
+    assert runtime.store.scan_invariants(result.task_id) == []

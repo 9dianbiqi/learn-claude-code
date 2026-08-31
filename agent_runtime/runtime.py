@@ -23,6 +23,8 @@ from .models import (
     VerifierContext,
     VerifierResult,
     VerifiedSubtaskConfig,
+    is_valid_sha256,
+    normalize_evidence_path,
 )
 from .permissions import PermissionDecision, PermissionEngine
 from .store import EffectBlocked, EventStore, InvariantViolation, LeaseLost, StaleState
@@ -143,9 +145,11 @@ class Runtime:
 
     @staticmethod
     def _completion_summary(text: str) -> str:
-        return "\n".join(
-            line for line in str(text).splitlines() if line != "SUBTASK_COMPLETE"
-        ).strip()
+        return "".join(
+            line
+            for line in str(text).splitlines(keepends=True)
+            if line.rstrip("\r\n") != "SUBTASK_COMPLETE"
+        )
 
     @staticmethod
     def _normalize_evidence_manifest(
@@ -156,13 +160,7 @@ class Runtime:
         for entry in manifest:
             if not isinstance(entry, dict) or "path" not in entry or "sha256" not in entry:
                 raise ValueError("evidence manifest entries require path and sha256")
-            path = str(entry["path"]).replace("\\", "/")
-            parts = [part for part in path.split("/") if part not in {"", "."}]
-            if not parts or path.startswith("/") or ".." in parts:
-                raise ValueError(f"evidence path must be repository-relative: {path!r}")
-            normalized_path = "/".join(parts)
-            if len(normalized_path) >= 2 and normalized_path[1] == ":" and normalized_path[0].isalpha():
-                raise ValueError(f"evidence path must be repository-relative: {path!r}")
+            normalized_path = normalize_evidence_path(str(entry["path"]))
             if normalized_path in seen:
                 raise ValueError(f"duplicate evidence path: {normalized_path}")
             seen.add(normalized_path)
@@ -229,10 +227,41 @@ class Runtime:
             completion_summary=completion_summary,
             execution_checkpoint_id=execution_checkpoint_id,
         )
-        verifier_result = config.verifier(context)
+        try:
+            verifier_result = config.verifier(context)
+        except Exception as exc:
+            verifier_result = VerifierResult(
+                status="uncertain",
+                summary=f"Verifier raised {type(exc).__name__}: {str(exc)[:256]}",
+                evidence_manifest=[],
+            )
         if not isinstance(verifier_result, VerifierResult):
-            raise TypeError("verifier must return VerifierResult")
-        manifest = self._normalize_evidence_manifest(verifier_result.evidence_manifest)
+            verifier_result = VerifierResult(
+                status="uncertain",
+                summary="Verifier returned a malformed result; expected VerifierResult.",
+                evidence_manifest=[],
+            )
+        try:
+            manifest = self._normalize_evidence_manifest(verifier_result.evidence_manifest)
+        except Exception as exc:
+            verifier_result = VerifierResult(
+                status="uncertain",
+                summary=f"Verifier returned an invalid evidence manifest: {str(exc)[:256]}",
+                evidence_manifest=[],
+            )
+            manifest = []
+        invalid_hashes = [
+            entry["path"] for entry in manifest if not is_valid_sha256(entry["sha256"])
+        ]
+        if invalid_hashes and verifier_result.status == "pass":
+            verifier_result = VerifierResult(
+                status="uncertain",
+                summary=(
+                    "Verifier pass rejected because evidence contains invalid SHA-256 "
+                    "values: " + ", ".join(invalid_hashes)
+                ),
+                evidence_manifest=manifest,
+            )
         covered_paths = {entry["path"] for entry in manifest}
         missing_paths = sorted(set(config.evidence_paths) - covered_paths)
         if verifier_result.status == "pass" and missing_paths:
@@ -263,6 +292,7 @@ class Runtime:
                 verifier_version=config.verifier_version,
                 verification_rule=config.verification_rule,
                 verifier_bundle_hash=config.verifier_bundle_hash,
+                verifier_implementation_hash=config.verifier_implementation_hash,
                 execution_checkpoint_id=execution_checkpoint_id,
                 fault_injector=self._fault,
             )
@@ -280,6 +310,7 @@ class Runtime:
             verifier_version=config.verifier_version,
             verification_rule=config.verification_rule,
             verifier_bundle_hash=config.verifier_bundle_hash,
+            verifier_implementation_hash=config.verifier_implementation_hash,
             execution_checkpoint_id=execution_checkpoint_id,
         )
         self._append_verified_feedback(
@@ -640,6 +671,15 @@ class Runtime:
                 execution_checkpoint_id = self.store.save_checkpoint(
                     task_id, "model_responded", messages, {"turn": turn}
                 )
+
+                if (
+                    self.verified_subtask is not None
+                    and response.tool_calls
+                    and self._has_completion_marker(response.text)
+                ):
+                    error = "Completion marker cannot be combined with tool calls"
+                    self.store.fail_task(task_id, messages, {"turn": turn}, error)
+                    return RunResult(task_id, "failed", error=error)
 
                 if not response.tool_calls:
                     text = response.text

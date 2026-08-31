@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.3.0.dev5 - Atomic Verified Subtask Checkpoints
+
+- Added an opt-in verified-subtask path with frozen verifier configuration,
+  deterministic bundle identity, evidence manifests, and public run/resume
+  recovery.
+- Added checksum-verified schema v10 migration with append-only verifier runs,
+  verified-subtask checkpoints, atomic pass commits, and non-authoritative
+  fail/uncertain audit records.
+
 ## v0.3.0.dev4 - Phase 3 Durable Subagents, Plan Approval & Team Mailbox
 
 - Stabilized and froze the reproducible v0.3 Exec-Full baseline at package

@@ -692,6 +692,7 @@ _V10_ADDITIONS = (
         verifier_version TEXT NOT NULL,
         verification_rule TEXT NOT NULL,
         verifier_bundle_hash TEXT NOT NULL,
+        verifier_implementation_hash TEXT NOT NULL,
         evidence_manifest_json TEXT NOT NULL,
         evidence_hash TEXT NOT NULL,
         authoritative INTEGER NOT NULL DEFAULT 0,
@@ -715,6 +716,7 @@ _V10_ADDITIONS = (
         verifier_version TEXT NOT NULL,
         verification_rule TEXT NOT NULL,
         verifier_bundle_hash TEXT NOT NULL,
+        verifier_implementation_hash TEXT NOT NULL,
         evidence_manifest_json TEXT NOT NULL,
         evidence_hash TEXT NOT NULL,
         created_at REAL NOT NULL
@@ -774,6 +776,8 @@ def _business_tables(table_names: set[str]) -> set[str]:
         "mailboxes",
         "mailbox_messages",
         "plan_approvals",
+        "verifier_runs",
+        "semantic_checkpoints",
     }
 
 
@@ -1514,15 +1518,17 @@ class SchemaManager:
                 },
                 "verifier_runs": {
                     "verifier_run_id", "task_id", "plan_item_id", "subtask_id", "status",
-                    "summary", "completion_summary", "verifier_id", "verifier_version",
-                    "verification_rule", "verifier_bundle_hash", "evidence_manifest_json",
+                "summary", "completion_summary", "verifier_id", "verifier_version",
+                    "verification_rule", "verifier_bundle_hash", "verifier_implementation_hash",
+                    "evidence_manifest_json",
                     "evidence_hash", "authoritative", "execution_checkpoint_id", "created_at",
                 },
                 "semantic_checkpoints": {
                     "semantic_checkpoint_id", "task_id", "plan_item_id", "subtask_id",
                     "verifier_run_id", "execution_checkpoint_id", "completion_summary",
                     "verifier_id", "verifier_version", "verification_rule",
-                    "verifier_bundle_hash", "evidence_manifest_json", "evidence_hash",
+                    "verifier_bundle_hash", "verifier_implementation_hash", "evidence_manifest_json",
+                    "evidence_hash",
                     "created_at",
                 },
             }

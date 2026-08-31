@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Callable
@@ -59,7 +60,10 @@ class RunResult:
     error: str | None = None
 
 
-def _normalize_evidence_path(path: str) -> str:
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+def normalize_evidence_path(path: str) -> str:
     value = str(path).replace("\\", "/")
     if not value or value.startswith("/") or value.startswith("//"):
         raise ValueError(f"evidence path must be repository-relative: {path!r}")
@@ -69,6 +73,10 @@ def _normalize_evidence_path(path: str) -> str:
     if not parts or ".." in parts:
         raise ValueError(f"evidence path must be repository-relative: {path!r}")
     return "/".join(parts)
+
+
+def is_valid_sha256(value: str) -> bool:
+    return bool(_SHA256_HEX.fullmatch(str(value)))
 
 
 @dataclass(frozen=True)
@@ -110,6 +118,7 @@ class VerifiedSubtaskConfig:
     verifier_version: str
     verification_rule: str
     verifier: Callable[[VerifierContext], VerifierResult]
+    verifier_implementation_hash: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -123,19 +132,26 @@ class VerifiedSubtaskConfig:
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{field_name} must be a non-empty string")
-        normalized = tuple(sorted(_normalize_evidence_path(path) for path in self.evidence_paths))
+        normalized = tuple(sorted(normalize_evidence_path(path) for path in self.evidence_paths))
         if len(normalized) != len(set(normalized)):
             raise ValueError("evidence_paths must not contain duplicates")
         if not callable(self.verifier):
             raise TypeError("verifier must be callable")
+        implementation_hash = self.verifier_implementation_hash or self.verifier_id
+        if not isinstance(implementation_hash, str) or not implementation_hash.strip():
+            raise ValueError("verifier_implementation_hash must be a non-empty string")
         object.__setattr__(self, "evidence_paths", normalized)
+        object.__setattr__(self, "verifier_implementation_hash", implementation_hash)
 
     @property
     def verifier_bundle_hash(self) -> str:
         payload = {
+            "description": self.description,
+            "completion_criteria": self.completion_criteria,
             "verifier_id": self.verifier_id,
             "verifier_version": self.verifier_version,
             "verification_rule": self.verification_rule,
+            "verifier_implementation_hash": self.verifier_implementation_hash,
             "evidence_paths": list(self.evidence_paths),
         }
         canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

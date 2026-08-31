@@ -103,8 +103,8 @@ class TraceReporter:
             "verifier_run_count": verified_metrics["verifier_run_count"],
             "authoritative_verifier_run_count": verified_metrics["authoritative_verifier_run_count"],
             "non_authoritative_verifier_run_count": verified_metrics["non_authoritative_verifier_run_count"],
-            "semantic_checkpoint_count": verified_metrics["semantic_checkpoint_count"],
-            "verified_subtask_bundle_count": verified_metrics["semantic_checkpoint_count"],
+            "verified_subtask_checkpoint_count": verified_metrics["verified_subtask_checkpoint_count"],
+            "verified_subtask_bundle_count": verified_metrics["verified_subtask_checkpoint_count"],
             "background_job_count": len(jobs),
             "background_job_runs": job_run_count,
             "background_job_statuses": job_status_counts,
@@ -156,12 +156,12 @@ class TraceReporter:
 
     def _verified_metrics(self, task_id: str) -> dict[str, int]:
         runs = self.store.list_verifier_runs(task_id)
-        checkpoints = self.store.list_semantic_checkpoints(task_id)
+        checkpoints = self.store.list_verified_subtask_checkpoints(task_id)
         return {
             "verifier_run_count": len(runs),
             "authoritative_verifier_run_count": sum(run["authoritative"] for run in runs),
             "non_authoritative_verifier_run_count": sum(not run["authoritative"] for run in runs),
-            "semantic_checkpoint_count": len(checkpoints),
+            "verified_subtask_checkpoint_count": len(checkpoints),
         }
 
     def export_jsonl(self, task_id: str, output_path: str | Path) -> int:
@@ -232,10 +232,10 @@ class TraceReporter:
                     )
                     + "\n"
                 )
-            for checkpoint in self.store.list_semantic_checkpoints(task_id):
+            for checkpoint in self.store.list_verified_subtask_checkpoints(task_id):
                 handle.write(
                     json.dumps(
-                        _redact({"record_type": "semantic_checkpoint", **checkpoint}),
+                        _redact({"record_type": "verified_subtask_checkpoint", **checkpoint}),
                         ensure_ascii=False,
                         sort_keys=True,
                     )
