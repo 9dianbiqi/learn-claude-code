@@ -32,6 +32,7 @@ from agent_runtime.trace import TraceReporter
 
 
 VALID_SHA256 = "a" * 64
+VALID_VERIFIER_IMPLEMENTATION_HASH = "b" * 64
 
 
 def _config(verifier, evidence_paths: list[str] | tuple[str, ...] = ("artifact.txt",)) -> VerifiedSubtaskConfig:
@@ -44,6 +45,7 @@ def _config(verifier, evidence_paths: list[str] | tuple[str, ...] = ("artifact.t
         verifier_version="1.0",
         verification_rule="artifact-v1",
         verifier=verifier,
+        verifier_implementation_hash=VALID_VERIFIER_IMPLEMENTATION_HASH,
     )
 
 
@@ -123,7 +125,8 @@ def test_bundle_hash_and_evidence_manifest_are_deterministic(tmp_path: Path):
     config_a = _config(lambda _: VerifierResult("pass", "ok", []), ["z.txt", "a.txt"])
     config_b = _config(lambda _: VerifierResult("pass", "ok", []), ["a.txt", "z.txt"])
     assert config_a.verifier_bundle_hash == config_b.verifier_bundle_hash
-    assert replace(config_a, verifier_implementation_hash="b" * 64).verifier_bundle_hash != config_a.verifier_bundle_hash
+    assert replace(config_a, verifier_implementation_hash="c" * 64).verifier_bundle_hash != config_a.verifier_bundle_hash
+    assert replace(config_a, subtask_id="s2").verifier_bundle_hash != config_a.verifier_bundle_hash
 
     runtime = Runtime(
         tmp_path,
@@ -144,6 +147,7 @@ def test_bundle_hash_and_evidence_manifest_are_deterministic(tmp_path: Path):
                     {"path": "a.txt", "sha256": "c" * 64},
                 ],
             ),
+            verifier_implementation_hash=VALID_VERIFIER_IMPLEMENTATION_HASH,
         ),
     )
 
@@ -544,6 +548,7 @@ def test_verified_resume_is_idempotent_and_rejects_a_mismatched_bundle(tmp_path:
         verifier_version=config.verifier_version,
         verification_rule="different-rule",
         verifier=verify,
+        verifier_implementation_hash=config.verifier_implementation_hash,
     )
     with pytest.raises(RuntimeError, match="bundle hash mismatch"):
         Runtime(tmp_path, ScriptedModel([]), verified_subtask=mismatched).resume(completed.task_id)

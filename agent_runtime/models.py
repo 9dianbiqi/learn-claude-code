@@ -118,7 +118,7 @@ class VerifiedSubtaskConfig:
     verifier_version: str
     verification_rule: str
     verifier: Callable[[VerifierContext], VerifierResult]
-    verifier_implementation_hash: str | None = None
+    verifier_implementation_hash: str
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -137,7 +137,7 @@ class VerifiedSubtaskConfig:
             raise ValueError("evidence_paths must not contain duplicates")
         if not callable(self.verifier):
             raise TypeError("verifier must be callable")
-        implementation_hash = self.verifier_implementation_hash or self.verifier_id
+        implementation_hash = self.verifier_implementation_hash
         if not isinstance(implementation_hash, str) or not implementation_hash.strip():
             raise ValueError("verifier_implementation_hash must be a non-empty string")
         object.__setattr__(self, "evidence_paths", normalized)
@@ -146,6 +146,7 @@ class VerifiedSubtaskConfig:
     @property
     def verifier_bundle_hash(self) -> str:
         payload = {
+            "subtask_id": self.subtask_id,
             "description": self.description,
             "completion_criteria": self.completion_criteria,
             "verifier_id": self.verifier_id,
