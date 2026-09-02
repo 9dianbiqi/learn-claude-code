@@ -7,11 +7,12 @@ from .models import (
     VerifierContext,
     VerifierResult,
     VerifiedSubtaskConfig,
+    VerifiedSubtaskDAGConfig,
 )
 from .effects import EffectSemantics, OperationSpec, ReconcileEvidence
 from .runtime import Runtime
 
-__version__ = "0.3.0.dev5"
+__version__ = "0.3.0.dev6"
 
 __all__ = [
     "EffectSemantics",
@@ -24,5 +25,6 @@ __all__ = [
     "VerifierContext",
     "VerifierResult",
     "VerifiedSubtaskConfig",
+    "VerifiedSubtaskDAGConfig",
     "__version__",
 ]

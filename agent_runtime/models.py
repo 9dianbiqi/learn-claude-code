@@ -119,6 +119,8 @@ class VerifiedSubtaskConfig:
     verification_rule: str
     verifier: Callable[[VerifierContext], VerifierResult]
     verifier_implementation_hash: str
+    blocked_by: tuple[str, ...] = ()
+    max_turns: int = 1
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -140,8 +142,21 @@ class VerifiedSubtaskConfig:
         implementation_hash = self.verifier_implementation_hash
         if not isinstance(implementation_hash, str) or not implementation_hash.strip():
             raise ValueError("verifier_implementation_hash must be a non-empty string")
+        if isinstance(self.max_turns, bool) or not isinstance(self.max_turns, int) or self.max_turns < 1:
+            raise ValueError("max_turns must be a positive integer")
+        if isinstance(self.blocked_by, str):
+            raise TypeError("blocked_by must be a collection of subtask IDs")
+        try:
+            dependencies = tuple(self.blocked_by)
+        except TypeError as exc:
+            raise TypeError("blocked_by must be a collection of subtask IDs") from exc
+        if any(not isinstance(dependency, str) or not dependency.strip() for dependency in dependencies):
+            raise ValueError("blocked_by must contain non-empty string subtask IDs")
+        if len(dependencies) != len(set(dependencies)):
+            raise ValueError("blocked_by must not contain duplicates")
         object.__setattr__(self, "evidence_paths", normalized)
         object.__setattr__(self, "verifier_implementation_hash", implementation_hash)
+        object.__setattr__(self, "blocked_by", tuple(sorted(dependencies)))
 
     @property
     def verifier_bundle_hash(self) -> str:
@@ -156,4 +171,79 @@ class VerifiedSubtaskConfig:
             "evidence_paths": list(self.evidence_paths),
         }
         canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, init=False)
+class VerifiedSubtaskDAGConfig:
+    """A validated, immutable, deterministically ordered verified-subtask DAG."""
+
+    nodes: tuple[VerifiedSubtaskConfig, ...]
+
+    def __init__(
+        self,
+        nodes: tuple[VerifiedSubtaskConfig, ...] | list[VerifiedSubtaskConfig] | None = None,
+    ) -> None:
+        raw_nodes = nodes if nodes is not None else ()
+        normalized: list[VerifiedSubtaskConfig] = []
+        for node in raw_nodes:
+            if isinstance(node, VerifiedSubtaskConfig):
+                normalized.append(node)
+            else:
+                raise TypeError("DAG nodes must be VerifiedSubtaskConfig instances")
+        if not normalized:
+            raise ValueError("verified subtask DAG must not be empty")
+
+        ids = [node.subtask_id for node in normalized]
+        if len(ids) != len(set(ids)):
+            raise ValueError("verified subtask DAG must not contain duplicate subtask IDs")
+        node_by_id = {node.subtask_id: node for node in normalized}
+        known_ids = set(ids)
+        for node in normalized:
+            if node.subtask_id in node.blocked_by:
+                raise ValueError(f"subtask {node.subtask_id} cannot depend on itself")
+            missing = [
+                dependency for dependency in node.blocked_by if dependency not in known_ids
+            ]
+            if missing:
+                raise ValueError(
+                    f"subtask {node.subtask_id} depends on missing subtask(s): {', '.join(missing)}"
+                )
+
+        states: dict[str, int] = {subtask_id: 0 for subtask_id in ids}
+
+        def visit(subtask_id: str) -> None:
+            if states[subtask_id] == 1:
+                raise ValueError("verified subtask DAG must not contain cycles")
+            if states[subtask_id] == 2:
+                return
+            states[subtask_id] = 1
+            node = node_by_id[subtask_id]
+            for dependency in node.blocked_by:
+                visit(dependency)
+            states[subtask_id] = 2
+
+        for subtask_id in ids:
+            visit(subtask_id)
+        object.__setattr__(self, "nodes", tuple(normalized))
+
+    @property
+    def dag_hash(self) -> str:
+        payload = {
+            "nodes": [
+                {
+                    "subtask_id": node.subtask_id,
+                    "blocked_by": list(node.blocked_by),
+                    "verifier_bundle_hash": node.verifier_bundle_hash,
+                    "max_turns": node.max_turns,
+                }
+                for node in self.nodes
+            ]
+        }
+        canonical = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

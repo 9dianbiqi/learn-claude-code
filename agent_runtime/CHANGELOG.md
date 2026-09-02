@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.0.dev6 - Frozen DAG Orchestration & Deterministic Recovery
+
+- Added opt-in frozen verified-subtask DAG orchestration with deterministic
+  dependency selection, verifier-gated intermediate checkpoints, and F3-safe
+  recovery through the public `Runtime.run`/`resume` API.
+- Added durable per-node turn budgets and schema v11 migration support, with
+  fail-closed configuration/hash mismatch handling and budget exhaustion.
+
 ## v0.3.0.dev5 - Atomic Verified Subtask Checkpoints
 
 - Added an opt-in verified-subtask path with frozen verifier configuration,

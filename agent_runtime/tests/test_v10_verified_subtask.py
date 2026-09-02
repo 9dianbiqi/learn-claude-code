@@ -19,6 +19,7 @@ from agent_runtime.migrations import (
     V8_CHECKSUM,
     V9_CHECKSUM,
     V10_CHECKSUM,
+    V11_CHECKSUM,
     _BASE_SCHEMA,
     _apply_v6_durable_context,
     _apply_v7_background_jobs,
@@ -160,16 +161,16 @@ def test_bundle_hash_and_evidence_manifest_are_deterministic(tmp_path: Path):
     ]
 
 
-def test_v9_migrates_to_v10_with_verified_subtask_schema(tmp_path: Path):
+def test_v9_migrates_to_v11_with_verified_subtask_schema(tmp_path: Path):
     database = _v9_database(tmp_path)
 
     report = SchemaManager(database).migrate()
 
     assert report.ok is True
     assert report.from_version == 9
-    assert report.to_version == 10
-    assert report.applied == ("v10_verified_subtask",)
-    assert SchemaManager(database).inspect().current_version == 10
+    assert report.to_version == 11
+    assert report.applied == ("v10_verified_subtask", "v11_frozen_dag")
+    assert SchemaManager(database).inspect().current_version == 11
     with sqlite3.connect(database) as connection:
         tables = {
             row[0]
@@ -181,6 +182,9 @@ def test_v9_migrates_to_v10_with_verified_subtask_schema(tmp_path: Path):
         assert connection.execute(
             "SELECT checksum FROM schema_migrations WHERE version = 10"
         ).fetchone()[0] == V10_CHECKSUM
+        assert connection.execute(
+            "SELECT checksum FROM schema_migrations WHERE version = 11"
+        ).fetchone()[0] == V11_CHECKSUM
         assert "verifier_bundle_hash" in {
             row[1] for row in connection.execute("PRAGMA table_info(plan_items)")
         }
@@ -192,7 +196,7 @@ def test_v9_migrates_to_v10_with_verified_subtask_schema(tmp_path: Path):
         }
 
 
-def test_v9_to_v10_migration_rolls_back_before_commit(tmp_path: Path):
+def test_v9_to_v11_migration_rolls_back_before_commit(tmp_path: Path):
     database = _v9_database(tmp_path)
 
     def inject(point: str, **_: object) -> None:
@@ -217,18 +221,18 @@ def test_v9_to_v10_migration_rolls_back_before_commit(tmp_path: Path):
         }
 
 
-def test_fresh_database_is_v10_and_integrity_checked(tmp_path: Path):
+def test_fresh_database_is_v11_and_integrity_checked(tmp_path: Path):
     store = EventStore(tmp_path / "runtime.db")
 
     assert store.integrity_check() == []
-    assert SchemaManager(store.path).inspect().current_version == 10
+    assert SchemaManager(store.path).inspect().current_version == 11
     with sqlite3.connect(store.path) as connection:
         assert [row[0] for row in connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        )] == [10]
+        )] == [11]
         assert connection.execute(
-            "SELECT checksum FROM schema_migrations WHERE version = 10"
-        ).fetchone()[0] == V10_CHECKSUM
+            "SELECT checksum FROM schema_migrations WHERE version = 11"
+        ).fetchone()[0] == V11_CHECKSUM
 
 
 def test_verified_tables_without_migration_history_fail_closed(tmp_path: Path):

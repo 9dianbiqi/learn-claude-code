@@ -590,6 +590,94 @@ class EventStore:
             )
         return checkpoint_id
 
+    def fail_plan_item_and_task(
+        self,
+        task_id: str,
+        plan_item_id: int,
+        messages: list[dict],
+        cursor: dict[str, Any],
+        error: str,
+    ) -> int:
+        """Atomically fail a DAG item and its task after a durable budget boundary."""
+        now = _now()
+        messages_json = _checked_json(messages, MAX_CHECKPOINT_BYTES, "checkpoint messages")
+        cursor_json = _checked_json(cursor, MAX_CHECKPOINT_BYTES, "checkpoint cursor")
+        with self.transaction() as conn:
+            task = conn.execute(
+                "SELECT status, version, checkpoint_id FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise KeyError(f"Task not found: {task_id}")
+            if task["status"] in {"completed", "failed", "aborted"}:
+                return int(task["checkpoint_id"])
+            item = self._plan_call(conn, plan_item_id)
+            if str(item["task_id"]) != task_id:
+                raise InvariantViolation(f"Plan item {plan_item_id} does not belong to task {task_id}")
+            if item["status"] == "completed":
+                raise StaleState(f"Plan item completed before budget failure: {plan_item_id}")
+            conn.execute(
+                "UPDATE tool_calls SET status = 'failed', error = ?, finished_at = ?, version = version + 1 "
+                "WHERE task_id = ? AND status = 'running'",
+                (error, now, task_id),
+            )
+            item_updated = conn.execute(
+                "UPDATE plan_items SET status = 'failed', evidence_hash = NULL, "
+                "version = version + 1, updated_at = ? "
+                "WHERE plan_item_id = ? AND version = ? AND status != 'completed'",
+                (now, plan_item_id, int(item["version"])),
+            )
+            if item_updated.rowcount != 1:
+                raise StaleState(f"Plan item changed during budget failure: {plan_item_id}")
+            conn.execute(
+                "UPDATE plans SET status = 'failed', updated_at = ? WHERE plan_id = ?",
+                (now, item["plan_id"]),
+            )
+            checkpoint = conn.execute(
+                "INSERT INTO checkpoints(task_id, phase, messages_json, cursor_json, created_at) "
+                "VALUES (?, 'failed', ?, ?, ?)",
+                (task_id, messages_json, cursor_json, now),
+            )
+            checkpoint_id = int(checkpoint.lastrowid)
+            task_updated = conn.execute(
+                "UPDATE tasks SET status = 'failed', checkpoint_id = ?, last_error = ?, "
+                "updated_at = ?, version = version + 1 WHERE task_id = ? AND version = ?",
+                (checkpoint_id, error, now, task_id, int(task["version"])),
+            )
+            if task_updated.rowcount != 1:
+                raise StaleState(f"Task changed during budget failure: {task_id}")
+            conn.execute(
+                "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'plan_item_failed', ?, ?)",
+                (
+                    task_id,
+                    _checked_json(
+                        {
+                            "plan_item_id": plan_item_id,
+                            "subtask_id": item["subtask_id"],
+                            "from": item["status"],
+                            "reason": error,
+                            "budget_exhausted": True,
+                        },
+                        MAX_EVENT_PAYLOAD_BYTES,
+                        "event payload",
+                    ),
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'task_failed', ?, ?)",
+                (task_id, _checked_json({"error": error}, MAX_EVENT_PAYLOAD_BYTES, "event payload"), now),
+            )
+            conn.execute(
+                "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'checkpoint_saved', ?, ?)",
+                (
+                    task_id,
+                    _checked_json({"checkpoint_id": checkpoint_id, "phase": "failed"}, MAX_EVENT_PAYLOAD_BYTES, "event payload"),
+                    now,
+                ),
+            )
+        return checkpoint_id
+
     def recover_model_checkpoint(self, task_id: str) -> dict[str, Any] | None:
         """Materialize a successful model response that was durable before its checkpoint."""
         with self.transaction() as conn:
@@ -612,11 +700,19 @@ class EventStore:
             response = _loads(latest["response_json"], {})
             content = list(response.get("content") or [])
             messages = _loads(current["messages_json"], [])
-            if messages and messages[-1].get("role") == "assistant":
+            request = _loads(latest["request_json"], {})
+            if (
+                messages
+                and messages[-1].get("role") == "assistant"
+                and request.get("messages") != messages
+            ):
                 return None
             messages.append({"role": "assistant", "content": content})
             cursor = _loads(current["cursor_json"], {})
             cursor["turn"] = int(latest["turn"])
+            active_subtask_id = request.get("active_subtask_id")
+            if active_subtask_id:
+                cursor["active_subtask_id"] = str(active_subtask_id)
             messages_json = _checked_json(messages, MAX_CHECKPOINT_BYTES, "checkpoint messages")
             cursor_json = _checked_json(cursor, MAX_CHECKPOINT_BYTES, "checkpoint cursor")
             now = _now()
@@ -1089,16 +1185,21 @@ class EventStore:
                     MAX_CHECKPOINT_BYTES,
                     "plan blocked_by",
                 )
+                max_turns = subtask.get("max_turns", 1)
+                if isinstance(max_turns, bool) or not isinstance(max_turns, int) or max_turns < 1:
+                    raise ValueError("plan item max_turns must be a positive integer")
                 conn.execute(
                     "INSERT INTO plan_items(plan_id, subtask_id, description, status, "
-                    "blocked_by_json, verifier_bundle_hash, version, created_at, updated_at) "
-                    "VALUES (?, ?, ?, 'pending', ?, ?, 0, ?, ?)",
+                    "blocked_by_json, verifier_bundle_hash, max_turns, consumed_turns, "
+                    "version, created_at, updated_at) "
+                    "VALUES (?, ?, ?, 'pending', ?, ?, ?, 0, 0, ?, ?)",
                     (
                         plan_id,
                         subtask["subtask_id"],
                         subtask.get("description", ""),
                         blocked_by,
                         subtask.get("verifier_bundle_hash"),
+                        max_turns,
                         now,
                         now,
                     ),
@@ -1110,6 +1211,9 @@ class EventStore:
             "SELECT * FROM plans WHERE task_id = ? AND status = 'active' ORDER BY plan_id DESC LIMIT 1",
             (task_id,),
         )
+        return self._decode_plan(row)
+
+    def _decode_plan(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
         if row is None:
             return None
         plan = dict(row)
@@ -1117,13 +1221,21 @@ class EventStore:
             "SELECT * FROM plan_items WHERE plan_id = ? ORDER BY plan_item_id",
             (plan["plan_id"],),
         )
-        decoded = []
-        for item in items:
-            decoded_item = dict(item)
-            decoded_item["blocked_by"] = _loads(decoded_item.pop("blocked_by_json"), [])
-            decoded.append(decoded_item)
-        plan["items"] = decoded
+        plan["items"] = [self._decode_plan_item(item) for item in items]
         return plan
+
+    @staticmethod
+    def _decode_plan_item(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["blocked_by"] = _loads(item.pop("blocked_by_json"), [])
+        return item
+
+    def get_latest_plan(self, task_id: str) -> dict[str, Any] | None:
+        row = self._fetchone(
+            "SELECT * FROM plans WHERE task_id = ? ORDER BY plan_id DESC LIMIT 1",
+            (task_id,),
+        )
+        return self._decode_plan(row)
 
     def list_plans(self, task_id: str | None = None) -> list[dict[str, Any]]:
         if task_id is None:
@@ -1137,12 +1249,7 @@ class EventStore:
             "SELECT * FROM plan_items WHERE plan_id = ? ORDER BY plan_item_id",
             (plan_id,),
         )
-        result = []
-        for row in rows:
-            item = dict(row)
-            item["blocked_by"] = _loads(item.pop("blocked_by_json"), [])
-            result.append(item)
-        return result
+        return [self._decode_plan_item(row) for row in rows]
 
     def _plan_call(self, conn: sqlite3.Connection, plan_item_id: int) -> sqlite3.Row:
         row = conn.execute(
@@ -1159,18 +1266,26 @@ class EventStore:
                              completion_summary: str | None = None,
                              evidence_hash: str | None = None,
                              event_type: str | None = None,
-                             event_payload: dict[str, Any] | None = None) -> None:
-        conn.execute(
+                             event_payload: dict[str, Any] | None = None,
+                             expected_version: int | None = None) -> None:
+        where = "plan_item_id = ?"
+        params: list[Any] = [
+            new_status,
+            completion_summary,
+            evidence_hash,
+            _now(),
+            plan_item_id,
+        ]
+        if expected_version is not None:
+            where += " AND version = ?"
+            params.append(int(expected_version))
+        updated = conn.execute(
             "UPDATE plan_items SET status = ?, completion_summary = ?, evidence_hash = ?, "
-            "version = version + 1, updated_at = ? WHERE plan_item_id = ?",
-            (
-                new_status,
-                completion_summary,
-                evidence_hash,
-                _now(),
-                plan_item_id,
-            ),
+            f"version = version + 1, updated_at = ? WHERE {where}",
+            params,
         )
+        if expected_version is not None and updated.rowcount != 1:
+            raise StaleState(f"Plan item state changed before {new_status}: {plan_item_id}")
         conn.execute(
             "UPDATE plans SET updated_at = ? WHERE plan_id = ?",
             (_now(), row["plan_id"]),
@@ -1190,26 +1305,110 @@ class EventStore:
                 ),
             )
 
-    def start_plan_item(self, plan_item_id: int) -> None:
+    def start_plan_item(self, plan_item_id: int, *, check_dependencies: bool = True) -> None:
         with self.transaction() as conn:
             row = self._plan_call(conn, plan_item_id)
             if row["status"] not in {"pending", "retryable"}:
                 raise InvariantViolation(
                     f"plan item {plan_item_id} cannot start from {row['status']}"
                 )
-            blockers = _loads(row["blocked_by_json"], [])
-            for blocker in blockers:
-                blocked = conn.execute(
-                    "SELECT status FROM plan_items WHERE plan_id = ? AND subtask_id = ?",
-                    (row["plan_id"], blocker),
-                ).fetchone()
-                if blocked is None or blocked["status"] != "completed":
-                    raise InvariantViolation(
-                        f"plan item {plan_item_id} blocked by uncompleted {blocker}"
-                    )
+            if check_dependencies:
+                blockers = _loads(row["blocked_by_json"], [])
+                for blocker in blockers:
+                    blocked = conn.execute(
+                        "SELECT status FROM plan_items WHERE plan_id = ? AND subtask_id = ?",
+                        (row["plan_id"], blocker),
+                    ).fetchone()
+                    if blocked is None or blocked["status"] != "completed":
+                        raise InvariantViolation(
+                            f"plan item {plan_item_id} blocked by uncompleted {blocker}"
+                        )
             self._set_plan_item_state(
                 conn, plan_item_id, row, "in_progress",
                 event_type="plan_item_started", event_payload={"from": row["status"]},
+                expected_version=int(row["version"]),
+            )
+
+    def plan_item_dependencies_complete(self, plan_item_id: int) -> bool:
+        row = self._fetchone(
+            "SELECT plan_id, blocked_by_json FROM plan_items WHERE plan_item_id = ?",
+            (plan_item_id,),
+        )
+        if row is None:
+            raise KeyError(f"Plan item not found: {plan_item_id}")
+        blockers = _loads(row["blocked_by_json"], [])
+        for blocker in blockers:
+            dependency = self._fetchone(
+                "SELECT status FROM plan_items WHERE plan_id = ? AND subtask_id = ?",
+                (row["plan_id"], blocker),
+            )
+            if dependency is None or dependency["status"] != "completed":
+                return False
+        return True
+
+    def reserve_plan_item_turn(self, plan_item_id: int) -> int | None:
+        """Durably reserve one model-call attempt without ever resetting its budget."""
+        with self.transaction() as conn:
+            row = self._plan_call(conn, plan_item_id)
+            if row["status"] != "in_progress":
+                raise InvariantViolation(
+                    f"plan item {plan_item_id} cannot reserve a turn from {row['status']}"
+                )
+            max_turns = int(row["max_turns"])
+            consumed_turns = int(row["consumed_turns"])
+            if consumed_turns >= max_turns:
+                return None
+            next_consumed = consumed_turns + 1
+            now = _now()
+            updated = conn.execute(
+                "UPDATE plan_items SET consumed_turns = ?, version = version + 1, updated_at = ? "
+                "WHERE plan_item_id = ? AND status = 'in_progress' AND consumed_turns = ? AND version = ?",
+                (next_consumed, now, plan_item_id, consumed_turns, int(row["version"])),
+            )
+            if updated.rowcount != 1:
+                raise StaleState(f"Plan item changed during turn reservation: {plan_item_id}")
+            conn.execute(
+                "UPDATE plans SET updated_at = ? WHERE plan_id = ?",
+                (now, row["plan_id"]),
+            )
+            conn.execute(
+                "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    row["task_id"],
+                    "plan_item_turn_reserved",
+                    _checked_json(
+                        {
+                            "plan_item_id": plan_item_id,
+                            "subtask_id": row["subtask_id"],
+                            "consumed_turns": next_consumed,
+                            "max_turns": max_turns,
+                        },
+                        MAX_EVENT_PAYLOAD_BYTES,
+                        "event payload",
+                    ),
+                    now,
+                ),
+            )
+            return next_consumed
+
+    def return_plan_item_to_progress(self, plan_item_id: int) -> None:
+        """Release a verifier-pending item when its dependencies are no longer ready."""
+        with self.transaction() as conn:
+            row = self._plan_call(conn, plan_item_id)
+            if row["status"] != "verifying":
+                raise InvariantViolation(
+                    f"plan item {plan_item_id} cannot return to progress from {row['status']}"
+                )
+            self._set_plan_item_state(
+                conn,
+                plan_item_id,
+                row,
+                "in_progress",
+                completion_summary=row["completion_summary"],
+                evidence_hash=None,
+                event_type="plan_item_dependency_blocked",
+                event_payload={"from": "verifying"},
+                expected_version=int(row["version"]),
             )
 
     def submit_plan_item_for_verification(self, plan_item_id: int,
@@ -1226,6 +1425,7 @@ class EventStore:
                 completion_summary=completion_summary,
                 evidence_hash=evidence_hash,
                 event_type="plan_item_verifying", event_payload={"from": "in_progress"},
+                expected_version=int(row["version"]),
             )
 
     def verify_plan_item(self, plan_item_id: int, evidence_hash: str | None = None) -> None:
@@ -1262,6 +1462,7 @@ class EventStore:
                 conn, plan_item_id, row, "failed",
                 event_type="plan_item_failed",
                 event_payload={"from": row["status"], "reason": reason},
+                expected_version=int(row["version"]),
             )
 
     def mark_plan_item_retryable(self, plan_item_id: int) -> None:
@@ -1275,26 +1476,32 @@ class EventStore:
                 conn, plan_item_id, row, "retryable",
                 event_type="plan_item_retryable",
                 event_payload={"from": "failed"},
+                expected_version=int(row["version"]),
             )
 
     def get_plan_item(self, task_id: str, subtask_id: str) -> dict[str, Any] | None:
         row = self._fetchone(
             "SELECT i.*, p.task_id FROM plan_items i "
             "JOIN plans p ON p.plan_id = i.plan_id "
-            "WHERE p.task_id = ? AND p.status IN ('active', 'completed') AND i.subtask_id = ? "
+            "WHERE p.task_id = ? AND p.status IN ('active', 'completed', 'failed') AND i.subtask_id = ? "
             "ORDER BY i.plan_item_id DESC LIMIT 1",
             (task_id, subtask_id),
         )
         if row is None:
             return None
-        item = dict(row)
-        item["blocked_by"] = _loads(item.pop("blocked_by_json"), [])
-        return item
+        return self._decode_plan_item(row)
 
     def has_verified_subtask(self, task_id: str) -> bool:
         row = self._fetchone(
             "SELECT 1 FROM plan_items i JOIN plans p ON p.plan_id = i.plan_id "
             "WHERE p.task_id = ? AND i.verifier_bundle_hash IS NOT NULL LIMIT 1",
+            (task_id,),
+        )
+        return row is not None
+
+    def has_frozen_dag(self, task_id: str) -> bool:
+        row = self._fetchone(
+            "SELECT 1 FROM plans WHERE task_id = ? AND dag_hash IS NOT NULL LIMIT 1",
             (task_id,),
         )
         return row is not None
@@ -1429,8 +1636,8 @@ class EventStore:
             updated = conn.execute(
                 "UPDATE plan_items SET status = 'retryable', completion_summary = ?, "
                 "evidence_hash = NULL, version = version + 1, updated_at = ? "
-                "WHERE plan_item_id = ? AND status = 'verifying'",
-                (completion_summary, now, plan_item_id),
+                "WHERE plan_item_id = ? AND status = 'verifying' AND version = ?",
+                (completion_summary, now, plan_item_id, int(item["version"])),
             )
             if updated.rowcount != 1:
                 raise StaleState(f"Plan item changed during verifier recording: {plan_item_id}")
@@ -1478,6 +1685,7 @@ class EventStore:
         verifier_implementation_hash: str,
         execution_checkpoint_id: int,
         fault_injector: Callable[..., None] | None = None,
+        complete_task: bool = True,
     ) -> dict[str, Any]:
         invalid_paths = [
             entry["path"]
@@ -1500,7 +1708,7 @@ class EventStore:
             if item["verifier_bundle_hash"] != verifier_bundle_hash:
                 raise InvariantViolation(f"Verifier bundle hash mismatch for plan item {plan_item_id}")
             task = conn.execute(
-                "SELECT status FROM tasks WHERE task_id = ?", (task_id,)
+                "SELECT status, version FROM tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
             if task is None:
                 raise KeyError(f"Task not found: {task_id}")
@@ -1570,8 +1778,8 @@ class EventStore:
             updated_item = conn.execute(
                 "UPDATE plan_items SET status = 'completed', completion_summary = ?, "
                 "evidence_hash = ?, version = version + 1, updated_at = ? "
-                "WHERE plan_item_id = ? AND status = 'verifying'",
-                (completion_summary, evidence_hash, now, plan_item_id),
+                "WHERE plan_item_id = ? AND status = 'verifying' AND version = ?",
+                (completion_summary, evidence_hash, now, plan_item_id, int(item["version"])),
             )
             if updated_item.rowcount != 1:
                 raise StaleState(f"Plan item changed during verified completion: {plan_item_id}")
@@ -1579,27 +1787,40 @@ class EventStore:
                 "SELECT COUNT(*) FROM plan_items WHERE plan_id = ? AND status != 'completed'",
                 (item["plan_id"],),
             ).fetchone()[0]
-            conn.execute(
-                "UPDATE plans SET status = CASE WHEN ? = 0 THEN 'completed' ELSE status END, "
-                "updated_at = ? WHERE plan_id = ?",
-                (remaining, now, item["plan_id"]),
-            )
-            updated_checkpoint = conn.execute(
-                "UPDATE checkpoints SET phase = 'completed' "
-                "WHERE checkpoint_id = ? AND task_id = ?",
-                (execution_checkpoint_id, task_id),
-            )
-            if updated_checkpoint.rowcount != 1:
-                raise StaleState(
-                    f"Execution checkpoint changed during verified completion: {execution_checkpoint_id}"
+            if complete_task:
+                if remaining != 0:
+                    raise InvariantViolation(
+                        f"Task completion requested with {remaining} plan item(s) remaining"
+                    )
+                conn.execute(
+                    "UPDATE plans SET status = 'completed', updated_at = ? WHERE plan_id = ?",
+                    (now, item["plan_id"]),
                 )
-            updated_task = conn.execute(
-                "UPDATE tasks SET status = 'completed', checkpoint_id = ?, last_error = NULL, "
-                "updated_at = ?, version = version + 1 WHERE task_id = ?",
-                (execution_checkpoint_id, now, task_id),
-            )
-            if updated_task.rowcount != 1:
-                raise StaleState(f"Task changed during verified completion: {task_id}")
+                updated_checkpoint = conn.execute(
+                    "UPDATE checkpoints SET phase = 'completed' "
+                    "WHERE checkpoint_id = ? AND task_id = ?",
+                    (execution_checkpoint_id, task_id),
+                )
+                if updated_checkpoint.rowcount != 1:
+                    raise StaleState(
+                        f"Execution checkpoint changed during verified completion: {execution_checkpoint_id}"
+                    )
+                updated_task = conn.execute(
+                    "UPDATE tasks SET status = 'completed', checkpoint_id = ?, last_error = NULL, "
+                    "updated_at = ?, version = version + 1 WHERE task_id = ? AND version = ?",
+                    (execution_checkpoint_id, now, task_id, int(task["version"])),
+                )
+                if updated_task.rowcount != 1:
+                    raise StaleState(f"Task changed during verified completion: {task_id}")
+            else:
+                if remaining == 0:
+                    raise InvariantViolation(
+                        "Intermediate verified completion cannot finish the plan"
+                    )
+                conn.execute(
+                    "UPDATE plans SET status = 'active', updated_at = ? WHERE plan_id = ?",
+                    (now, item["plan_id"]),
+                )
 
             run_payload = {
                 "plan_item_id": plan_item_id,
@@ -1632,22 +1853,21 @@ class EventStore:
                         "execution_checkpoint_id": execution_checkpoint_id,
                     },
                 ),
-                (
-                    "task_completed",
-                    {"final_text": completion_summary},
-                ),
-                (
-                    "verified_subtask_committed",
-                    run_payload,
-                ),
-                (
-                    "checkpoint_saved",
-                    {
-                        "checkpoint_id": execution_checkpoint_id,
-                        "phase": "completed",
-                    },
-                ),
             )
+            if complete_task:
+                event_rows += (
+                    ("task_completed", {"final_text": completion_summary}),
+                    ("verified_subtask_committed", run_payload),
+                    (
+                        "checkpoint_saved",
+                        {
+                            "checkpoint_id": execution_checkpoint_id,
+                            "phase": "completed",
+                        },
+                    ),
+                )
+            else:
+                event_rows += (("verified_subtask_committed", run_payload),)
             for event_type, payload in event_rows:
                 conn.execute(
                     "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
@@ -4529,17 +4749,29 @@ class EventStore:
         }
         if task_id is not None:
             items = conn.execute(
-                "SELECT i.*, p.task_id FROM plan_items i JOIN plans p ON p.plan_id = i.plan_id "
+                "SELECT i.*, p.task_id, p.dag_hash AS plan_dag_hash "
+                "FROM plan_items i JOIN plans p ON p.plan_id = i.plan_id "
                 "WHERE p.task_id = ?",
                 (task_id,),
             ).fetchall()
         else:
             items = conn.execute(
-                "SELECT i.*, p.task_id FROM plan_items i JOIN plans p ON p.plan_id = i.plan_id"
+                "SELECT i.*, p.task_id, p.dag_hash AS plan_dag_hash "
+                "FROM plan_items i JOIN plans p ON p.plan_id = i.plan_id"
             ).fetchall()
         deps_by_item: dict[int, list[Any]] = {}
         for item in items:
             deps_by_item[int(item["plan_item_id"])] = _loads(item["blocked_by_json"], [])
+            try:
+                max_turns = int(item["max_turns"])
+                consumed_turns = int(item["consumed_turns"])
+                if max_turns < 1 or consumed_turns < 0 or consumed_turns > max_turns:
+                    violations.append(
+                        f"plan_item {item['plan_item_id']}: turn count "
+                        f"{consumed_turns} is outside 0..{max_turns}"
+                    )
+            except (KeyError, TypeError, ValueError):
+                violations.append(f"plan_item {item['plan_item_id']}: invalid turn budget")
             if item["status"] not in valid_statuses:
                 violations.append(
                     f"plan_item {item['plan_item_id']}: invalid status {item['status']!r}"
@@ -4561,8 +4793,14 @@ class EventStore:
                     violations.append(
                         f"plan_item {item['plan_item_id']}: blocked_by references missing subtask {blocker!r}"
                     )
-                elif item["status"] in {"in_progress", "verifying", "completed", "retryable"} \
-                        and dep["status"] != "completed":
+                elif (
+                    item["status"] in {"in_progress", "verifying", "completed", "retryable"}
+                    and dep["status"] != "completed"
+                    and not (
+                        item["plan_dag_hash"] is not None
+                        and item["status"] in {"in_progress", "verifying", "retryable"}
+                    )
+                ):
                     violations.append(
                         f"plan_item {item['plan_item_id']}: blocked_by {blocker!r} is not completed"
                     )

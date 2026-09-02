@@ -90,6 +90,7 @@ class ContextProjector:
     @staticmethod
     def _select_active_subtask(plan: dict[str, Any]) -> dict[str, Any] | None:
         item_by_subtask = {item["subtask_id"]: item for item in plan["items"]}
+        frozen_dag = plan.get("dag_hash") is not None
 
         def unblocked(item: dict[str, Any]) -> bool:
             return all(
@@ -97,14 +98,18 @@ class ContextProjector:
                 for blocker in item.get("blocked_by", [])
             )
 
-        candidates = [
-            item for item in plan["items"]
-            if item["status"] not in {"completed", "failed"} and unblocked(item)
-        ]
-        for preferred in ("in_progress", "verifying", "retryable", "pending"):
-            for item in candidates:
-                if item["status"] == preferred:
-                    return item
+        preference = (
+            ("verifying", "in_progress", "retryable", "pending")
+            if frozen_dag
+            else ("in_progress", "verifying", "retryable", "pending")
+        )
+        for preferred in preference:
+            for item in plan["items"]:
+                if item["status"] != preferred:
+                    continue
+                if (not frozen_dag or preferred == "pending") and not unblocked(item):
+                    continue
+                return item
         return None
 
     def _recent_review_reasons(self, task_id: str) -> list[str]:

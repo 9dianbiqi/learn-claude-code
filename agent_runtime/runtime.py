@@ -23,6 +23,7 @@ from .models import (
     VerifierContext,
     VerifierResult,
     VerifiedSubtaskConfig,
+    VerifiedSubtaskDAGConfig,
     is_valid_sha256,
     normalize_evidence_path,
 )
@@ -93,6 +94,12 @@ INTERNAL_TOOL_SCHEMAS = {
 
 
 class Runtime:
+    _DAG_BLOCKED_FEEDBACK = (
+        "The current subtask is blocked by incomplete dependencies. Continue working "
+        "on the current subtask and emit SUBTASK_COMPLETE only after all dependencies "
+        "are complete."
+    )
+
     def __init__(self, repo_root: str | Path, model: Any, store: EventStore | None = None,
                  model_name: str | None = None, owner_id: str | None = None,
                  fault_injector: Callable[..., None] | None = None,
@@ -100,7 +107,10 @@ class Runtime:
                  interactive: bool = False, policy_path: str | Path | None = None,
                  lease_ttl: float = 300.0,
                  tool_scope: set[str] | None = None,
-                 verified_subtask: VerifiedSubtaskConfig | None = None):
+                 verified_subtask: VerifiedSubtaskConfig | None = None,
+                 verified_subtask_dag: VerifiedSubtaskDAGConfig | None = None):
+        if verified_subtask is not None and verified_subtask_dag is not None:
+            raise ValueError("verified_subtask and verified_subtask_dag are mutually exclusive")
         self.repo_root = Path(repo_root).resolve()
         self.model = model
         self.model_name = model_name or getattr(model, "name", "unknown")
@@ -121,6 +131,11 @@ class Runtime:
         self._active_subagent_run_id: str | None = None
         self._subagent_fencing: dict[str, str] = {}
         self._subagent_tool_scopes: dict[str, set[str] | None] = {}
+        self.verified_subtask_dag = verified_subtask_dag
+        self._dag_nodes = (
+            {node.subtask_id: node for node in verified_subtask_dag.nodes}
+            if verified_subtask_dag is not None else {}
+        )
         self.tools = ToolExecutor(self.repo_root)
         if float(self.tools.shell_timeout) >= lease_ttl:
             self.tools.shell_timeout = max(0.01, float(lease_ttl) * 0.8)
@@ -175,19 +190,148 @@ class Runtime:
             "SUBTASK_COMPLETE on its own line when the completion criteria are satisfied."
         )
 
+    def _uses_verified_subtasks(self) -> bool:
+        return self.verified_subtask is not None or self.verified_subtask_dag is not None
+
+    def _assert_dag_config(self, task_id: str) -> dict[str, Any]:
+        if self.verified_subtask_dag is None:
+            raise RuntimeError(
+                f"Task {task_id} requires its frozen verified-subtask DAG configuration to resume"
+            )
+        plan = self.store.get_latest_plan(task_id)
+        if plan is None or plan.get("dag_hash") is None:
+            raise RuntimeError(f"Task {task_id} does not use a frozen verified-subtask DAG")
+        if plan["dag_hash"] != self.verified_subtask_dag.dag_hash:
+            raise RuntimeError(f"DAG hash mismatch for task {task_id}")
+        items = plan.get("items", [])
+        nodes = self.verified_subtask_dag.nodes
+        if len(items) != len(nodes):
+            raise RuntimeError(f"DAG configuration mismatch for task {task_id}")
+        for item, node in zip(items, nodes):
+            try:
+                stored_max_turns = int(item["max_turns"])
+            except (KeyError, TypeError, ValueError):
+                stored_max_turns = None
+            if (
+                item.get("subtask_id") != node.subtask_id
+                or tuple(item.get("blocked_by", [])) != node.blocked_by
+                or item.get("verifier_bundle_hash") != node.verifier_bundle_hash
+                or stored_max_turns != node.max_turns
+            ):
+                raise RuntimeError(f"DAG configuration mismatch for task {task_id}")
+        return plan
+
+    def _select_dag_item(
+        self,
+        task_id: str,
+        *,
+        start_selected_item: bool = True,
+    ) -> dict[str, Any] | None:
+        plan = self.store.get_active_plan(task_id)
+        if plan is None:
+            return None
+        items = plan["items"]
+        by_id = {item["subtask_id"]: item for item in items}
+        for status in ("verifying", "in_progress", "retryable"):
+            candidates = [item for item in items if item["status"] == status]
+            if candidates:
+                item = candidates[0]
+                if (
+                    status == "retryable"
+                    and start_selected_item
+                    and self.store.plan_item_dependencies_complete(
+                        int(item["plan_item_id"])
+                    )
+                ):
+                    self.store.start_plan_item(int(item["plan_item_id"]))
+                    return self.store.get_plan_item(task_id, str(item["subtask_id"]))
+                return item
+        for item in items:
+            if item["status"] != "pending":
+                continue
+            ready = all(
+                dependency in by_id and by_id[dependency]["status"] == "completed"
+                for dependency in item.get("blocked_by", [])
+            )
+            if not ready:
+                continue
+            if start_selected_item:
+                self.store.start_plan_item(int(item["plan_item_id"]))
+                return self.store.get_plan_item(task_id, str(item["subtask_id"]))
+            return item
+        return None
+
+    def _dag_config_for_item(self, item: dict[str, Any]) -> VerifiedSubtaskConfig:
+        try:
+            return self._dag_nodes[str(item["subtask_id"])]
+        except KeyError as exc:
+            raise InvariantViolation(
+                f"Plan item has no frozen DAG configuration: {item.get('subtask_id')!r}"
+            ) from exc
+
+    def _dag_budget_error(self, item: dict[str, Any]) -> str:
+        return (
+            f"Subtask {item['subtask_id']} exhausted its maximum turn budget "
+            f"(max_turns={item['max_turns']}) without a valid completion marker"
+        )
+
+    def _fail_dag_budget(
+        self,
+        task_id: str,
+        item: dict[str, Any],
+        messages: list[dict],
+        turn: int,
+    ) -> RunResult:
+        error = self._dag_budget_error(item)
+        self.store.fail_plan_item_and_task(
+            task_id,
+            int(item["plan_item_id"]),
+            messages,
+            {"turn": turn, "active_subtask_id": item["subtask_id"]},
+            error,
+        )
+        return RunResult(task_id, "failed", error=error)
+
+    def _handle_blocked_dag_marker(
+        self,
+        task_id: str,
+        item: dict[str, Any],
+        messages: list[dict],
+        turn: int,
+    ) -> RunResult | None:
+        if item["status"] == "verifying":
+            self.store.return_plan_item_to_progress(int(item["plan_item_id"]))
+            refreshed = self.store.get_plan_item(task_id, str(item["subtask_id"]))
+            if refreshed is not None:
+                item = refreshed
+        self._append_verified_feedback(
+            task_id,
+            messages,
+            turn,
+            self._DAG_BLOCKED_FEEDBACK,
+            active_subtask_id=str(item["subtask_id"]),
+        )
+        if int(item["consumed_turns"]) >= int(item["max_turns"]):
+            return self._fail_dag_budget(task_id, item, messages, turn)
+        return None
+
     def _append_verified_feedback(
         self,
         task_id: str,
         messages: list[dict],
         turn: int,
         feedback: str,
+        active_subtask_id: str | None = None,
     ) -> None:
         messages.append({"role": "user", "content": feedback})
+        cursor: dict[str, Any] = {"turn": turn + 1}
+        if active_subtask_id is not None:
+            cursor["active_subtask_id"] = active_subtask_id
         self.store.save_checkpoint(
             task_id,
             "tool_results_appended",
             messages,
-            {"turn": turn + 1},
+            cursor,
         )
 
     def _handle_verified_marker(
@@ -197,20 +341,47 @@ class Runtime:
         turn: int,
         execution_checkpoint_id: int,
         completion_summary: str,
+        marker_subtask_id: str | None = None,
     ) -> RunResult | None:
-        config = self.verified_subtask
-        if config is None:
-            return None
-        item = self._verified_plan_item(task_id)
+        if self.verified_subtask_dag is not None:
+            item = self._select_dag_item(task_id)
+            if item is None:
+                return None
+            if marker_subtask_id is not None and item["subtask_id"] != marker_subtask_id:
+                return None
+            if item["status"] == "completed":
+                return None
+            config = self._dag_config_for_item(item)
+        else:
+            config = self.verified_subtask
+            if config is None:
+                return None
+            item = self._verified_plan_item(task_id)
+        if self.verified_subtask_dag is not None and not self.store.plan_item_dependencies_complete(
+            int(item["plan_item_id"])
+        ):
+            return self._handle_blocked_dag_marker(task_id, item, messages, turn)
         if item["status"] == "retryable":
             self.store.start_plan_item(int(item["plan_item_id"]))
-            item = self._verified_plan_item(task_id)
+            item = (
+                self.store.get_plan_item(task_id, str(item["subtask_id"]))
+                if self.verified_subtask_dag is not None
+                else self._verified_plan_item(task_id)
+            )
         if item["status"] == "in_progress":
             self.store.submit_plan_item_for_verification(
                 int(item["plan_item_id"]),
                 completion_summary=completion_summary,
             )
-            item = self._verified_plan_item(task_id)
+            item = (
+                self.store.get_plan_item(task_id, str(item["subtask_id"]))
+                if self.verified_subtask_dag is not None
+                else self._verified_plan_item(task_id)
+            )
+        if self.verified_subtask_dag is not None and not self.store.plan_item_dependencies_complete(
+            int(item["plan_item_id"])
+        ):
+            return self._handle_blocked_dag_marker(task_id, item, messages, turn)
         if item["status"] == "completed":
             completed = self.store.get_completed_result(task_id)
             return RunResult(task_id, "completed", completed["final_text"])
@@ -281,6 +452,11 @@ class Runtime:
                 plan_item_id=int(item["plan_item_id"]),
                 execution_checkpoint_id=execution_checkpoint_id,
             )
+            is_final = self.verified_subtask_dag is None or not any(
+                other["status"] != "completed"
+                for other in self.store.get_active_plan(task_id)["items"]
+                if int(other["plan_item_id"]) != int(item["plan_item_id"])
+            )
             self.store.commit_verified_subtask(
                 task_id=task_id,
                 plan_item_id=int(item["plan_item_id"]),
@@ -294,9 +470,12 @@ class Runtime:
                 verifier_bundle_hash=config.verifier_bundle_hash,
                 verifier_implementation_hash=config.verifier_implementation_hash,
                 execution_checkpoint_id=execution_checkpoint_id,
+                complete_task=is_final,
                 fault_injector=self._fault,
             )
-            return RunResult(task_id, "completed", completion_summary)
+            if is_final:
+                return RunResult(task_id, "completed", completion_summary)
+            return None
 
         self.store.record_non_authoritative_verifier_run(
             task_id=task_id,
@@ -318,7 +497,14 @@ class Runtime:
             messages,
             turn,
             self._verifier_feedback(verifier_result.status, verifier_result.summary),
+            active_subtask_id=(
+                str(item["subtask_id"]) if self.verified_subtask_dag is not None else None
+            ),
         )
+        if self.verified_subtask_dag is not None and int(item["consumed_turns"]) >= int(
+            item["max_turns"]
+        ):
+            return self._fail_dag_budget(task_id, item, messages, turn)
         self.store.start_plan_item(int(item["plan_item_id"]))
         return None
 
@@ -344,10 +530,35 @@ class Runtime:
                 }],
             )
             self.store.start_plan_item(self.store.list_plan_items(plan_id)[0]["plan_item_id"])
+        elif self.verified_subtask_dag is not None:
+            self.store.create_plan(
+                task_id,
+                [
+                    {
+                        "subtask_id": node.subtask_id,
+                        "description": node.description,
+                        "blocked_by": list(node.blocked_by),
+                        "verifier_bundle_hash": node.verifier_bundle_hash,
+                        "max_turns": node.max_turns,
+                    }
+                    for node in self.verified_subtask_dag.nodes
+                ],
+                dag_hash=self.verified_subtask_dag.dag_hash,
+            )
         return self._run_task(task_id, messages, turn=0)
 
     def resume(self, task_id: str) -> RunResult:
-        if self.verified_subtask is not None or self.store.has_verified_subtask(task_id):
+        latest_plan = self.store.get_latest_plan(task_id)
+        if self.verified_subtask_dag is not None or (
+            latest_plan is not None and latest_plan.get("dag_hash") is not None
+        ):
+            self._assert_dag_config(task_id)
+            task = self.store.get_task(task_id)
+            if task["status"] == "completed":
+                self.store.assert_invariants(task_id)
+                completed = self.store.get_completed_result(task_id)
+                return RunResult(task_id, "completed", completed["final_text"])
+        elif self.verified_subtask is not None or self.store.has_verified_subtask(task_id):
             self._assert_verified_subtask_config(task_id)
             task = self.store.get_task(task_id)
             if task["status"] == "completed":
@@ -357,6 +568,9 @@ class Runtime:
         return self._resume_task(task_id, lease_acquired=False)
 
     def _assert_verified_subtask_config(self, task_id: str) -> dict[str, Any]:
+        latest_plan = self.store.get_latest_plan(task_id)
+        if latest_plan is not None and latest_plan.get("dag_hash") is not None:
+            raise RuntimeError(f"Task {task_id} requires its frozen verified-subtask DAG configuration")
         if self.verified_subtask is None:
             raise RuntimeError(
                 f"Task {task_id} requires its frozen verified-subtask configuration to resume"
@@ -543,6 +757,7 @@ class Runtime:
                   lease_acquired: bool = False) -> RunResult:
         recovered_completion_text: str | None = None
         verified_marker_checkpoint_id: int | None = None
+        verified_marker_subtask_id: str | None = None
         self._pending_review = None
         previous_active_task = self._active_task_id
         self._active_task_id = task_id
@@ -568,9 +783,13 @@ class Runtime:
             } else []
             if phase == "model_responded" and not pending_calls:
                 last_text = self._last_text(messages)
-                if self.verified_subtask is not None and self._has_completion_marker(last_text):
+                if self._uses_verified_subtasks() and self._has_completion_marker(last_text):
                     verified_marker_checkpoint_id = int(current_checkpoint["checkpoint_id"])
-                elif self.verified_subtask is None:
+                    if self.verified_subtask_dag is not None:
+                        verified_marker_subtask_id = current_checkpoint["cursor"].get(
+                            "active_subtask_id"
+                        )
+                elif not self._uses_verified_subtasks():
                     recovered_completion_text = last_text
         try:
             if resume_recovery and self.store.abandon_open_model_calls(task_id):
@@ -606,8 +825,10 @@ class Runtime:
                         turn,
                         verified_marker_checkpoint_id,
                         self._completion_summary(marker_text),
+                        marker_subtask_id=verified_marker_subtask_id,
                     )
                     verified_marker_checkpoint_id = None
+                    verified_marker_subtask_id = None
                     if marker_result is not None:
                         return marker_result
                     turn += 1
@@ -619,10 +840,45 @@ class Runtime:
                     turn += 1
                     continue
 
+                current_item: dict[str, Any] | None = None
                 if self.verified_subtask is not None:
                     current_item = self._verified_plan_item(task_id)
                     if current_item["status"] == "retryable":
                         self.store.start_plan_item(int(current_item["plan_item_id"]))
+                        current_item = self._verified_plan_item(task_id)
+                elif self.verified_subtask_dag is not None:
+                    current_item = self._select_dag_item(task_id)
+                    if current_item is None:
+                        raise InvariantViolation(
+                            f"Frozen DAG for task {task_id} has no executable subtask"
+                        )
+                    if current_item["status"] == "retryable" and not self.store.plan_item_dependencies_complete(
+                        int(current_item["plan_item_id"])
+                    ):
+                        self.store.start_plan_item(
+                            int(current_item["plan_item_id"]),
+                            check_dependencies=False,
+                        )
+                        current_item = self.store.get_plan_item(
+                            task_id, str(current_item["subtask_id"])
+                        )
+                        if current_item is None:
+                            raise InvariantViolation(
+                                f"Frozen DAG subtask disappeared: {task_id}"
+                            )
+                        blocked_result = self._handle_blocked_dag_marker(
+                            task_id, current_item, messages, turn
+                        )
+                        if blocked_result is not None:
+                            return blocked_result
+                        turn += 1
+                        continue
+                    if current_item["status"] != "in_progress":
+                        raise InvariantViolation(
+                            f"Frozen DAG subtask {current_item['subtask_id']} is not in progress"
+                        )
+                    if int(current_item["consumed_turns"]) >= int(current_item["max_turns"]):
+                        return self._fail_dag_budget(task_id, current_item, messages, turn)
 
                 checkpoint_id = self.store.get_task(task_id)["checkpoint_id"]
                 projection = self.projector.project(task_id, messages, checkpoint_id)
@@ -634,6 +890,14 @@ class Runtime:
                 ]
                 tool_schemas.extend(INTERNAL_TOOL_SCHEMAS.values())
                 request = {"messages": messages, "tools": tool_schemas}
+                if self.verified_subtask_dag is not None and current_item is not None:
+                    request["active_subtask_id"] = current_item["subtask_id"]
+                    reserved_turn = self.store.reserve_plan_item_turn(
+                        int(current_item["plan_item_id"])
+                    )
+                    if reserved_turn is None:
+                        return self._fail_dag_budget(task_id, current_item, messages, turn)
+                    current_item = {**current_item, "consumed_turns": reserved_turn}
                 model_call_id = self.store.create_model_call(
                     task_id,
                     turn,
@@ -668,22 +932,37 @@ class Runtime:
                 })
                 messages.append({"role": "assistant", "content": response.content})
                 self._fault("after_model_response", task_id=task_id, turn=turn)
+                checkpoint_cursor: dict[str, Any] = {"turn": turn}
+                if self.verified_subtask_dag is not None and current_item is not None:
+                    checkpoint_cursor["active_subtask_id"] = current_item["subtask_id"]
                 execution_checkpoint_id = self.store.save_checkpoint(
-                    task_id, "model_responded", messages, {"turn": turn}
+                    task_id, "model_responded", messages, checkpoint_cursor
                 )
 
                 if (
-                    self.verified_subtask is not None
+                    self._uses_verified_subtasks()
                     and response.tool_calls
                     and self._has_completion_marker(response.text)
                 ):
                     error = "Completion marker cannot be combined with tool calls"
-                    self.store.fail_task(task_id, messages, {"turn": turn}, error)
+                    if self.verified_subtask_dag is not None and current_item is not None:
+                        self.store.fail_plan_item_and_task(
+                            task_id,
+                            int(current_item["plan_item_id"]),
+                            messages,
+                            {
+                                "turn": turn,
+                                "active_subtask_id": current_item["subtask_id"],
+                            },
+                            error,
+                        )
+                    else:
+                        self.store.fail_task(task_id, messages, {"turn": turn}, error)
                     return RunResult(task_id, "failed", error=error)
 
                 if not response.tool_calls:
                     text = response.text
-                    if self.verified_subtask is not None:
+                    if self._uses_verified_subtasks():
                         if self._has_completion_marker(text):
                             marker_result = self._handle_verified_marker(
                                 task_id,
@@ -691,17 +970,31 @@ class Runtime:
                                 turn,
                                 execution_checkpoint_id,
                                 self._completion_summary(text),
+                                marker_subtask_id=(
+                                    str(current_item["subtask_id"])
+                                    if self.verified_subtask_dag is not None and current_item is not None
+                                    else None
+                                ),
                             )
                             if marker_result is not None:
                                 return marker_result
                             turn += 1
                             continue
+                        if self.verified_subtask_dag is not None and current_item is not None and int(
+                            current_item["consumed_turns"]
+                        ) >= int(current_item["max_turns"]):
+                            return self._fail_dag_budget(task_id, current_item, messages, turn)
                         self._append_verified_feedback(
                             task_id,
                             messages,
                             turn,
                             "The subtask is not complete. Emit SUBTASK_COMPLETE on its own line "
                             "after satisfying the completion criteria.",
+                            active_subtask_id=(
+                                str(current_item["subtask_id"])
+                                if self.verified_subtask_dag is not None and current_item is not None
+                                else None
+                            ),
                         )
                         turn += 1
                         continue

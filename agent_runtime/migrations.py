@@ -10,14 +10,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 10
-MIGRATION_NAME = "v10_verified_subtask"
+SCHEMA_VERSION = 11
+MIGRATION_NAME = "v11_frozen_dag"
 V5_MIGRATION_NAME = "v5_effect_ledger"
 V6_MIGRATION_NAME = "v6_durable_context"
 V7_MIGRATION_NAME = "v7_background_jobs"
 V8_MIGRATION_NAME = "v8_tool_registry_mcp"
 V9_MIGRATION_NAME = "v9_subagents_mailbox"
 V10_MIGRATION_NAME = "v10_verified_subtask"
+V11_MIGRATION_NAME = "v11_frozen_dag"
 MAX_EVENT_PAYLOAD_BYTES = 1 * 1024 * 1024
 
 _TASK_STATUSES = frozenset({
@@ -735,6 +736,18 @@ _V10_MIGRATION_SOURCE = "\n".join(
 V10_CHECKSUM = _sha256_text(_V10_MIGRATION_SOURCE)
 
 
+_V11_ADDITIONS = (
+    "ALTER TABLE plan_items ADD COLUMN max_turns INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE plan_items ADD COLUMN consumed_turns INTEGER NOT NULL DEFAULT 0",
+)
+
+_V11_MIGRATION_SOURCE = "\n".join(
+    [_V10_MIGRATION_SOURCE.strip()]
+    + [statement.strip() for statement in _V11_ADDITIONS]
+)
+V11_CHECKSUM = _sha256_text(_V11_MIGRATION_SOURCE)
+
+
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in columns:
@@ -1305,6 +1318,11 @@ def _apply_v10_verified_subtask(conn: sqlite3.Connection) -> None:
     _execute_all(conn, _V10_ADDITIONS[1:])
 
 
+def _apply_v11_frozen_dag(conn: sqlite3.Connection) -> None:
+    _ensure_column(conn, "plan_items", "max_turns", "INTEGER NOT NULL DEFAULT 1")
+    _ensure_column(conn, "plan_items", "consumed_turns", "INTEGER NOT NULL DEFAULT 0")
+
+
 def _create_latest_schema(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys=ON")
     _execute_all(conn, _BASE_SCHEMA)
@@ -1313,6 +1331,7 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
     _apply_v8_tool_registry(conn)
     _apply_v9_subagents_mailbox(conn)
     _apply_v10_verified_subtask(conn)
+    _apply_v11_frozen_dag(conn)
     row = conn.execute("SELECT 1 FROM schema_migrations WHERE version = ?", (SCHEMA_VERSION,)).fetchone()
     if row is None:
         conn.execute(
@@ -1321,7 +1340,7 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
                 version, name, checksum, applied_at, duration_ms, backup_filename, backup_sha256
             ) VALUES (?, ?, ?, ?, ?, NULL, NULL)
             """,
-            (SCHEMA_VERSION, MIGRATION_NAME, V10_CHECKSUM, _now(), 0.0),
+            (SCHEMA_VERSION, MIGRATION_NAME, V11_CHECKSUM, _now(), 0.0),
         )
 
 
@@ -1331,6 +1350,7 @@ V7_MIGRATION = Migration(7, V7_MIGRATION_NAME, V7_CHECKSUM, _apply_v7_background
 V8_MIGRATION = Migration(8, V8_MIGRATION_NAME, V8_CHECKSUM, _apply_v8_tool_registry)
 V9_MIGRATION = Migration(9, V9_MIGRATION_NAME, V9_CHECKSUM, _apply_v9_subagents_mailbox)
 V10_MIGRATION = Migration(10, V10_MIGRATION_NAME, V10_CHECKSUM, _apply_v10_verified_subtask)
+V11_MIGRATION = Migration(11, V11_MIGRATION_NAME, V11_CHECKSUM, _apply_v11_frozen_dag)
 
 
 class SchemaManager:
@@ -1364,6 +1384,7 @@ class SchemaManager:
             V8_MIGRATION,
             V9_MIGRATION,
             V10_MIGRATION,
+            V11_MIGRATION,
         )
 
     def _connect(self, *, read_only: bool = False) -> sqlite3.Connection:
@@ -1425,7 +1446,7 @@ class SchemaManager:
             if not {"name", "checksum"} <= columns:
                 raise MigrationValidationError("schema_migrations is missing migration audit columns")
             latest = next(row for row in rows if int(row["version"]) == SCHEMA_VERSION)
-            if str(latest["name"]) != MIGRATION_NAME or str(latest["checksum"]) != V10_CHECKSUM:
+            if str(latest["name"]) != MIGRATION_NAME or str(latest["checksum"]) != V11_CHECKSUM:
                 raise MigrationChecksumMismatch(
                     f"migration checksum mismatch for v{SCHEMA_VERSION}: "
                     f"{latest['name']!r}/{latest['checksum']!r}"
@@ -1474,7 +1495,8 @@ class SchemaManager:
                 "plan_items": {
                     "plan_item_id", "plan_id", "subtask_id", "description", "status",
                     "blocked_by_json", "completion_summary", "evidence_hash", "version",
-                    "created_at", "updated_at", "verifier_bundle_hash",
+                    "created_at", "updated_at", "verifier_bundle_hash", "max_turns",
+                    "consumed_turns",
                 },
                 "agent_jobs": {
                     "job_id", "task_id", "repo_root", "lane_id", "kind", "payload_json",
@@ -1835,6 +1857,8 @@ class SchemaManager:
                 _apply_v9_subagents_mailbox(conn)
             if 10 in expected_versions:
                 _apply_v10_verified_subtask(conn)
+            if 11 in expected_versions:
+                _apply_v11_frozen_dag(conn)
 
             duration_ms = (time.perf_counter() - started) * 1000.0
             for migration in pending:
@@ -1916,4 +1940,5 @@ __all__ = [
     "V8_CHECKSUM",
     "V9_CHECKSUM",
     "V10_CHECKSUM",
+    "V11_CHECKSUM",
 ]
