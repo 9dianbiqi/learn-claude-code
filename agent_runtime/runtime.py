@@ -32,6 +32,7 @@ from .store import EffectBlocked, EventStore, InvariantViolation, LeaseLost, Sta
 from .tools import FileConflict, ShellResult, ToolExecutor
 from .tool_registry import ToolRegistry
 from .projector import ContextProjector, estimate_tokens
+from .verified_evidence import EvidenceSnapshot, VerifiedEvidenceRecovery, capture_evidence_manifest
 
 
 DEFAULT_SUBAGENT_CONTEXT_WINDOW = 32000
@@ -135,6 +136,14 @@ class Runtime:
         self._dag_nodes = (
             {node.subtask_id: node for node in verified_subtask_dag.nodes}
             if verified_subtask_dag is not None else {}
+        )
+        self._evidence_recovery = VerifiedEvidenceRecovery(
+            self.store,
+            self.repo_root,
+            self._dag_nodes if verified_subtask_dag is not None else (
+                {verified_subtask.subtask_id: verified_subtask}
+                if verified_subtask is not None else {}
+            ),
         )
         self.tools = ToolExecutor(self.repo_root)
         if float(self.tools.shell_timeout) >= lease_ttl:
@@ -446,6 +455,13 @@ class Runtime:
             )
 
         if verifier_result.status == "pass":
+            observed_snapshot = capture_evidence_manifest(self.repo_root, manifest)
+            if observed_snapshot.complete and observed_snapshot.manifest != manifest:
+                observed_snapshot = EvidenceSnapshot(
+                    [],
+                    False,
+                    "verifier manifest did not match the initial file observation",
+                )
             self._fault(
                 "verified_subtask_f2_pre",
                 task_id=task_id,
@@ -472,6 +488,8 @@ class Runtime:
                 execution_checkpoint_id=execution_checkpoint_id,
                 complete_task=is_final,
                 fault_injector=self._fault,
+                observed_manifest=observed_snapshot.manifest,
+                observation_complete=observed_snapshot.complete,
             )
             if is_final:
                 return RunResult(task_id, "completed", completion_summary)
@@ -553,19 +571,36 @@ class Runtime:
             latest_plan is not None and latest_plan.get("dag_hash") is not None
         ):
             self._assert_dag_config(task_id)
-            task = self.store.get_task(task_id)
-            if task["status"] == "completed":
-                self.store.assert_invariants(task_id)
-                completed = self.store.get_completed_result(task_id)
-                return RunResult(task_id, "completed", completed["final_text"])
+            return self._resume_verified_task(task_id)
         elif self.verified_subtask is not None or self.store.has_verified_subtask(task_id):
             self._assert_verified_subtask_config(task_id)
+            return self._resume_verified_task(task_id)
+        return self._resume_task(task_id, lease_acquired=False)
+
+    def _resume_verified_task(self, task_id: str) -> RunResult:
+        """Run evidence recovery before terminal fast paths or DAG selection."""
+        self.store.assert_invariants(task_id)
+        task = self.store.get_task(task_id)
+        if task["status"] in {"failed", "aborted"}:
+            raise RuntimeError(f"Task {task_id} is terminal: {task['status']}")
+        if not self._evidence_recovery.needs_recovery(task_id):
+            if task["status"] == "completed":
+                completed = self.store.get_completed_result(task_id)
+                return RunResult(task_id, "completed", completed["final_text"])
+            return self._resume_task(task_id, lease_acquired=False)
+        self._acquire(task_id)
+        try:
+            self.store.assert_invariants(task_id)
+            self._evidence_recovery.recover(task_id)
             task = self.store.get_task(task_id)
             if task["status"] == "completed":
                 self.store.assert_invariants(task_id)
                 completed = self.store.get_completed_result(task_id)
                 return RunResult(task_id, "completed", completed["final_text"])
-        return self._resume_task(task_id, lease_acquired=False)
+            return self._resume_task(task_id, lease_acquired=True)
+        finally:
+            if self._lease_token is not None:
+                self._release()
 
     def _assert_verified_subtask_config(self, task_id: str) -> dict[str, Any]:
         latest_plan = self.store.get_latest_plan(task_id)
