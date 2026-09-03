@@ -24,6 +24,7 @@ from agent_runtime.migrations import (
     V9_CHECKSUM,
     V10_CHECKSUM,
     V11_CHECKSUM,
+    V12_CHECKSUM,
 )
 from agent_runtime.models import (
     ModelResponse,
@@ -34,6 +35,7 @@ from agent_runtime.models import (
     VerifiedSubtaskDAGConfig,
 )
 from agent_runtime.runtime import InjectedCrash
+from agent_runtime.store import InvariantViolation
 
 
 VALID_SHA256 = "a" * 64
@@ -165,15 +167,18 @@ def test_v10_to_v11_migration_is_audited_and_idempotent(tmp_path: Path) -> None:
 
     assert report.ok is True
     assert report.from_version == 10
-    assert report.to_version == 11
-    assert report.applied == ("v11_frozen_dag",)
-    assert SchemaManager(database).inspect().current_version == 11
+    assert report.to_version == 12
+    assert report.applied == ("v11_frozen_dag", "v12_stale_evidence")
+    assert SchemaManager(database).inspect().current_version == 12
     with sqlite3.connect(database) as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(plan_items)")}
         assert {"max_turns", "consumed_turns"} <= columns
         assert connection.execute(
             "SELECT checksum FROM schema_migrations WHERE version = 11"
         ).fetchone()[0] == V11_CHECKSUM
+        assert connection.execute(
+            "SELECT checksum FROM schema_migrations WHERE version = 12"
+        ).fetchone()[0] == V12_CHECKSUM
 
     repeated = SchemaManager(database).migrate()
     assert repeated.ok is True
@@ -468,6 +473,17 @@ def test_resume_retryable_blocked_node_returns_fixed_feedback_without_verifying(
         )
         connection.execute(
             "UPDATE plan_items SET status = 'pending' WHERE subtask_id = 'first'"
+        )
+        checkpoint = first.store.list_verified_subtask_checkpoints(task_id)[0]
+        connection.execute(
+            "INSERT INTO semantic_checkpoint_state_events("
+            "task_id, semantic_checkpoint_id, plan_item_id, state, reason, "
+            "observed_manifest_json, observation_complete, created_at) "
+            "SELECT task_id, semantic_checkpoint_id, plan_item_id, 'stale', "
+            "'test_dependency_block', observed_manifest_json, observation_complete, "
+            "strftime('%s','now') FROM semantic_checkpoint_state_events "
+            "WHERE semantic_checkpoint_id = ? ORDER BY state_event_id DESC LIMIT 1",
+            (checkpoint["verified_subtask_checkpoint_id"],),
         )
 
     recovered = Runtime(
@@ -790,11 +806,5 @@ def test_blocked_marker_can_continue_after_dependency_becomes_complete(tmp_path:
     )
     runtime_holder["runtime"] = runtime
 
-    result = runtime.run("Complete both")
-
-    assert result.status == "completed"
-    assert [run["subtask_id"] for run in runtime.store.list_verifier_runs(result.task_id)] == [
-        "dependency",
-        "current",
-    ]
-    assert runtime.store.get_plan_item(result.task_id, "current")["consumed_turns"] == 2
+    with pytest.raises(InvariantViolation, match="pending has a current valid checkpoint"):
+        runtime.run("Complete both")

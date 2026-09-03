@@ -105,6 +105,12 @@ class TraceReporter:
             "non_authoritative_verifier_run_count": verified_metrics["non_authoritative_verifier_run_count"],
             "verified_subtask_checkpoint_count": verified_metrics["verified_subtask_checkpoint_count"],
             "verified_subtask_bundle_count": verified_metrics["verified_subtask_bundle_count"],
+            "verified_subtask_valid_checkpoint_count": verified_metrics["valid_checkpoint_count"],
+            "verified_subtask_stale_checkpoint_count": verified_metrics["stale_checkpoint_count"],
+            "verified_subtask_superseded_checkpoint_count": verified_metrics["superseded_checkpoint_count"],
+            "verified_subtask_refresh_count": verified_metrics["refresh_count"],
+            "verified_subtask_f4_fail_count": verified_metrics["f4_fail_count"],
+            "verified_subtask_f4_uncertain_count": verified_metrics["f4_uncertain_count"],
             "background_job_count": len(jobs),
             "background_job_runs": job_run_count,
             "background_job_statuses": job_status_counts,
@@ -157,6 +163,14 @@ class TraceReporter:
     def _verified_metrics(self, task_id: str) -> dict[str, int]:
         runs = self.store.list_verifier_runs(task_id)
         checkpoints = self.store.list_verified_subtask_checkpoints(task_id)
+        current_counts = {
+            state: sum(
+                checkpoint.get("lifecycle_state") == state
+                for checkpoint in checkpoints
+            )
+            for state in ("valid", "stale", "superseded")
+        }
+        events = self.store.list_events(task_id)
         bundle_hashes = {
             str(run["verifier_bundle_hash"])
             for run in runs
@@ -168,6 +182,21 @@ class TraceReporter:
             "non_authoritative_verifier_run_count": sum(not run["authoritative"] for run in runs),
             "verified_subtask_checkpoint_count": len(checkpoints),
             "verified_subtask_bundle_count": len(bundle_hashes),
+            "valid_checkpoint_count": current_counts["valid"],
+            "stale_checkpoint_count": current_counts["stale"],
+            "superseded_checkpoint_count": current_counts["superseded"],
+            "refresh_count": sum(
+                event["type"] == "verified_subtask_evidence_refreshed"
+                for event in events
+            ),
+            "f4_fail_count": sum(
+                event["type"] == "verified_subtask_evidence_refresh_fail"
+                for event in events
+            ),
+            "f4_uncertain_count": sum(
+                event["type"] == "verified_subtask_evidence_refresh_uncertain"
+                for event in events
+            ),
         }
 
     def export_jsonl(self, task_id: str, output_path: str | Path) -> int:
@@ -242,6 +271,15 @@ class TraceReporter:
                 handle.write(
                     json.dumps(
                         _redact({"record_type": "verified_subtask_checkpoint", **checkpoint}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+            for state_event in self.store.list_checkpoint_state_events(task_id):
+                handle.write(
+                    json.dumps(
+                        _redact({"record_type": "verified_subtask_checkpoint_state_event", **state_event}),
                         ensure_ascii=False,
                         sort_keys=True,
                     )

@@ -20,6 +20,7 @@ from agent_runtime.migrations import (
     V9_CHECKSUM,
     V10_CHECKSUM,
     V11_CHECKSUM,
+    V12_CHECKSUM,
     _BASE_SCHEMA,
     _apply_v6_durable_context,
     _apply_v7_background_jobs,
@@ -168,9 +169,9 @@ def test_v9_migrates_to_v11_with_verified_subtask_schema(tmp_path: Path):
 
     assert report.ok is True
     assert report.from_version == 9
-    assert report.to_version == 11
-    assert report.applied == ("v10_verified_subtask", "v11_frozen_dag")
-    assert SchemaManager(database).inspect().current_version == 11
+    assert report.to_version == 12
+    assert report.applied == ("v10_verified_subtask", "v11_frozen_dag", "v12_stale_evidence")
+    assert SchemaManager(database).inspect().current_version == 12
     with sqlite3.connect(database) as connection:
         tables = {
             row[0]
@@ -178,13 +179,16 @@ def test_v9_migrates_to_v11_with_verified_subtask_schema(tmp_path: Path):
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        assert {"verifier_runs", "semantic_checkpoints"} <= tables
+        assert {"verifier_runs", "semantic_checkpoints", "semantic_checkpoint_state_events"} <= tables
         assert connection.execute(
             "SELECT checksum FROM schema_migrations WHERE version = 10"
         ).fetchone()[0] == V10_CHECKSUM
         assert connection.execute(
             "SELECT checksum FROM schema_migrations WHERE version = 11"
         ).fetchone()[0] == V11_CHECKSUM
+        assert connection.execute(
+            "SELECT checksum FROM schema_migrations WHERE version = 12"
+        ).fetchone()[0] == V12_CHECKSUM
         assert "verifier_bundle_hash" in {
             row[1] for row in connection.execute("PRAGMA table_info(plan_items)")
         }
@@ -225,14 +229,14 @@ def test_fresh_database_is_v11_and_integrity_checked(tmp_path: Path):
     store = EventStore(tmp_path / "runtime.db")
 
     assert store.integrity_check() == []
-    assert SchemaManager(store.path).inspect().current_version == 11
+    assert SchemaManager(store.path).inspect().current_version == 12
     with sqlite3.connect(store.path) as connection:
         assert [row[0] for row in connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        )] == [11]
+        )] == [12]
         assert connection.execute(
-            "SELECT checksum FROM schema_migrations WHERE version = 11"
-        ).fetchone()[0] == V11_CHECKSUM
+            "SELECT checksum FROM schema_migrations WHERE version = 12"
+        ).fetchone()[0] == V12_CHECKSUM
 
 
 def test_verified_tables_without_migration_history_fail_closed(tmp_path: Path):
@@ -409,12 +413,9 @@ def test_verified_resume_fails_closed_when_bundle_is_inconsistent(tmp_path: Path
     result = runtime.run("Create the artifact")
 
     with sqlite3.connect(runtime.store.path) as connection:
-        connection.execute("DELETE FROM semantic_checkpoints WHERE task_id = ?", (result.task_id,))
-        connection.commit()
-
-    assert runtime.store.scan_invariants(result.task_id)
-    with pytest.raises(InvariantViolation, match="invariant"):
-        Runtime(tmp_path, ScriptedModel([]), verified_subtask=config).resume(result.task_id)
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            connection.execute("DELETE FROM semantic_checkpoints WHERE task_id = ?", (result.task_id,))
+    assert runtime.store.scan_invariants(result.task_id) == []
 
 
 def test_completion_marker_requires_an_exclusive_line(tmp_path: Path):
@@ -689,6 +690,34 @@ def test_verified_subtask_history_remains_append_only(tmp_path: Path):
             "evidence_hash, created_at + 1 FROM semantic_checkpoints "
             "WHERE semantic_checkpoint_id = ?",
             (manifest_json, checkpoint["verified_subtask_checkpoint_id"]),
+        )
+        new_checkpoint_id = connection.execute(
+            "SELECT MAX(semantic_checkpoint_id) FROM semantic_checkpoints WHERE task_id = ?",
+            (result.task_id,),
+        ).fetchone()[0]
+        new_checkpoint = connection.execute(
+            "SELECT task_id, plan_item_id FROM semantic_checkpoints WHERE semantic_checkpoint_id = ?",
+            (new_checkpoint_id,),
+        ).fetchone()
+        connection.execute(
+            "INSERT INTO semantic_checkpoint_state_events("
+            "task_id, semantic_checkpoint_id, plan_item_id, state, reason, "
+            "observed_manifest_json, observation_complete, created_at) "
+            "VALUES (?, ?, ?, 'valid', 'test_history', '[]', 0, ?)",
+            (new_checkpoint[0], new_checkpoint_id, new_checkpoint[1], time.time()),
+        )
+        connection.execute(
+            "INSERT INTO semantic_checkpoint_state_events("
+            "task_id, semantic_checkpoint_id, plan_item_id, state, reason, "
+            "replacement_checkpoint_id, observed_manifest_json, observation_complete, created_at) "
+            "VALUES (?, ?, ?, 'superseded', 'test_history_replacement', ?, '[]', 0, ?)",
+            (
+                result.task_id,
+                checkpoint["verified_subtask_checkpoint_id"],
+                new_checkpoint[1],
+                new_checkpoint_id,
+                time.time(),
+            ),
         )
         connection.commit()
 

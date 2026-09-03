@@ -1518,6 +1518,12 @@ class EventStore:
         item = dict(row)
         item["evidence_manifest"] = _loads(item.pop("evidence_manifest_json"), [])
         item["verified_subtask_checkpoint_id"] = item.pop("semantic_checkpoint_id")
+        if "observed_manifest_json" in item:
+            item["observed_manifest"] = _loads(item.pop("observed_manifest_json"), [])
+        if "lifecycle_state" not in item:
+            item["lifecycle_state"] = None
+        if "observation_complete" in item:
+            item["observation_complete"] = bool(item["observation_complete"])
         return item
 
     def list_verifier_runs(self, task_id: str) -> list[dict[str, Any]]:
@@ -1537,8 +1543,14 @@ class EventStore:
 
     def list_verified_subtask_checkpoints(self, task_id: str) -> list[dict[str, Any]]:
         rows = self._fetchall(
-            "SELECT * FROM semantic_checkpoints WHERE task_id = ? "
-            "ORDER BY semantic_checkpoint_id",
+            "SELECT s.*, state.state AS lifecycle_state, state.reason AS lifecycle_reason, "
+            "state.replacement_checkpoint_id, state.observed_manifest_json, "
+            "state.observation_complete "
+            "FROM semantic_checkpoints s "
+            "LEFT JOIN semantic_checkpoint_state_events state ON state.state_event_id = ("
+            "SELECT MAX(state_event_id) FROM semantic_checkpoint_state_events "
+            "WHERE semantic_checkpoint_id = s.semantic_checkpoint_id) "
+            "WHERE s.task_id = ? ORDER BY s.semantic_checkpoint_id",
             (task_id,),
         )
         return [self._decode_semantic_checkpoint(row) for row in rows]
@@ -1547,10 +1559,55 @@ class EventStore:
         self, verified_subtask_checkpoint_id: int
     ) -> dict[str, Any] | None:
         row = self._fetchone(
-            "SELECT * FROM semantic_checkpoints WHERE semantic_checkpoint_id = ?",
+            "SELECT s.*, state.state AS lifecycle_state, state.reason AS lifecycle_reason, "
+            "state.replacement_checkpoint_id, state.observed_manifest_json, "
+            "state.observation_complete "
+            "FROM semantic_checkpoints s "
+            "LEFT JOIN semantic_checkpoint_state_events state ON state.state_event_id = ("
+            "SELECT MAX(state_event_id) FROM semantic_checkpoint_state_events "
+            "WHERE semantic_checkpoint_id = s.semantic_checkpoint_id) "
+            "WHERE s.semantic_checkpoint_id = ?",
             (verified_subtask_checkpoint_id,),
         )
         return self._decode_semantic_checkpoint(row) if row is not None else None
+
+    def get_current_verified_subtask_checkpoint(
+        self, task_id: str, plan_item_id: int
+    ) -> dict[str, Any] | None:
+        row = self._fetchone(
+            "SELECT s.*, state.state AS lifecycle_state, state.reason AS lifecycle_reason, "
+            "state.replacement_checkpoint_id, state.observed_manifest_json, "
+            "state.observation_complete "
+            "FROM semantic_checkpoints s "
+            "JOIN semantic_checkpoint_state_events state ON state.state_event_id = ("
+            "SELECT MAX(state_event_id) FROM semantic_checkpoint_state_events "
+            "WHERE semantic_checkpoint_id = s.semantic_checkpoint_id) "
+            "WHERE s.task_id = ? AND s.plan_item_id = ? AND state.state = 'valid'",
+            (task_id, plan_item_id),
+        )
+        return self._decode_semantic_checkpoint(row) if row is not None else None
+
+    def list_checkpoint_state_events(
+        self, task_id: str, checkpoint_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        clauses = ["task_id = ?"]
+        params: list[Any] = [task_id]
+        if checkpoint_id is not None:
+            clauses.append("semantic_checkpoint_id = ?")
+            params.append(int(checkpoint_id))
+        rows = self._fetchall(
+            "SELECT * FROM semantic_checkpoint_state_events WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY state_event_id",
+            tuple(params),
+        )
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["observed_manifest"] = _loads(item.pop("observed_manifest_json"), [])
+            item["observation_complete"] = bool(item["observation_complete"])
+            result.append(item)
+        return result
 
     def get_completed_result(self, task_id: str) -> dict[str, Any]:
         task = self.get_task(task_id)
@@ -1686,6 +1743,8 @@ class EventStore:
         execution_checkpoint_id: int,
         fault_injector: Callable[..., None] | None = None,
         complete_task: bool = True,
+        observed_manifest: list[dict[str, str]] | None = None,
+        observation_complete: bool = False,
     ) -> dict[str, Any]:
         invalid_paths = [
             entry["path"]
@@ -1699,6 +1758,9 @@ class EventStore:
             )
         evidence_json = _checked_json(evidence_manifest, MAX_CHECKPOINT_BYTES, "evidence manifest")
         evidence_hash = sha256_json(evidence_manifest)
+        observed_json = _checked_json(
+            observed_manifest or [], MAX_CHECKPOINT_BYTES, "observed evidence manifest"
+        )
         now = _now()
         verifier_run_id = f"verifier_{uuid.uuid4().hex}"
         with self.transaction() as conn:
@@ -1775,6 +1837,20 @@ class EventStore:
                 ),
             )
             verified_subtask_checkpoint_id = int(semantic.lastrowid)
+            conn.execute(
+                "INSERT INTO semantic_checkpoint_state_events("
+                "task_id, semantic_checkpoint_id, plan_item_id, state, reason, "
+                "observed_manifest_json, observation_complete, created_at) "
+                "VALUES (?, ?, ?, 'valid', 'checkpoint_created', ?, ?, ?)",
+                (
+                    task_id,
+                    verified_subtask_checkpoint_id,
+                    plan_item_id,
+                    observed_json,
+                    int(bool(observation_complete)),
+                    now,
+                ),
+            )
             updated_item = conn.execute(
                 "UPDATE plan_items SET status = 'completed', completion_summary = ?, "
                 "evidence_hash = ?, version = version + 1, updated_at = ? "
@@ -1900,6 +1976,375 @@ class EventStore:
                 verified_subtask_checkpoint_id=verified_subtask_checkpoint_id,
             )
         return result
+
+    def refresh_verified_subtask(
+        self,
+        task_id: str,
+        plan_item_id: int,
+        subtask_id: str,
+        old_checkpoint_id: int,
+        completion_summary: str,
+        verifier_summary: str,
+        evidence_manifest: list[dict[str, str]],
+        verifier_id: str,
+        verifier_version: str,
+        verification_rule: str,
+        verifier_bundle_hash: str,
+        verifier_implementation_hash: str,
+        execution_checkpoint_id: int,
+        observed_manifest: list[dict[str, str]],
+        observation_complete: bool,
+    ) -> dict[str, Any]:
+        """Atomically append a refreshed authority and supersede old evidence."""
+        invalid_paths = [
+            entry.get("path", "")
+            for entry in evidence_manifest
+            if not is_valid_sha256(entry.get("sha256", ""))
+        ]
+        if invalid_paths:
+            raise InvariantViolation(
+                "verified-subtask evidence requires lowercase 64-hex SHA-256 values: "
+                + ", ".join(invalid_paths)
+            )
+        evidence_json = _checked_json(evidence_manifest, MAX_CHECKPOINT_BYTES, "evidence manifest")
+        evidence_hash = sha256_json(evidence_manifest)
+        observed_json = _checked_json(
+            observed_manifest, MAX_CHECKPOINT_BYTES, "observed evidence manifest"
+        )
+        verifier_run_id = f"verifier_{uuid.uuid4().hex}"
+        now = _now()
+        with self.transaction() as conn:
+            item = self._plan_call(conn, plan_item_id)
+            if str(item["task_id"]) != task_id or str(item["subtask_id"]) != subtask_id:
+                raise InvariantViolation(f"Plan item {plan_item_id} does not belong to task/subtask")
+            if item["verifier_bundle_hash"] != verifier_bundle_hash:
+                raise InvariantViolation(f"Verifier bundle hash mismatch for plan item {plan_item_id}")
+            if item["status"] != "completed":
+                raise InvariantViolation(
+                    f"plan item {plan_item_id} cannot refresh from {item['status']}"
+                )
+            old = conn.execute(
+                "SELECT s.*, state.state AS lifecycle_state, state.observed_manifest_json, "
+                "state.observation_complete "
+                "FROM semantic_checkpoints s JOIN semantic_checkpoint_state_events state "
+                "ON state.state_event_id = (SELECT MAX(state_event_id) "
+                "FROM semantic_checkpoint_state_events WHERE semantic_checkpoint_id = s.semantic_checkpoint_id) "
+                "WHERE s.semantic_checkpoint_id = ? AND s.task_id = ? AND s.plan_item_id = ? "
+                "AND state.state = 'valid'",
+                (old_checkpoint_id, task_id, plan_item_id),
+            ).fetchone()
+            if old is None:
+                raise StaleState(f"Verified evidence checkpoint is no longer valid: {old_checkpoint_id}")
+            if any(
+                str(old[field]) != str(expected)
+                for field, expected in (
+                    ("subtask_id", subtask_id),
+                    ("verifier_id", verifier_id),
+                    ("verifier_version", verifier_version),
+                    ("verification_rule", verification_rule),
+                    ("verifier_bundle_hash", verifier_bundle_hash),
+                    ("verifier_implementation_hash", verifier_implementation_hash),
+                )
+            ):
+                raise InvariantViolation(
+                    f"Frozen verifier bundle changed for plan item {plan_item_id}"
+                )
+            checkpoint = conn.execute(
+                "SELECT 1 FROM checkpoints WHERE checkpoint_id = ? AND task_id = ?",
+                (execution_checkpoint_id, task_id),
+            ).fetchone()
+            if checkpoint is None:
+                raise InvariantViolation(f"Execution checkpoint is not owned by task {task_id}")
+            conn.execute(
+                "INSERT INTO verifier_runs("
+                "verifier_run_id, task_id, plan_item_id, subtask_id, status, summary, "
+                "completion_summary, verifier_id, verifier_version, verification_rule, "
+                "verifier_bundle_hash, verifier_implementation_hash, evidence_manifest_json, "
+                "evidence_hash, authoritative, execution_checkpoint_id, created_at) "
+                "VALUES (?, ?, ?, ?, 'pass', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                (
+                    verifier_run_id, task_id, plan_item_id, subtask_id, verifier_summary,
+                    completion_summary, verifier_id, verifier_version, verification_rule,
+                    verifier_bundle_hash, verifier_implementation_hash, evidence_json,
+                    evidence_hash, execution_checkpoint_id, now,
+                ),
+            )
+            semantic = conn.execute(
+                "INSERT INTO semantic_checkpoints("
+                "task_id, plan_item_id, subtask_id, verifier_run_id, execution_checkpoint_id, "
+                "completion_summary, verifier_id, verifier_version, verification_rule, "
+                "verifier_bundle_hash, verifier_implementation_hash, evidence_manifest_json, "
+                "evidence_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id, plan_item_id, subtask_id, verifier_run_id, execution_checkpoint_id,
+                    completion_summary, verifier_id, verifier_version, verification_rule,
+                    verifier_bundle_hash, verifier_implementation_hash, evidence_json,
+                    evidence_hash, now,
+                ),
+            )
+            new_checkpoint_id = int(semantic.lastrowid)
+            conn.execute(
+                "INSERT INTO semantic_checkpoint_state_events("
+                "task_id, semantic_checkpoint_id, plan_item_id, state, reason, "
+                "observed_manifest_json, observation_complete, created_at) "
+                "VALUES (?, ?, ?, 'valid', 'evidence_refreshed', ?, ?, ?)",
+                (
+                    task_id, new_checkpoint_id, plan_item_id, observed_json,
+                    int(bool(observation_complete)), now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO semantic_checkpoint_state_events("
+                "task_id, semantic_checkpoint_id, plan_item_id, state, reason, "
+                "replacement_checkpoint_id, observed_manifest_json, observation_complete, created_at) "
+                "VALUES (?, ?, ?, 'superseded', 'evidence_refreshed', ?, ?, ?, ?)",
+                (
+                    task_id, old_checkpoint_id, plan_item_id, new_checkpoint_id,
+                    old["observed_manifest_json"], old["observation_complete"], now,
+                ),
+            )
+            updated = conn.execute(
+                "UPDATE plan_items SET evidence_hash = ?, version = version + 1, updated_at = ? "
+                "WHERE plan_item_id = ? AND status = 'completed' AND version = ?",
+                (evidence_hash, now, plan_item_id, int(item["version"])),
+            )
+            if updated.rowcount != 1:
+                raise StaleState(f"Plan item changed during evidence refresh: {plan_item_id}")
+            conn.execute("UPDATE plans SET updated_at = ? WHERE plan_id = ?", (now, item["plan_id"]))
+            payload = {
+                "plan_item_id": plan_item_id,
+                "subtask_id": subtask_id,
+                "verifier_run_id": verifier_run_id,
+                "old_checkpoint_id": old_checkpoint_id,
+                "verified_subtask_checkpoint_id": new_checkpoint_id,
+                "replacement_checkpoint_id": new_checkpoint_id,
+                "status": "pass",
+                "authoritative": True,
+                "verifier_bundle_hash": verifier_bundle_hash,
+                "evidence_hash": evidence_hash,
+            }
+            for event_type, event_payload in (
+                ("verifier_run_recorded", payload),
+                ("verified_subtask_checkpoint_created", payload),
+                ("verified_subtask_checkpoint_superseded", {
+                    "plan_item_id": plan_item_id,
+                    "old_checkpoint_id": old_checkpoint_id,
+                    "replacement_checkpoint_id": new_checkpoint_id,
+                }),
+                ("verified_subtask_evidence_refreshed", payload),
+            ):
+                conn.execute(
+                    "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                    (task_id, event_type, _checked_json(event_payload, MAX_EVENT_PAYLOAD_BYTES, "event payload"), now),
+                )
+        return {
+            "verifier_run_id": verifier_run_id,
+            "verified_subtask_checkpoint_id": new_checkpoint_id,
+            "old_checkpoint_id": old_checkpoint_id,
+            "execution_checkpoint_id": execution_checkpoint_id,
+        }
+
+    def invalidate_verified_subtask_evidence(
+        self,
+        task_id: str,
+        plan_item_id: int,
+        subtask_id: str,
+        checkpoint_id: int,
+        status: str,
+        summary: str,
+        completion_summary: str,
+        evidence_manifest: list[dict[str, str]],
+        verifier_id: str,
+        verifier_version: str,
+        verification_rule: str,
+        verifier_bundle_hash: str,
+        verifier_implementation_hash: str,
+        execution_checkpoint_id: int,
+        reason: str,
+    ) -> str:
+        if status not in {"fail", "uncertain"}:
+            raise ValueError("evidence invalidation must be fail or uncertain")
+        evidence_json = _checked_json(evidence_manifest, MAX_CHECKPOINT_BYTES, "evidence manifest")
+        evidence_hash = sha256_json(evidence_manifest)
+        verifier_run_id = f"verifier_{uuid.uuid4().hex}"
+        now = _now()
+        with self.transaction() as conn:
+            item = self._plan_call(conn, plan_item_id)
+            if str(item["task_id"]) != task_id or str(item["subtask_id"]) != subtask_id:
+                raise InvariantViolation(f"Plan item {plan_item_id} does not belong to task/subtask")
+            if item["verifier_bundle_hash"] != verifier_bundle_hash:
+                raise InvariantViolation(f"Verifier bundle hash mismatch for plan item {plan_item_id}")
+            if item["status"] != "completed":
+                raise InvariantViolation(
+                    f"plan item {plan_item_id} cannot invalidate from {item['status']}"
+                )
+            old = conn.execute(
+                "SELECT s.semantic_checkpoint_id, state.state AS lifecycle_state, "
+                "state.observed_manifest_json, state.observation_complete "
+                "FROM semantic_checkpoints s JOIN semantic_checkpoint_state_events state "
+                "ON state.state_event_id = (SELECT MAX(state_event_id) "
+                "FROM semantic_checkpoint_state_events WHERE semantic_checkpoint_id = s.semantic_checkpoint_id) "
+                "WHERE s.semantic_checkpoint_id = ? AND s.task_id = ? AND s.plan_item_id = ? "
+                "AND state.state = 'valid'",
+                (checkpoint_id, task_id, plan_item_id),
+            ).fetchone()
+            if old is None:
+                raise StaleState(f"Verified evidence checkpoint is no longer valid: {checkpoint_id}")
+            old_checkpoint = conn.execute(
+                "SELECT * FROM semantic_checkpoints WHERE semantic_checkpoint_id = ?",
+                (checkpoint_id,),
+            ).fetchone()
+            if old_checkpoint is None or any(
+                str(old_checkpoint[field]) != str(expected)
+                for field, expected in (
+                    ("subtask_id", subtask_id),
+                    ("verifier_id", verifier_id),
+                    ("verifier_version", verifier_version),
+                    ("verification_rule", verification_rule),
+                    ("verifier_bundle_hash", verifier_bundle_hash),
+                    ("verifier_implementation_hash", verifier_implementation_hash),
+                )
+            ):
+                raise InvariantViolation(
+                    f"Frozen verifier bundle changed for plan item {plan_item_id}"
+                )
+            execution_checkpoint = conn.execute(
+                "SELECT 1 FROM checkpoints WHERE checkpoint_id = ? AND task_id = ?",
+                (execution_checkpoint_id, task_id),
+            ).fetchone()
+            if execution_checkpoint is None:
+                raise InvariantViolation(f"Execution checkpoint is not owned by task {task_id}")
+            conn.execute(
+                "INSERT INTO verifier_runs("
+                "verifier_run_id, task_id, plan_item_id, subtask_id, status, summary, "
+                "completion_summary, verifier_id, verifier_version, verification_rule, "
+                "verifier_bundle_hash, verifier_implementation_hash, evidence_manifest_json, "
+                "evidence_hash, authoritative, execution_checkpoint_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                (
+                    verifier_run_id, task_id, plan_item_id, subtask_id, status, summary,
+                    completion_summary, verifier_id, verifier_version, verification_rule,
+                    verifier_bundle_hash, verifier_implementation_hash, evidence_json,
+                    evidence_hash, execution_checkpoint_id, now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO semantic_checkpoint_state_events("
+                "task_id, semantic_checkpoint_id, plan_item_id, state, reason, "
+                "observed_manifest_json, observation_complete, created_at) "
+                "VALUES (?, ?, ?, 'stale', ?, ?, ?, ?)",
+                (
+                    task_id, checkpoint_id, plan_item_id,
+                    f"evidence_refresh_{status}: {str(reason)[:256]}",
+                    old["observed_manifest_json"], old["observation_complete"], now,
+                ),
+            )
+            updated = conn.execute(
+                "UPDATE plan_items SET status = 'retryable', completion_summary = ?, "
+                "evidence_hash = NULL, version = version + 1, updated_at = ? "
+                "WHERE plan_item_id = ? AND status = 'completed' AND version = ?",
+                (completion_summary, now, plan_item_id, int(item["version"])),
+            )
+            if updated.rowcount != 1:
+                raise StaleState(f"Plan item changed during evidence invalidation: {plan_item_id}")
+
+            all_items = conn.execute(
+                "SELECT * FROM plan_items WHERE plan_id = ? ORDER BY plan_item_id",
+                (item["plan_id"],),
+            ).fetchall()
+            descendants: set[str] = set()
+            changed = {subtask_id}
+            while changed:
+                current = changed.pop()
+                for candidate in all_items:
+                    dependencies = _loads(candidate["blocked_by_json"], [])
+                    candidate_id = str(candidate["subtask_id"])
+                    if candidate_id not in descendants and current in dependencies:
+                        descendants.add(candidate_id)
+                        changed.add(candidate_id)
+            descendants.discard(subtask_id)
+            affected_descendants: list[str] = []
+            for candidate in all_items:
+                candidate_id = str(candidate["subtask_id"])
+                if candidate_id not in descendants:
+                    continue
+                candidate_id_num = int(candidate["plan_item_id"])
+                if candidate["status"] == "completed":
+                    current_checkpoint = conn.execute(
+                        "SELECT s.semantic_checkpoint_id, state.observed_manifest_json, "
+                        "state.observation_complete FROM semantic_checkpoints s "
+                        "JOIN semantic_checkpoint_state_events state ON state.state_event_id = ("
+                        "SELECT MAX(state_event_id) FROM semantic_checkpoint_state_events "
+                        "WHERE semantic_checkpoint_id = s.semantic_checkpoint_id) "
+                        "WHERE s.plan_item_id = ? AND state.state = 'valid'",
+                        (candidate_id_num,),
+                    ).fetchone()
+                    if current_checkpoint is None:
+                        raise InvariantViolation(
+                            f"completed dependent plan item {candidate_id_num} has no valid checkpoint"
+                        )
+                    conn.execute(
+                        "INSERT INTO semantic_checkpoint_state_events("
+                        "task_id, semantic_checkpoint_id, plan_item_id, state, reason, "
+                        "observed_manifest_json, observation_complete, created_at) "
+                        "VALUES (?, ?, ?, 'stale', 'dependency_invalidation', ?, ?, ?)",
+                        (
+                            task_id, current_checkpoint["semantic_checkpoint_id"], candidate_id_num,
+                            current_checkpoint["observed_manifest_json"],
+                            current_checkpoint["observation_complete"], now,
+                        ),
+                    )
+                if candidate["status"] != "pending":
+                    conn.execute(
+                        "UPDATE plan_items SET status = 'pending', evidence_hash = NULL, "
+                        "version = version + 1, updated_at = ? WHERE plan_item_id = ?",
+                        (now, candidate_id_num),
+                    )
+                affected_descendants.append(candidate_id)
+                conn.execute(
+                    "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                    (
+                        task_id,
+                        "plan_item_dependency_invalidated",
+                        _checked_json({
+                            "plan_item_id": candidate_id_num,
+                            "subtask_id": candidate_id,
+                            "from": candidate["status"],
+                            "dependency": subtask_id,
+                        }, MAX_EVENT_PAYLOAD_BYTES, "event payload"),
+                        now,
+                    ),
+                )
+            conn.execute(
+                "UPDATE plans SET status = 'active', updated_at = ? WHERE plan_id = ?",
+                (now, item["plan_id"]),
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'running', last_error = NULL, version = version + 1, "
+                "updated_at = ? WHERE task_id = ?",
+                (now, task_id),
+            )
+            payload = {
+                "plan_item_id": plan_item_id,
+                "subtask_id": subtask_id,
+                "checkpoint_id": checkpoint_id,
+                "verifier_run_id": verifier_run_id,
+                "status": status,
+                "authoritative": False,
+                "summary": summary,
+                "reason": str(reason)[:256],
+                "affected_descendants": affected_descendants,
+            }
+            for event_type in (
+                "verifier_run_recorded",
+                "verified_subtask_checkpoint_stale",
+                f"verified_subtask_evidence_refresh_{status}",
+            ):
+                conn.execute(
+                    "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                    (task_id, event_type, _checked_json(payload, MAX_EVENT_PAYLOAD_BYTES, "event payload"), now),
+                )
+        return verifier_run_id
 
     def get_tool_call(self, task_id: str, tool_use_id: str) -> dict[str, Any] | None:
         row = self._fetchone(
@@ -4477,6 +4922,9 @@ class EventStore:
             ).fetchall()
             runs = conn.execute("SELECT * FROM verifier_runs").fetchall()
             semantic_rows = conn.execute("SELECT * FROM semantic_checkpoints").fetchall()
+            state_rows = conn.execute(
+                "SELECT * FROM semantic_checkpoint_state_events ORDER BY state_event_id"
+            ).fetchall()
         else:
             items = conn.execute(
                 "SELECT i.*, p.task_id FROM plan_items i "
@@ -4489,10 +4937,61 @@ class EventStore:
             semantic_rows = conn.execute(
                 "SELECT * FROM semantic_checkpoints WHERE task_id = ?", (task_id,)
             ).fetchall()
+            state_rows = conn.execute(
+                "SELECT * FROM semantic_checkpoint_state_events WHERE task_id = ? "
+                "ORDER BY state_event_id",
+                (task_id,),
+            ).fetchall()
 
         item_by_id = {int(item["plan_item_id"]): item for item in items}
         runs_by_item: dict[int, list[sqlite3.Row]] = {}
         runs_by_id: dict[str, sqlite3.Row] = {}
+        semantic_by_id = {
+            int(semantic["semantic_checkpoint_id"]): semantic
+            for semantic in semantic_rows
+        }
+        latest_state_by_checkpoint: dict[int, sqlite3.Row] = {}
+        states_by_checkpoint: dict[int, list[sqlite3.Row]] = {}
+        for state in state_rows:
+            state_id = int(state["state_event_id"])
+            checkpoint_id = int(state["semantic_checkpoint_id"])
+            states_by_checkpoint.setdefault(checkpoint_id, []).append(state)
+            latest_state_by_checkpoint[checkpoint_id] = state
+            if state["state"] not in {"valid", "stale", "superseded"}:
+                violations.append(
+                    f"checkpoint_state_event {state_id}: invalid state {state['state']!r}"
+                )
+            if int(state["observation_complete"]) not in {0, 1}:
+                violations.append(f"checkpoint_state_event {state_id}: invalid observation flag")
+            if not str(state["reason"] or "").strip():
+                violations.append(f"checkpoint_state_event {state_id}: missing reason")
+            try:
+                observed_manifest = _loads(state["observed_manifest_json"], [])
+                if not isinstance(observed_manifest, list):
+                    raise ValueError("manifest is not a list")
+            except (TypeError, ValueError):
+                violations.append(f"checkpoint_state_event {state_id}: invalid observed manifest")
+            checkpoint = semantic_by_id.get(checkpoint_id)
+            if checkpoint is None:
+                violations.append(
+                    f"checkpoint_state_event {state_id}: missing semantic checkpoint {checkpoint_id}"
+                )
+                continue
+            if str(state["task_id"]) != str(checkpoint["task_id"]):
+                violations.append(f"checkpoint_state_event {state_id}: task mismatch")
+            if int(state["plan_item_id"]) != int(checkpoint["plan_item_id"]):
+                violations.append(f"checkpoint_state_event {state_id}: plan item mismatch")
+            if state["state"] == "superseded":
+                replacement = state["replacement_checkpoint_id"]
+                if replacement is None:
+                    violations.append(
+                        f"checkpoint_state_event {state_id}: superseded checkpoint has no replacement"
+                    )
+                elif int(replacement) == checkpoint_id:
+                    violations.append(
+                        f"checkpoint_state_event {state_id}: superseded checkpoint replaces itself"
+                    )
+
         for run in runs:
             run_id = str(run["verifier_run_id"])
             runs_by_id[run_id] = run
@@ -4546,6 +5045,11 @@ class EventStore:
                     f"verified_subtask_checkpoint {semantic_id}: missing verifier run {run_id}"
                 )
                 continue
+            state = latest_state_by_checkpoint.get(semantic_id)
+            if state is None:
+                violations.append(
+                    f"verified_subtask_checkpoint {semantic_id}: missing lifecycle state"
+                )
             if not int(run["authoritative"]) or run["status"] != "pass":
                 violations.append(
                     f"verified_subtask_checkpoint {semantic_id}: verifier run is not authoritative pass"
@@ -4595,15 +5099,70 @@ class EventStore:
                 semantic for semantic in semantic_rows
                 if int(semantic["plan_item_id"]) == item_id
             ]
+            current_valid = []
+            for semantic in linked:
+                state = latest_state_by_checkpoint.get(int(semantic["semantic_checkpoint_id"]))
+                if state is not None and state["state"] == "valid":
+                    current_valid.append(semantic)
             if item["status"] == "completed":
                 if not authoritative:
                     violations.append(
                         f"plan_item {item_id}: completed without an authoritative verifier run"
                     )
-                if not linked:
+                if len(current_valid) != 1:
                     violations.append(
-                        f"plan_item {item_id}: completed without a verified-subtask checkpoint"
+                        f"plan_item {item_id}: completed has {len(current_valid)} current valid checkpoints"
                     )
+            elif current_valid:
+                violations.append(
+                    f"plan_item {item_id}: {item['status']} has a current valid checkpoint"
+                )
+
+            if len(current_valid) > 1:
+                violations.append(
+                    f"plan_item {item_id}: multiple current valid checkpoints"
+                )
+
+        for checkpoint_id, states in states_by_checkpoint.items():
+            if len(states) == 0:
+                continue
+            original = semantic_by_id.get(checkpoint_id)
+            if original is None:
+                continue
+            if states[0]["state"] != "valid":
+                violations.append(
+                    f"verified_subtask_checkpoint {checkpoint_id}: lifecycle does not start valid"
+                )
+            terminal_seen = False
+            for state in states:
+                state_value = str(state["state"])
+                if terminal_seen:
+                    violations.append(
+                        f"verified_subtask_checkpoint {checkpoint_id}: lifecycle reopens after {state_value}"
+                    )
+                if state_value in {"stale", "superseded"}:
+                    terminal_seen = True
+            latest = states[-1]
+            if latest["state"] == "superseded":
+                replacement_id = latest["replacement_checkpoint_id"]
+                replacement = semantic_by_id.get(int(replacement_id)) if replacement_id is not None else None
+                if replacement is None:
+                    continue
+                if (
+                    str(replacement["task_id"]) != str(original["task_id"])
+                    or int(replacement["plan_item_id"]) != int(original["plan_item_id"])
+                    or str(replacement["verifier_bundle_hash"])
+                    != str(original["verifier_bundle_hash"])
+                ):
+                    violations.append(
+                        f"verified_subtask_checkpoint {checkpoint_id}: replacement mismatch"
+                    )
+                else:
+                    replacement_state = latest_state_by_checkpoint.get(int(replacement_id))
+                    if replacement_state is None or replacement_state["state"] != "valid":
+                        violations.append(
+                            f"verified_subtask_checkpoint {checkpoint_id}: replacement is not current valid"
+                        )
 
         for run_id, linked in semantic_by_run.items():
             if len(linked) > 1:

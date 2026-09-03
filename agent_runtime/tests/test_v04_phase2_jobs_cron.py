@@ -13,6 +13,7 @@ from agent_runtime.migrations import (
     V9_CHECKSUM,
     V10_CHECKSUM,
     V11_CHECKSUM,
+    V12_CHECKSUM,
     _apply_v6_durable_context,
     _execute_all,
     _BASE_SCHEMA,
@@ -143,13 +144,14 @@ def test_v6_database_migrates_through_v7_to_v11(tmp_path: Path):
     assert SchemaManager(db).inspect().current_version == 6
     report = SchemaManager(db).migrate()
     assert report.from_version == 6
-    assert report.to_version == 11
+    assert report.to_version == 12
     assert report.applied == (
         "v7_background_jobs",
         "v8_tool_registry_mcp",
         "v9_subagents_mailbox",
         "v10_verified_subtask",
         "v11_frozen_dag",
+        "v12_stale_evidence",
     )
 
     store = EventStore(db)
@@ -168,6 +170,9 @@ def test_v6_database_migrates_through_v7_to_v11(tmp_path: Path):
     assert store._fetchone(
         "SELECT checksum FROM schema_migrations WHERE version = 11"
     )["checksum"] == V11_CHECKSUM
+    assert store._fetchone(
+        "SELECT checksum FROM schema_migrations WHERE version = 12"
+    )["checksum"] == V12_CHECKSUM
     tables = {
         str(row[0])
         for row in store._fetchall(
@@ -175,7 +180,7 @@ def test_v6_database_migrates_through_v7_to_v11(tmp_path: Path):
             "AND name IN ('agent_jobs', 'job_runs', 'cron_schedules', "
             "'tool_registrations', 'mcp_connections', "
             "'subagent_runs', 'mailboxes', 'mailbox_messages', 'plan_approvals', "
-            "'verifier_runs', 'semantic_checkpoints')"
+            "'verifier_runs', 'semantic_checkpoints', 'semantic_checkpoint_state_events')"
         )
     }
     assert tables == {
@@ -190,6 +195,7 @@ def test_v6_database_migrates_through_v7_to_v11(tmp_path: Path):
         "plan_approvals",
         "verifier_runs",
         "semantic_checkpoints",
+        "semantic_checkpoint_state_events",
     }
     assert store.integrity_check() == []
 

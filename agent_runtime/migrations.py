@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-SCHEMA_VERSION = 11
-MIGRATION_NAME = "v11_frozen_dag"
+SCHEMA_VERSION = 12
+MIGRATION_NAME = "v12_stale_evidence"
 V5_MIGRATION_NAME = "v5_effect_ledger"
 V6_MIGRATION_NAME = "v6_durable_context"
 V7_MIGRATION_NAME = "v7_background_jobs"
@@ -19,6 +19,7 @@ V8_MIGRATION_NAME = "v8_tool_registry_mcp"
 V9_MIGRATION_NAME = "v9_subagents_mailbox"
 V10_MIGRATION_NAME = "v10_verified_subtask"
 V11_MIGRATION_NAME = "v11_frozen_dag"
+V12_MIGRATION_NAME = "v12_stale_evidence"
 MAX_EVENT_PAYLOAD_BYTES = 1 * 1024 * 1024
 
 _TASK_STATUSES = frozenset({
@@ -748,6 +749,80 @@ _V11_MIGRATION_SOURCE = "\n".join(
 V11_CHECKSUM = _sha256_text(_V11_MIGRATION_SOURCE)
 
 
+_V12_ADDITIONS = (
+    """
+    CREATE TABLE IF NOT EXISTS semantic_checkpoint_state_events (
+        state_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        semantic_checkpoint_id INTEGER NOT NULL
+            REFERENCES semantic_checkpoints(semantic_checkpoint_id),
+        plan_item_id INTEGER NOT NULL REFERENCES plan_items(plan_item_id),
+        state TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        replacement_checkpoint_id INTEGER
+            REFERENCES semantic_checkpoints(semantic_checkpoint_id),
+        observed_manifest_json TEXT NOT NULL DEFAULT '[]',
+        observation_complete INTEGER NOT NULL DEFAULT 0,
+        created_at REAL NOT NULL,
+        CHECK (state IN ('valid', 'stale', 'superseded')),
+        CHECK (observation_complete IN (0, 1))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_checkpoint_state_task ON "
+    "semantic_checkpoint_state_events(task_id, semantic_checkpoint_id, state_event_id)",
+    "CREATE INDEX IF NOT EXISTS idx_checkpoint_state_item ON "
+    "semantic_checkpoint_state_events(plan_item_id, state_event_id)",
+    """
+    CREATE TRIGGER IF NOT EXISTS immutable_verifier_runs
+    BEFORE UPDATE ON verifier_runs
+    BEGIN
+        SELECT RAISE(ABORT, 'verifier_runs are append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS immutable_verifier_runs_delete
+    BEFORE DELETE ON verifier_runs
+    BEGIN
+        SELECT RAISE(ABORT, 'verifier_runs are append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS immutable_semantic_checkpoints
+    BEFORE UPDATE ON semantic_checkpoints
+    BEGIN
+        SELECT RAISE(ABORT, 'semantic_checkpoints are append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS immutable_semantic_checkpoints_delete
+    BEFORE DELETE ON semantic_checkpoints
+    BEGIN
+        SELECT RAISE(ABORT, 'semantic_checkpoints are append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS immutable_checkpoint_state_events
+    BEFORE UPDATE ON semantic_checkpoint_state_events
+    BEGIN
+        SELECT RAISE(ABORT, 'semantic_checkpoint_state_events are append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS immutable_checkpoint_state_events_delete
+    BEFORE DELETE ON semantic_checkpoint_state_events
+    BEGIN
+        SELECT RAISE(ABORT, 'semantic_checkpoint_state_events are append-only');
+    END
+    """,
+)
+
+_V12_MIGRATION_SOURCE = "\n".join(
+    [_V11_MIGRATION_SOURCE.strip()]
+    + [statement.strip() for statement in _V12_ADDITIONS]
+)
+V12_CHECKSUM = _sha256_text(_V12_MIGRATION_SOURCE)
+
+
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in columns:
@@ -1323,6 +1398,38 @@ def _apply_v11_frozen_dag(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "plan_items", "consumed_turns", "INTEGER NOT NULL DEFAULT 0")
 
 
+def _apply_v12_stale_evidence(conn: sqlite3.Connection) -> None:
+    _execute_all(conn, _V12_ADDITIONS)
+    rows = conn.execute(
+        "SELECT semantic_checkpoint_id, task_id, plan_item_id "
+        "FROM semantic_checkpoints ORDER BY semantic_checkpoint_id"
+    ).fetchall()
+    now = _now()
+    for row in rows:
+        semantic_checkpoint_id = int(row[0])
+        task_id = str(row[1])
+        plan_item_id = int(row[2])
+        exists = conn.execute(
+            "SELECT 1 FROM semantic_checkpoint_state_events "
+            "WHERE semantic_checkpoint_id = ? LIMIT 1",
+            (semantic_checkpoint_id,),
+        ).fetchone()
+        if exists is not None:
+            continue
+        conn.execute(
+            "INSERT INTO semantic_checkpoint_state_events("
+            "task_id, semantic_checkpoint_id, plan_item_id, state, reason, "
+            "observed_manifest_json, observation_complete, created_at) "
+            "VALUES (?, ?, ?, 'valid', 'migration_backfill', '[]', 0, ?)",
+            (
+                task_id,
+                semantic_checkpoint_id,
+                plan_item_id,
+                now,
+            ),
+        )
+
+
 def _create_latest_schema(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys=ON")
     _execute_all(conn, _BASE_SCHEMA)
@@ -1332,6 +1439,7 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
     _apply_v9_subagents_mailbox(conn)
     _apply_v10_verified_subtask(conn)
     _apply_v11_frozen_dag(conn)
+    _apply_v12_stale_evidence(conn)
     row = conn.execute("SELECT 1 FROM schema_migrations WHERE version = ?", (SCHEMA_VERSION,)).fetchone()
     if row is None:
         conn.execute(
@@ -1340,7 +1448,7 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
                 version, name, checksum, applied_at, duration_ms, backup_filename, backup_sha256
             ) VALUES (?, ?, ?, ?, ?, NULL, NULL)
             """,
-            (SCHEMA_VERSION, MIGRATION_NAME, V11_CHECKSUM, _now(), 0.0),
+            (SCHEMA_VERSION, MIGRATION_NAME, V12_CHECKSUM, _now(), 0.0),
         )
 
 
@@ -1351,6 +1459,7 @@ V8_MIGRATION = Migration(8, V8_MIGRATION_NAME, V8_CHECKSUM, _apply_v8_tool_regis
 V9_MIGRATION = Migration(9, V9_MIGRATION_NAME, V9_CHECKSUM, _apply_v9_subagents_mailbox)
 V10_MIGRATION = Migration(10, V10_MIGRATION_NAME, V10_CHECKSUM, _apply_v10_verified_subtask)
 V11_MIGRATION = Migration(11, V11_MIGRATION_NAME, V11_CHECKSUM, _apply_v11_frozen_dag)
+V12_MIGRATION = Migration(12, V12_MIGRATION_NAME, V12_CHECKSUM, _apply_v12_stale_evidence)
 
 
 class SchemaManager:
@@ -1385,6 +1494,7 @@ class SchemaManager:
             V9_MIGRATION,
             V10_MIGRATION,
             V11_MIGRATION,
+            V12_MIGRATION,
         )
 
     def _connect(self, *, read_only: bool = False) -> sqlite3.Connection:
@@ -1446,7 +1556,7 @@ class SchemaManager:
             if not {"name", "checksum"} <= columns:
                 raise MigrationValidationError("schema_migrations is missing migration audit columns")
             latest = next(row for row in rows if int(row["version"]) == SCHEMA_VERSION)
-            if str(latest["name"]) != MIGRATION_NAME or str(latest["checksum"]) != V11_CHECKSUM:
+            if str(latest["name"]) != MIGRATION_NAME or str(latest["checksum"]) != V12_CHECKSUM:
                 raise MigrationChecksumMismatch(
                     f"migration checksum mismatch for v{SCHEMA_VERSION}: "
                     f"{latest['name']!r}/{latest['checksum']!r}"
@@ -1459,6 +1569,7 @@ class SchemaManager:
                 "tool_registrations", "mcp_connections",
                 "subagent_runs", "mailboxes", "mailbox_messages", "plan_approvals",
                 "verifier_runs", "semantic_checkpoints",
+                "semantic_checkpoint_state_events",
             }
             missing = sorted(required - tables)
             if missing:
@@ -1552,6 +1663,11 @@ class SchemaManager:
                     "verifier_bundle_hash", "verifier_implementation_hash", "evidence_manifest_json",
                     "evidence_hash",
                     "created_at",
+                },
+                "semantic_checkpoint_state_events": {
+                    "state_event_id", "task_id", "semantic_checkpoint_id", "plan_item_id",
+                    "state", "reason", "replacement_checkpoint_id", "observed_manifest_json",
+                    "observation_complete", "created_at",
                 },
             }
             for table, columns in required_columns.items():
@@ -1859,6 +1975,8 @@ class SchemaManager:
                 _apply_v10_verified_subtask(conn)
             if 11 in expected_versions:
                 _apply_v11_frozen_dag(conn)
+            if 12 in expected_versions:
+                _apply_v12_stale_evidence(conn)
 
             duration_ms = (time.perf_counter() - started) * 1000.0
             for migration in pending:
@@ -1941,4 +2059,5 @@ __all__ = [
     "V9_CHECKSUM",
     "V10_CHECKSUM",
     "V11_CHECKSUM",
+    "V12_CHECKSUM",
 ]
