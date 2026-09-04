@@ -5,6 +5,8 @@ import sqlite3
 import time
 from pathlib import Path
 
+import pytest
+
 from agent_runtime import Runtime
 from agent_runtime.fake_model import ScriptedModel
 from agent_runtime.migrations import (
@@ -368,6 +370,54 @@ def test_deleted_evidence_is_detected_and_fails_closed(tmp_path: Path) -> None:
     checkpoint = recovered.store.list_verified_subtask_checkpoints(completed.task_id)[0]
     assert checkpoint["lifecycle_state"] == "stale"
     assert recovered.store.get_plan_item(completed.task_id, "artifact")["consumed_turns"] == 1
+
+
+def test_verified_history_and_lifecycle_events_are_append_only(tmp_path: Path) -> None:
+    artifact = tmp_path / "artifact.txt"
+    artifact.write_text("stable", encoding="utf-8")
+
+    def verify(_: VerifierContext) -> VerifierResult:
+        return VerifierResult("pass", "ok", [{"path": "artifact.txt", "sha256": _sha256(artifact)}])
+
+    config = VerifiedSubtaskConfig(
+        subtask_id="artifact",
+        description="Create artifact",
+        completion_criteria="artifact exists",
+        evidence_paths=("artifact.txt",),
+        verifier_id="artifact-verifier",
+        verifier_version="1",
+        verification_rule="artifact exists",
+        verifier=verify,
+        verifier_implementation_hash="b" * 64,
+    )
+    runtime = Runtime(
+        tmp_path,
+        ScriptedModel([ModelResponse(text="done\nSUBTASK_COMPLETE")]),
+        verified_subtask=config,
+    )
+    result = runtime.run("Create artifact")
+    run = runtime.store.list_verifier_runs(result.task_id)[0]
+    checkpoint = runtime.store.list_verified_subtask_checkpoints(result.task_id)[0]
+    state_event_id = runtime.store.list_checkpoint_state_events(result.task_id)[0]["state_event_id"]
+
+    with sqlite3.connect(runtime.store.path) as connection:
+        targets = (
+            ("verifier_runs", "verifier_run_id", run["verifier_run_id"]),
+            (
+                "semantic_checkpoints",
+                "semantic_checkpoint_id",
+                checkpoint["verified_subtask_checkpoint_id"],
+            ),
+            ("semantic_checkpoint_state_events", "state_event_id", state_event_id),
+        )
+        for table, column, value in targets:
+            with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+                connection.execute(
+                    f"UPDATE {table} SET {column} = {column} WHERE {column} = ?",
+                    (value,),
+                )
+            with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+                connection.execute(f"DELETE FROM {table} WHERE {column} = ?", (value,))
 
 
 def test_resume_refreshes_completed_evidence_after_benign_change(tmp_path: Path) -> None:

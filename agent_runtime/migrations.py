@@ -1401,7 +1401,7 @@ def _apply_v11_frozen_dag(conn: sqlite3.Connection) -> None:
 def _apply_v12_stale_evidence(conn: sqlite3.Connection) -> None:
     _execute_all(conn, _V12_ADDITIONS)
     rows = conn.execute(
-        "SELECT semantic_checkpoint_id, task_id, plan_item_id "
+        "SELECT semantic_checkpoint_id, task_id, plan_item_id, evidence_manifest_json "
         "FROM semantic_checkpoints ORDER BY semantic_checkpoint_id"
     ).fetchall()
     now = _now()
@@ -1409,6 +1409,7 @@ def _apply_v12_stale_evidence(conn: sqlite3.Connection) -> None:
         semantic_checkpoint_id = int(row[0])
         task_id = str(row[1])
         plan_item_id = int(row[2])
+        evidence_manifest_json = str(row[3])
         exists = conn.execute(
             "SELECT 1 FROM semantic_checkpoint_state_events "
             "WHERE semantic_checkpoint_id = ? LIMIT 1",
@@ -1420,11 +1421,12 @@ def _apply_v12_stale_evidence(conn: sqlite3.Connection) -> None:
             "INSERT INTO semantic_checkpoint_state_events("
             "task_id, semantic_checkpoint_id, plan_item_id, state, reason, "
             "observed_manifest_json, observation_complete, created_at) "
-            "VALUES (?, ?, ?, 'valid', 'migration_backfill', '[]', 0, ?)",
+            "VALUES (?, ?, ?, 'valid', 'migration_backfill', ?, 1, ?)",
             (
                 task_id,
                 semantic_checkpoint_id,
                 plan_item_id,
+                evidence_manifest_json,
                 now,
             ),
         )
