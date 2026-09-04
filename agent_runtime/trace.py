@@ -94,6 +94,19 @@ class TraceReporter:
             "projection_basis": projection_metrics["basis"],
             "projection_used_count": projection_metrics["used_count"],
             "projection_token_estimates": projection_metrics["token_estimates"],
+            "verified_scoped_resume_count": projection_metrics["scoped_resume_count"],
+            "verified_scoped_token_estimates": projection_metrics["scoped_token_estimates"],
+            "verified_scoped_budgets": projection_metrics["scoped_budgets"],
+            "verified_scoped_resume_unit_ids": projection_metrics["scoped_resume_unit_ids"],
+            "verified_scoped_dependency_counts": projection_metrics["scoped_dependency_counts"],
+            "verified_scoped_relevant_path_counts": projection_metrics["scoped_relevant_path_counts"],
+            "verified_scoped_overflow_count": (
+                projection_metrics["scoped_overflow_count"]
+                + sum(event["type"] == "verified_scoped_context_overflow" for event in events)
+            ),
+            "verified_scoped_context_failure_count": sum(
+                event["type"] == "verified_scoped_context_failed" for event in events
+            ),
             "memory_count": projection_metrics["memory_count"],
             "summary_count": projection_metrics["summary_count"],
             "plan_item_count": sum(
@@ -126,6 +139,13 @@ class TraceReporter:
         token_estimates: list[int] = []
         memory_count = 0
         summary_count = 0
+        scoped_resume_count = 0
+        scoped_token_estimates: list[int] = []
+        scoped_budgets: list[int] = []
+        scoped_resume_unit_ids: list[str] = []
+        scoped_dependency_counts: list[int] = []
+        scoped_relevant_path_counts: list[int] = []
+        scoped_overflow_count = 0
         for call in models:
             projection = call.get("projection") or {}
             basis = projection.get("basis")
@@ -138,12 +158,33 @@ class TraceReporter:
                 token_estimates.append(int(estimate))
             memory_count = max(memory_count, int(projection.get("memory_count") or 0))
             summary_count = max(summary_count, int(projection.get("summary_count") or 0))
+            if projection.get("basis") == "verified_scoped" or projection.get("scoped_resume"):
+                scoped_resume_count += 1
+                if isinstance(estimate, (int, float)):
+                    scoped_token_estimates.append(int(estimate))
+                budget = projection.get("scoped_context_budget")
+                if isinstance(budget, (int, float)):
+                    scoped_budgets.append(int(budget))
+                resume_unit_id = projection.get("resume_unit_id")
+                if resume_unit_id is not None:
+                    scoped_resume_unit_ids.append(str(resume_unit_id))
+                scoped_dependency_counts.append(int(projection.get("dependency_count") or 0))
+                scoped_relevant_path_counts.append(int(projection.get("relevant_path_count") or 0))
+                if projection.get("overflow") or projection.get("overflow_outcome") == "overflow":
+                    scoped_overflow_count += 1
         return {
             "basis": sorted(bases),
             "used_count": used_count,
             "token_estimates": token_estimates,
             "memory_count": memory_count,
             "summary_count": summary_count,
+            "scoped_resume_count": scoped_resume_count,
+            "scoped_token_estimates": scoped_token_estimates,
+            "scoped_budgets": scoped_budgets,
+            "scoped_resume_unit_ids": scoped_resume_unit_ids,
+            "scoped_dependency_counts": scoped_dependency_counts,
+            "scoped_relevant_path_counts": scoped_relevant_path_counts,
+            "scoped_overflow_count": scoped_overflow_count,
         }
 
     def _plan_metrics(self, task_id: str) -> dict[str, Any]:

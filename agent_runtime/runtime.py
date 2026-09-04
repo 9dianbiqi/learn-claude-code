@@ -32,6 +32,11 @@ from .store import EffectBlocked, EventStore, InvariantViolation, LeaseLost, Sta
 from .tools import FileConflict, ShellResult, ToolExecutor
 from .tool_registry import ToolRegistry
 from .projector import ContextProjector, estimate_tokens
+from .scoped_resume import (
+    ScopedContextError,
+    ScopedContextProjection,
+    VerifiedScopedResume,
+)
 from .verified_evidence import VerifiedEvidenceRecovery, capture_evidence_manifest
 
 
@@ -109,7 +114,8 @@ class Runtime:
                  lease_ttl: float = 300.0,
                  tool_scope: set[str] | None = None,
                  verified_subtask: VerifiedSubtaskConfig | None = None,
-                 verified_subtask_dag: VerifiedSubtaskDAGConfig | None = None):
+                 verified_subtask_dag: VerifiedSubtaskDAGConfig | None = None,
+                 scoped_context_budget: int | None = None):
         if verified_subtask is not None and verified_subtask_dag is not None:
             raise ValueError("verified_subtask and verified_subtask_dag are mutually exclusive")
         self.repo_root = Path(repo_root).resolve()
@@ -133,6 +139,14 @@ class Runtime:
         self._subagent_fencing: dict[str, str] = {}
         self._subagent_tool_scopes: dict[str, set[str] | None] = {}
         self.verified_subtask_dag = verified_subtask_dag
+        if scoped_context_budget is not None:
+            if (
+                isinstance(scoped_context_budget, bool)
+                or not isinstance(scoped_context_budget, int)
+                or scoped_context_budget < 1
+            ):
+                raise ValueError("scoped_context_budget must be a positive integer")
+        self.scoped_context_budget = scoped_context_budget
         self._dag_nodes = (
             {node.subtask_id: node for node in verified_subtask_dag.nodes}
             if verified_subtask_dag is not None else {}
@@ -144,6 +158,16 @@ class Runtime:
                 {verified_subtask.subtask_id: verified_subtask}
                 if verified_subtask is not None else {}
             ),
+        )
+        self._scoped_resume = (
+            VerifiedScopedResume(
+                self.store,
+                self.repo_root,
+                self._dag_nodes,
+                tuple(node.subtask_id for node in verified_subtask_dag.nodes),
+            )
+            if verified_subtask_dag is not None
+            else None
         )
         self.tools = ToolExecutor(self.repo_root)
         if float(self.tools.shell_timeout) >= lease_ttl:
@@ -353,12 +377,28 @@ class Runtime:
         marker_subtask_id: str | None = None,
     ) -> RunResult | None:
         if self.verified_subtask_dag is not None:
+            if marker_subtask_id is not None:
+                marker_item = self.store.get_plan_item(task_id, marker_subtask_id)
+                if marker_item is not None and marker_item["status"] == "retryable":
+                    # Do not let _select_dag_item start the reopened node and
+                    # then feed it the stale completion marker below.
+                    return None
             item = self._select_dag_item(task_id)
             if item is None:
                 return None
             if marker_subtask_id is not None and item["subtask_id"] != marker_subtask_id:
                 return None
             if item["status"] == "completed":
+                return None
+            # A completion marker recovered from an old execution checkpoint
+            # cannot complete a node that Ticket #9 reopened as retryable
+            # after stale-evidence invalidation.  The node must receive a new
+            # model turn; otherwise F4 would silently trust the stale marker.
+            if (
+                self.verified_subtask_dag is not None
+                and marker_subtask_id == item["subtask_id"]
+                and item["status"] == "retryable"
+            ):
                 return None
             config = self._dag_config_for_item(item)
         else:
@@ -603,7 +643,11 @@ class Runtime:
                 self.store.assert_invariants(task_id)
                 completed = self.store.get_completed_result(task_id)
                 return RunResult(task_id, "completed", completed["final_text"])
-            return self._resume_task(task_id, lease_acquired=True)
+            return self._resume_task(
+                task_id,
+                lease_acquired=True,
+                scoped_resume=self.scoped_context_budget is not None,
+            )
         finally:
             if self._lease_token is not None:
                 self._release()
@@ -626,7 +670,13 @@ class Runtime:
     def _verified_plan_item(self, task_id: str) -> dict[str, Any]:
         return self._assert_verified_subtask_config(task_id)
 
-    def _resume_task(self, task_id: str, lease_acquired: bool) -> RunResult:
+    def _resume_task(
+        self,
+        task_id: str,
+        lease_acquired: bool,
+        *,
+        scoped_resume: bool = False,
+    ) -> RunResult:
         acquired_here = False
         if not lease_acquired:
             self._acquire(task_id)
@@ -663,6 +713,7 @@ class Runtime:
                 pending_calls=pending,
                 resume_recovery=True,
                 lease_acquired=True,
+                scoped_resume=scoped_resume and self.verified_subtask_dag is not None,
             )
         except Exception:
             if acquired_here and self._lease_token is not None:
@@ -795,10 +846,13 @@ class Runtime:
     def _run_task(self, task_id: str, messages: list[dict], turn: int,
                   pending_calls: list[ToolCall] | None = None,
                   resume_recovery: bool = False,
-                  lease_acquired: bool = False) -> RunResult:
+                  lease_acquired: bool = False,
+                  scoped_resume: bool = False) -> RunResult:
         recovered_completion_text: str | None = None
         verified_marker_checkpoint_id: int | None = None
         verified_marker_subtask_id: str | None = None
+        scoped_projection: ScopedContextProjection | None = None
+        scoped_boundary_message_count: int | None = None
         self._pending_review = None
         previous_active_task = self._active_task_id
         self._active_task_id = task_id
@@ -818,6 +872,12 @@ class Runtime:
             current_checkpoint = self.store.get_checkpoint(current_checkpoint_id)
             messages = current_checkpoint["messages"]
             turn = int(current_checkpoint["cursor"].get("turn", 0))
+            if scoped_resume and self.verified_subtask_dag is not None:
+                # The checkpoint recovered above is the resume boundary.  Any
+                # messages appended while replaying a pending response/tool
+                # belong to the scoped tail; pre-interruption history never
+                # enters the model view.
+                scoped_boundary_message_count = len(messages)
             phase = current_checkpoint["phase"]
             pending_calls = self._pending_calls(messages) if phase in {
                 "model_responded", "waiting_approval", "needs_review"
@@ -930,7 +990,83 @@ class Runtime:
                         return self._fail_dag_budget(task_id, current_item, messages, turn)
 
                 checkpoint_id = self.store.get_task(task_id)["checkpoint_id"]
-                projection = self.projector.project(task_id, messages, checkpoint_id)
+                if (
+                    scoped_resume
+                    and self.verified_subtask_dag is not None
+                    and self._scoped_resume is not None
+                    and self.scoped_context_budget is not None
+                    and current_item is not None
+                ):
+                    if scoped_boundary_message_count is None:
+                        scoped_boundary_message_count = len(messages)
+                    post_resume_messages = messages[scoped_boundary_message_count:]
+                    try:
+                        if scoped_projection is None:
+                            scoped_projection = self._scoped_resume.build(
+                                task_id,
+                                current_item,
+                                post_resume_messages,
+                                self.scoped_context_budget,
+                                source_checkpoint_id=checkpoint_id,
+                            )
+                        else:
+                            scoped_projection = scoped_projection.with_post_resume_messages(
+                                post_resume_messages
+                            )
+                    except ScopedContextError as exc:
+                        error = f"verified-scoped context construction failed: {exc}"
+                        self.store.append_event(
+                            task_id,
+                            "verified_scoped_context_failed",
+                            {
+                                "error": error,
+                                "resume_unit_id": current_item.get("subtask_id"),
+                                "reason": str(exc),
+                            },
+                        )
+                        self.store.fail_plan_item_and_task(
+                            task_id,
+                            int(current_item["plan_item_id"]),
+                            messages,
+                            {
+                                "turn": turn,
+                                "active_subtask_id": current_item["subtask_id"],
+                            },
+                            error,
+                        )
+                        return RunResult(task_id, "failed", error=error)
+                    if scoped_projection.metrics.get("overflow"):
+                        estimated = int(scoped_projection.metrics["token_estimate"])
+                        budget = int(self.scoped_context_budget)
+                        error = (
+                            "verified-scoped context budget overflow: "
+                            f"estimated {estimated} tokens exceeds budget {budget} "
+                            f"for resume unit {current_item['subtask_id']}"
+                        )
+                        self.store.append_event(
+                            task_id,
+                            "verified_scoped_context_overflow",
+                            {
+                                **scoped_projection.metrics,
+                                "error": error,
+                                "resume_unit_id": current_item["subtask_id"],
+                                "outcome": "overflow",
+                            },
+                        )
+                        self.store.fail_plan_item_and_task(
+                            task_id,
+                            int(current_item["plan_item_id"]),
+                            messages,
+                            {
+                                "turn": turn,
+                                "active_subtask_id": current_item["subtask_id"],
+                            },
+                            error,
+                        )
+                        return RunResult(task_id, "failed", error=error)
+                    projection = scoped_projection
+                else:
+                    projection = self.projector.project(task_id, messages, checkpoint_id)
                 projected_messages = projection.messages
                 active_tool_scope = self._effective_tool_scope()
                 tool_schemas = [
