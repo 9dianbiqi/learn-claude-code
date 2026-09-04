@@ -10,6 +10,7 @@ from agent_runtime import Runtime
 from agent_runtime.fake_model import ScriptedModel
 from agent_runtime.models import (
     ModelResponse,
+    ToolCall,
     VerifierContext,
     VerifierResult,
     VerifiedSubtaskConfig,
@@ -563,3 +564,176 @@ def test_missing_required_dependency_snapshot_fails_closed(tmp_path: Path, monke
         event["type"] == "verified_scoped_context_failed"
         for event in resumed.store.list_events(task_id)
     )
+
+
+def test_scoped_base_rebuilds_when_resume_advances_to_next_dag_item(tmp_path: Path) -> None:
+    for name in ("dependency", "current", "next"):
+        (tmp_path / f"{name}.txt").write_text(name, encoding="utf-8")
+
+    def verify(context: VerifierContext) -> VerifierResult:
+        path = Path(context.repo_root) / f"{context.subtask_id}.txt"
+        return VerifierResult(
+            "pass",
+            f"{context.subtask_id} passed",
+            [{"path": f"{context.subtask_id}.txt", "sha256": _sha256(path)}],
+        )
+
+    dag = VerifiedSubtaskDAGConfig(
+        nodes=(
+            _node("dependency", verify),
+            _node("current", verify, blocked_by=("dependency",)),
+            _node("next", verify, blocked_by=("current",)),
+        )
+    )
+    before_model_calls = 0
+
+    def crash(point: str, **_: object) -> None:
+        nonlocal before_model_calls
+        if point == "before_model_call":
+            before_model_calls += 1
+            if before_model_calls == 2:
+                raise InjectedCrash(point)
+
+    first = Runtime(
+        tmp_path,
+        ScriptedModel([ModelResponse(text="dependency\nSUBTASK_COMPLETE")]),
+        verified_subtask_dag=dag,
+        fault_injector=crash,
+    )
+    with pytest.raises(InjectedCrash):
+        first.run("Complete the dependency, current item, and next item")
+    task_id = first.store.list_tasks()[0]["task_id"]
+
+    resumed_model = ScriptedModel([
+        ModelResponse(text="current\nSUBTASK_COMPLETE"),
+        ModelResponse(text="next\nSUBTASK_COMPLETE"),
+    ])
+    resumed = Runtime(
+        tmp_path,
+        resumed_model,
+        verified_subtask_dag=dag,
+        scoped_context_budget=10_000,
+    )
+    result = resumed.resume(task_id)
+
+    assert result.status == "completed"
+    assert resumed_model.call_count == 2
+    second_bundle = json.loads(
+        resumed_model.calls[1][0]["content"].split("\n", 1)[1]
+    )
+    assert second_bundle["resume_unit"]["subtask_id"] == "next"
+    assert [
+        snapshot["subtask_id"]
+        for snapshot in second_bundle["required_dependency_snapshots"]
+    ] == ["dependency", "current"]
+    assert second_bundle["relevant_path_state"][0]["path"] == "next.txt"
+    assert resumed.store.list_model_calls(task_id)[-1]["projection"]["resume_unit_id"] == "next"
+
+
+def test_scoped_resume_pairs_recovered_tool_use_with_tool_result(tmp_path: Path) -> None:
+    artifact = tmp_path / "artifact.txt"
+    artifact.write_text("artifact", encoding="utf-8")
+
+    def verify(context: VerifierContext) -> VerifierResult:
+        return VerifierResult(
+            "pass",
+            "artifact passed",
+            [{"path": "artifact.txt", "sha256": _sha256(artifact)}],
+        )
+
+    dag = VerifiedSubtaskDAGConfig(nodes=(_node("artifact", verify),))
+
+    def crash(point: str, **_: object) -> None:
+        if point == "after_model_response":
+            raise InjectedCrash(point)
+
+    first = Runtime(
+        tmp_path,
+        ScriptedModel([
+            ModelResponse(tool_calls=[
+                ToolCall("read-artifact", "read_file", {"path": "artifact.txt"})
+            ])
+        ]),
+        verified_subtask_dag=dag,
+        fault_injector=crash,
+    )
+    with pytest.raises(InjectedCrash):
+        first.run("Read and verify the artifact")
+    task_id = first.store.list_tasks()[0]["task_id"]
+
+    resumed_model = ScriptedModel([ModelResponse(text="done\nSUBTASK_COMPLETE")])
+    resumed = Runtime(
+        tmp_path,
+        resumed_model,
+        verified_subtask_dag=dag,
+        scoped_context_budget=10_000,
+    )
+    result = resumed.resume(task_id)
+
+    assert result.status == "completed"
+    assert resumed_model.call_count == 1
+    model_messages = resumed_model.calls[0]
+    assistant_index = next(
+        index
+        for index, message in enumerate(model_messages)
+        if message.get("role") == "assistant"
+        and any(
+            isinstance(block, dict)
+            and block.get("type") == "tool_use"
+            and block.get("id") == "read-artifact"
+            for block in message.get("content", [])
+        )
+    )
+    assert model_messages[assistant_index + 1]["role"] == "user"
+    assert any(
+        isinstance(block, dict)
+        and block.get("type") == "tool_result"
+        and block.get("tool_use_id") == "read-artifact"
+        for block in model_messages[assistant_index + 1].get("content", [])
+    )
+
+
+def test_scoped_bundle_marks_missing_relevant_path_without_hash_or_size(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.txt"
+
+    def verify(_: VerifierContext) -> VerifierResult:
+        raise AssertionError("verifier should not run before this test's budget boundary")
+
+    config = _node("missing", verify)
+    dag = VerifiedSubtaskDAGConfig(nodes=(config,))
+
+    def crash(point: str, **_: object) -> None:
+        if point == "before_model_call":
+            raise InjectedCrash(point)
+
+    first = Runtime(
+        tmp_path,
+        ScriptedModel([ModelResponse(text="never called")]),
+        verified_subtask_dag=dag,
+        fault_injector=crash,
+    )
+    with pytest.raises(InjectedCrash):
+        first.run("Build the missing artifact")
+    task_id = first.store.list_tasks()[0]["task_id"]
+    assert not missing.exists()
+
+    resumed_model = ScriptedModel([
+        ModelResponse(text="still working"),
+        ModelResponse(text="still working"),
+    ])
+    resumed = Runtime(
+        tmp_path,
+        resumed_model,
+        verified_subtask_dag=dag,
+        scoped_context_budget=10_000,
+    )
+    result = resumed.resume(task_id)
+
+    assert result.status == "failed"
+    assert resumed_model.call_count == 2
+    bundle = json.loads(resumed_model.calls[0][0]["content"].split("\n", 1)[1])
+    path_state = bundle["relevant_path_state"][0]
+    assert path_state["path"] == "missing.txt"
+    assert path_state["missing"] is True
+    assert path_state["sha256"] is None
+    assert path_state["size"] is None
