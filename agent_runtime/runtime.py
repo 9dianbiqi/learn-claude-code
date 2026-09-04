@@ -2484,52 +2484,59 @@ class Runtime:
                     return []
                 return [copy.deepcopy(assistant), copy.deepcopy(user)]
             if isinstance(assistant_content, list):
-                text_blocks = [
-                    copy.deepcopy(block)
+                if any(
+                    isinstance(block, dict) and block.get("type") == "tool_use"
                     for block in assistant_content
-                    if (
-                        isinstance(block, dict)
-                        and block.get("type") == "text"
-                        and str(block.get("text") or "").strip()
-                    )
-                ]
-                if text_blocks:
-                    return [
-                        {"role": "assistant", "content": text_blocks},
-                        {"role": "user", "content": user_content},
-                    ]
+                ):
+                    return []
+                if not assistant_content or any(
+                    not isinstance(block, dict)
+                    or block.get("type") != "text"
+                    or not str(block.get("text") or "").strip()
+                    for block in assistant_content
+                ):
+                    return []
+                return [copy.deepcopy(assistant), copy.deepcopy(user)]
             return []
 
         if not isinstance(user_content, list):
             return []
-        result_blocks = [
-            copy.deepcopy(block)
+        if not user_content or any(
+            not isinstance(block, dict) or block.get("type") != "tool_result"
+            or not isinstance(block.get("tool_use_id"), str)
+            or not block["tool_use_id"].strip()
             for block in user_content
-            if (
-                isinstance(block, dict)
-                and block.get("type") == "tool_result"
-                and block.get("tool_use_id") is not None
-            )
-        ]
-        if not result_blocks or not isinstance(assistant.get("content"), list):
+        ):
             return []
-        result_ids = {str(block["tool_use_id"]) for block in result_blocks}
+        assistant_content = assistant.get("content")
+        if not isinstance(assistant_content, list) or not assistant_content:
+            return []
+        if any(
+            not isinstance(block, dict) or block.get("type") not in {"tool_use", "text"}
+            for block in assistant_content
+        ):
+            return []
+        if any(
+            block.get("type") == "text"
+            and (not isinstance(block.get("text"), str) or not block["text"].strip())
+            for block in assistant_content
+        ):
+            return []
         tool_use_blocks = [
-            copy.deepcopy(block)
-            for block in assistant["content"]
-            if (
-                isinstance(block, dict)
-                and block.get("type") == "tool_use"
-                and block.get("id") is not None
-                and str(block["id"]) in result_ids
-            )
+            block for block in assistant_content if block.get("type") == "tool_use"
         ]
-        if {str(block["id"]) for block in tool_use_blocks} != result_ids:
+        if not tool_use_blocks or any(
+            not isinstance(block.get("id"), str) or not block["id"].strip()
+            for block in tool_use_blocks
+        ):
             return []
-        return [
-            {"role": "assistant", "content": tool_use_blocks},
-            {"role": "user", "content": result_blocks},
-        ]
+        tool_use_ids = [block["id"] for block in tool_use_blocks]
+        result_ids = [block["tool_use_id"] for block in user_content]
+        if len(tool_use_ids) != len(set(tool_use_ids)) or len(result_ids) != len(set(result_ids)):
+            return []
+        if set(tool_use_ids) != set(result_ids):
+            return []
+        return [copy.deepcopy(assistant), copy.deepcopy(user)]
 
     @staticmethod
     def _last_text(messages: list[dict]) -> str:
