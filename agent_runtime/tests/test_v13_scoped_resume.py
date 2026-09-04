@@ -17,6 +17,7 @@ from agent_runtime.models import (
     VerifiedSubtaskDAGConfig,
 )
 from agent_runtime.runtime import InjectedCrash
+from agent_runtime.projector import estimate_tokens
 from agent_runtime.trace import TraceReporter
 
 
@@ -737,3 +738,225 @@ def test_scoped_bundle_marks_missing_relevant_path_without_hash_or_size(tmp_path
     assert path_state["missing"] is True
     assert path_state["sha256"] is None
     assert path_state["size"] is None
+
+
+def _seed_tool_results_checkpoint(
+    repo: Path,
+    pair: list[dict],
+) -> tuple[VerifiedSubtaskDAGConfig, str]:
+    artifact = repo / "artifact.txt"
+    artifact.write_text("artifact", encoding="utf-8")
+
+    def verify(context: VerifierContext) -> VerifierResult:
+        return VerifierResult(
+            "pass",
+            "artifact passed",
+            [{"path": "artifact.txt", "sha256": _sha256(artifact)}],
+        )
+
+    dag = VerifiedSubtaskDAGConfig(nodes=(_node("artifact", verify),))
+
+    def crash(point: str, **_: object) -> None:
+        if point == "before_model_call":
+            raise InjectedCrash(point)
+
+    first = Runtime(
+        repo,
+        ScriptedModel([ModelResponse(text="never called")]),
+        verified_subtask_dag=dag,
+        fault_injector=crash,
+    )
+    with pytest.raises(InjectedCrash):
+        first.run("Resume with the artifact context")
+    task_id = first.store.list_tasks()[0]["task_id"]
+    checkpoint = first.store.get_checkpoint(first.store.get_task(task_id)["checkpoint_id"])
+    first.store.save_checkpoint(
+        task_id,
+        "tool_results_appended",
+        checkpoint["messages"] + pair,
+        {"turn": checkpoint["cursor"].get("turn", 0)},
+    )
+    return dag, task_id
+
+
+def test_scoped_resume_keeps_pair_from_tool_results_checkpoint(tmp_path: Path) -> None:
+    pair = [
+        {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "recovered-read",
+                "name": "read_file",
+                "input": {"path": "artifact.txt"},
+            }],
+        },
+        {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "recovered-read",
+                "content": "artifact",
+            }],
+        },
+    ]
+    dag, task_id = _seed_tool_results_checkpoint(tmp_path, pair)
+    resumed_model = ScriptedModel([ModelResponse(text="done\nSUBTASK_COMPLETE")])
+    resumed = Runtime(
+        tmp_path,
+        resumed_model,
+        verified_subtask_dag=dag,
+        scoped_context_budget=10_000,
+    )
+
+    result = resumed.resume(task_id)
+
+    assert result.status == "completed"
+    messages = resumed_model.calls[0]
+    assistant_index = next(
+        index
+        for index, message in enumerate(messages)
+        if message.get("role") == "assistant"
+        and any(
+            isinstance(block, dict)
+            and block.get("type") == "tool_use"
+            and block.get("id") == "recovered-read"
+            for block in message.get("content", [])
+        )
+    )
+    assert messages[assistant_index + 1] == pair[1]
+    assert not any(
+        message.get("role") == "user" and message.get("content") == []
+        for message in messages
+    )
+    assert all(
+        "Resume with the artifact context" not in str(message.get("content", ""))
+        for message in messages
+        if message is not messages[0]
+    )
+
+
+def test_structured_scoped_content_overflow_fails_closed_without_model_call(tmp_path: Path) -> None:
+    structured_pair = [
+        {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "large-structured",
+                "name": "read_file",
+                "input": {
+                    "path": "artifact.txt",
+                    "nested": {"payload": "structured-input-" + "x" * 8_000},
+                },
+            }],
+        },
+        {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "large-structured",
+                "content": {
+                    "status": "ok",
+                    "result": "structured-result-" + "y" * 8_000,
+                },
+            }],
+        },
+    ]
+    repo = tmp_path / "overflow"
+    repo.mkdir()
+    dag, task_id = _seed_tool_results_checkpoint(repo, structured_pair)
+
+    probe = Runtime(
+        repo,
+        ScriptedModel([ModelResponse(text="never called")]),
+        verified_subtask_dag=dag,
+        scoped_context_budget=100_000,
+        fault_injector=lambda point, **_: (
+            (_ for _ in ()).throw(InjectedCrash(point))
+            if point == "before_model_call"
+            else None
+        ),
+    )
+    with pytest.raises(InjectedCrash):
+        probe.resume(task_id)
+    estimate = probe.store.list_model_calls(task_id)[-1]["projection"]["token_estimate"]
+
+    overflow_model = ScriptedModel([ModelResponse(text="must not be called")])
+    overflow = Runtime(
+        repo,
+        overflow_model,
+        verified_subtask_dag=dag,
+        scoped_context_budget=estimate - 1,
+    )
+    result = overflow.resume(task_id)
+
+    assert result.status == "failed"
+    assert overflow_model.call_count == 0
+    assert result.error is not None and "scoped context budget overflow" in result.error
+    assert estimate > 1
+    overflow_event = next(
+        event
+        for event in overflow.store.list_events(task_id)
+        if event["type"] == "verified_scoped_context_overflow"
+    )
+    assert estimate == overflow_event["payload"]["token_estimate"]
+
+
+def test_structured_scoped_content_exact_fit_is_accepted(tmp_path: Path) -> None:
+    structured_pair = [
+        {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "exact-structured",
+                "name": "read_file",
+                "input": {"path": "artifact.txt", "limit": 1},
+            }],
+        },
+        {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "exact-structured",
+                "content": {"status": "ok", "lines": ["artifact"]},
+            }],
+        },
+    ]
+    repo = tmp_path / "exact"
+    repo.mkdir()
+    dag, task_id = _seed_tool_results_checkpoint(repo, structured_pair)
+
+    probe = Runtime(
+        repo,
+        ScriptedModel([ModelResponse(text="never called")]),
+        verified_subtask_dag=dag,
+        scoped_context_budget=100_000,
+        fault_injector=lambda point, **_: (
+            (_ for _ in ()).throw(InjectedCrash(point))
+            if point == "before_model_call"
+            else None
+        ),
+    )
+    with pytest.raises(InjectedCrash):
+        probe.resume(task_id)
+    probe_call = probe.store.list_model_calls(task_id)[-1]
+    estimate = probe_call["projection"]["token_estimate"]
+    canonical = json.dumps(
+        probe_call["projection"]["messages"],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert estimate == estimate_tokens(canonical)
+
+    exact_model = ScriptedModel([ModelResponse(text="done\nSUBTASK_COMPLETE")])
+    exact = Runtime(
+        repo,
+        exact_model,
+        verified_subtask_dag=dag,
+        scoped_context_budget=estimate,
+    )
+    result = exact.resume(task_id)
+
+    assert result.status == "completed"
+    assert exact_model.call_count == 1
+    assert exact.store.list_model_calls(task_id)[-1]["projection"]["overflow"] is False
