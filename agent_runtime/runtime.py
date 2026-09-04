@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -843,6 +844,7 @@ class Runtime:
         verified_marker_subtask_id: str | None = None
         scoped_projection: ScopedContextProjection | None = None
         scoped_boundary_message_count: int | None = None
+        scoped_pending_tool_use_message: dict[str, Any] | None = None
         self._pending_review = None
         previous_active_task = self._active_task_id
         self._active_task_id = task_id
@@ -862,16 +864,34 @@ class Runtime:
             current_checkpoint = self.store.get_checkpoint(current_checkpoint_id)
             messages = current_checkpoint["messages"]
             turn = int(current_checkpoint["cursor"].get("turn", 0))
-            if scoped_resume and self.verified_subtask_dag is not None:
-                # The checkpoint recovered above is the resume boundary.  Any
-                # messages appended while replaying a pending response/tool
-                # belong to the scoped tail; pre-interruption history never
-                # enters the model view.
-                scoped_boundary_message_count = len(messages)
             phase = current_checkpoint["phase"]
             pending_calls = self._pending_calls(messages) if phase in {
                 "model_responded", "waiting_approval", "needs_review"
             } else []
+            if scoped_resume and self.verified_subtask_dag is not None:
+                # The checkpoint recovered above is the resume boundary. Any
+                # messages appended while replaying a pending response/tool
+                # belong to the scoped tail; pre-interruption history never
+                # enters the model view. Keep only the corresponding assistant
+                # tool-use blocks so replayed tool results remain structurally
+                # paired without restoring unrelated conversation history.
+                scoped_boundary_message_count = len(messages)
+                if pending_calls and messages and messages[-1].get("role") == "assistant":
+                    pending_ids = {call.id for call in pending_calls}
+                    tool_use_blocks = [
+                        copy.deepcopy(block)
+                        for block in messages[-1].get("content", [])
+                        if (
+                            isinstance(block, dict)
+                            and block.get("type") == "tool_use"
+                            and str(block.get("id")) in pending_ids
+                        )
+                    ]
+                    if tool_use_blocks:
+                        scoped_pending_tool_use_message = {
+                            "role": "assistant",
+                            "content": tool_use_blocks,
+                        }
             if phase == "model_responded" and not pending_calls:
                 last_text = self._last_text(messages)
                 if self._uses_verified_subtasks() and self._has_completion_marker(last_text):
@@ -990,8 +1010,17 @@ class Runtime:
                     if scoped_boundary_message_count is None:
                         scoped_boundary_message_count = len(messages)
                     post_resume_messages = messages[scoped_boundary_message_count:]
+                    if scoped_pending_tool_use_message is not None:
+                        post_resume_messages = [
+                            scoped_pending_tool_use_message,
+                            *post_resume_messages,
+                        ]
                     try:
-                        if scoped_projection is None:
+                        if (
+                            scoped_projection is None
+                            or scoped_projection.metrics.get("resume_unit_id")
+                            != current_item.get("subtask_id")
+                        ):
                             scoped_projection = self._scoped_resume.build(
                                 task_id,
                                 current_item,

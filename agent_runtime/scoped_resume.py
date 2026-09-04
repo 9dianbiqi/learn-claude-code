@@ -365,7 +365,7 @@ class VerifiedScopedResume:
             "path": relative_path,
             "sha256": None,
             "size": None,
-            "missing": False,
+            "missing": True,
             "status": "missing",
         }
         try:
@@ -382,6 +382,7 @@ class VerifiedScopedResume:
             state["size"] = int(stat_result.st_size)
             if not stat.S_ISREG(stat_result.st_mode):
                 state["status"] = "not_regular"
+                state["size"] = None
                 return state
             digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
             state["sha256"] = digest
@@ -390,6 +391,8 @@ class VerifiedScopedResume:
             return state
         except (OSError, PermissionError):
             state["status"] = "unreadable"
+            state["sha256"] = None
+            state["size"] = None
             return state
 
 
