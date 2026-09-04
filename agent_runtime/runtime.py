@@ -1011,7 +1011,8 @@ class Runtime:
                             )
                         else:
                             scoped_projection = scoped_projection.with_post_resume_messages(
-                                post_resume_messages
+                                post_resume_messages,
+                                source_checkpoint_id=checkpoint_id,
                             )
                     except ScopedContextError as exc:
                         error = f"verified-scoped context construction failed: {exc}"

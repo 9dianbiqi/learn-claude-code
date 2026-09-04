@@ -139,6 +139,41 @@ def test_scoped_mode_is_inactive_during_uninterrupted_run(tmp_path: Path) -> Non
     assert projection.get("scoped_resume") is not True
 
 
+def test_valid_completed_resume_returns_persisted_result_without_scoped_context(tmp_path: Path) -> None:
+    artifact = tmp_path / "only.txt"
+    artifact.write_text("only", encoding="utf-8")
+
+    def verify(context: VerifierContext) -> VerifierResult:
+        return VerifierResult(
+            "pass",
+            "only passed",
+            [{"path": "only.txt", "sha256": _sha256(artifact)}],
+        )
+
+    dag = VerifiedSubtaskDAGConfig(nodes=(_node("only", verify),))
+    first = Runtime(
+        tmp_path,
+        ScriptedModel([ModelResponse(text="only done\nSUBTASK_COMPLETE")]),
+        verified_subtask_dag=dag,
+    )
+    completed = first.run("Complete only")
+    calls_before = len(first.store.list_model_calls(completed.task_id))
+
+    resumed_model = ScriptedModel([])
+    resumed = Runtime(
+        tmp_path,
+        resumed_model,
+        verified_subtask_dag=dag,
+        scoped_context_budget=1,
+    )
+    result = resumed.resume(completed.task_id)
+
+    assert result.status == "completed"
+    assert result.final_text == "only done\n"
+    assert resumed_model.call_count == 0
+    assert len(resumed.store.list_model_calls(completed.task_id)) == calls_before
+
+
 def test_scoped_context_overflow_fails_closed_without_model_call(tmp_path: Path) -> None:
     artifact = tmp_path / "only.txt"
     artifact.write_text("only", encoding="utf-8")

@@ -45,6 +45,7 @@ class ScopedContextProjection:
     def with_post_resume_messages(
         self,
         post_resume_messages: Sequence[Mapping[str, Any]],
+        source_checkpoint_id: int | None = None,
     ) -> "ScopedContextProjection":
         """Reuse the immutable scoped base while extending only the resume tail."""
 
@@ -65,7 +66,11 @@ class ScopedContextProjection:
                 else None
             ),
         }
-        return ScopedContextProjection(view, metrics, self.source_checkpoint_id)
+        return ScopedContextProjection(
+            view,
+            metrics,
+            self.source_checkpoint_id if source_checkpoint_id is None else source_checkpoint_id,
+        )
 
 
 def _render_messages(messages: Sequence[Mapping[str, Any]]) -> str:

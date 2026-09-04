@@ -107,6 +107,18 @@ class TraceReporter:
             "verified_scoped_context_failure_count": sum(
                 event["type"] == "verified_scoped_context_failed" for event in events
             ),
+            # Keep concise scoped names alongside the verified-prefixed
+            # fields for trace consumers that group projection modes.
+            "scoped_resume_count": projection_metrics["scoped_resume_count"],
+            "scoped_token_estimates": projection_metrics["scoped_token_estimates"],
+            "scoped_context_budgets": projection_metrics["scoped_budgets"],
+            "scoped_resume_unit_ids": projection_metrics["scoped_resume_unit_ids"],
+            "scoped_dependency_counts": projection_metrics["scoped_dependency_counts"],
+            "scoped_relevant_path_counts": projection_metrics["scoped_relevant_path_counts"],
+            "scoped_context_overflow_count": (
+                projection_metrics["scoped_overflow_count"]
+                + sum(event["type"] == "verified_scoped_context_overflow" for event in events)
+            ),
             "memory_count": projection_metrics["memory_count"],
             "summary_count": projection_metrics["summary_count"],
             "plan_item_count": sum(
