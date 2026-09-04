@@ -960,3 +960,187 @@ def test_structured_scoped_content_exact_fit_is_accepted(tmp_path: Path) -> None
     assert result.status == "completed"
     assert exact_model.call_count == 1
     assert exact.store.list_model_calls(task_id)[-1]["projection"]["overflow"] is False
+
+
+def test_scoped_resume_preserves_non_completion_feedback_tail_after_crash(tmp_path: Path) -> None:
+    artifact = tmp_path / "artifact.txt"
+    artifact.write_text("artifact", encoding="utf-8")
+
+    def verify(context: VerifierContext) -> VerifierResult:
+        return VerifierResult(
+            "pass",
+            "artifact passed",
+            [{"path": "artifact.txt", "sha256": _sha256(artifact)}],
+        )
+
+    dag = VerifiedSubtaskDAGConfig(nodes=(_node("artifact", verify),))
+    before_model_calls = 0
+
+    def crash(point: str, **_: object) -> None:
+        nonlocal before_model_calls
+        if point == "before_model_call":
+            before_model_calls += 1
+            if before_model_calls == 2:
+                raise InjectedCrash(point)
+
+    first = Runtime(
+        tmp_path,
+        ScriptedModel([ModelResponse(text="attempt without completion marker")]),
+        verified_subtask_dag=dag,
+        fault_injector=crash,
+    )
+    with pytest.raises(InjectedCrash):
+        first.run("Finish the artifact")
+    task_id = first.store.list_tasks()[0]["task_id"]
+
+    resumed_model = ScriptedModel([ModelResponse(text="done\nSUBTASK_COMPLETE")])
+    resumed = Runtime(
+        tmp_path,
+        resumed_model,
+        verified_subtask_dag=dag,
+        scoped_context_budget=10_000,
+    )
+    result = resumed.resume(task_id)
+
+    assert result.status == "completed"
+    messages = resumed_model.calls[0]
+    assert any(
+        message.get("role") == "assistant"
+        and "attempt without completion marker" in str(message.get("content"))
+        for message in messages
+    )
+    assert any(
+        message.get("role") == "user"
+        and "The subtask is not complete" in str(message.get("content"))
+        for message in messages
+    )
+    assert not any(
+        message.get("role") == "user" and message.get("content") == []
+        for message in messages
+    )
+
+
+@pytest.mark.parametrize("failure_status", ["fail", "uncertain"])
+def test_scoped_resume_preserves_verifier_feedback_tail_after_crash(
+    tmp_path: Path,
+    failure_status: str,
+) -> None:
+    artifact = tmp_path / "artifact.txt"
+    artifact.write_text("artifact", encoding="utf-8")
+    verifier_results = iter([
+        VerifierResult(failure_status, f"first verifier {failure_status}", []),
+        VerifierResult(
+            "pass",
+            "artifact passed",
+            [{"path": "artifact.txt", "sha256": _sha256(artifact)}],
+        ),
+    ])
+
+    def verify(_: VerifierContext) -> VerifierResult:
+        return next(verifier_results)
+
+    dag = VerifiedSubtaskDAGConfig(nodes=(_node("artifact", verify),))
+    before_model_calls = 0
+
+    def crash(point: str, **_: object) -> None:
+        nonlocal before_model_calls
+        if point == "before_model_call":
+            before_model_calls += 1
+            if before_model_calls == 2:
+                raise InjectedCrash(point)
+
+    first = Runtime(
+        tmp_path,
+        ScriptedModel([ModelResponse(text="first attempt\nSUBTASK_COMPLETE")]),
+        verified_subtask_dag=dag,
+        fault_injector=crash,
+    )
+    with pytest.raises(InjectedCrash):
+        first.run(f"Retry after {failure_status} verifier feedback")
+    task_id = first.store.list_tasks()[0]["task_id"]
+
+    resumed_model = ScriptedModel([ModelResponse(text="retry\nSUBTASK_COMPLETE")])
+    resumed = Runtime(
+        tmp_path,
+        resumed_model,
+        verified_subtask_dag=dag,
+        scoped_context_budget=10_000,
+    )
+    result = resumed.resume(task_id)
+
+    assert result.status == "completed"
+    messages = resumed_model.calls[0]
+    assert any(
+        message.get("role") == "assistant"
+        and "first attempt" in str(message.get("content"))
+        for message in messages
+    )
+    assert any(
+        message.get("role") == "user"
+        and f"Verifier result: {failure_status}." in str(message.get("content"))
+        for message in messages
+    )
+    assert not any(
+        message.get("role") == "user" and message.get("content") == []
+        for message in messages
+    )
+
+
+def test_scoped_resume_does_not_substitute_older_tool_pair_for_latest_feedback(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "artifact.txt"
+    artifact.write_text("artifact", encoding="utf-8")
+    dag = VerifiedSubtaskDAGConfig(nodes=(_node(
+        "artifact",
+        lambda _: VerifierResult(
+            "pass",
+            "artifact passed",
+            [{"path": "artifact.txt", "sha256": _sha256(artifact)}],
+        ),
+    ),))
+    old_pair = [
+        {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "old-tool",
+                "name": "read_file",
+                "input": {"path": "artifact.txt"},
+            }],
+        },
+        {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "old-tool",
+                "content": "old unrelated result",
+            }],
+        },
+    ]
+    latest_feedback_pair = [
+        {"role": "assistant", "content": "latest attempt"},
+        {"role": "user", "content": "latest verifier feedback"},
+    ]
+    repo = tmp_path / "latest-feedback"
+    repo.mkdir()
+    dag, task_id = _seed_tool_results_checkpoint(
+        repo,
+        [*old_pair, *latest_feedback_pair],
+    )
+    resumed_model = ScriptedModel([ModelResponse(text="done\nSUBTASK_COMPLETE")])
+    resumed = Runtime(
+        repo,
+        resumed_model,
+        verified_subtask_dag=dag,
+        scoped_context_budget=10_000,
+    )
+
+    result = resumed.resume(task_id)
+
+    assert result.status == "completed"
+    rendered = "\n".join(str(message.get("content", "")) for message in resumed_model.calls[0])
+    assert "latest attempt" in rendered
+    assert "latest verifier feedback" in rendered
+    assert "old unrelated result" not in rendered
+    assert "old-tool" not in rendered
