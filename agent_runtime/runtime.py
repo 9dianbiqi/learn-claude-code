@@ -696,7 +696,7 @@ class Runtime:
                 return reconciliation
             pending = self._pending_calls(checkpoint["messages"]) if phase in {
                 "model_responded", "waiting_approval", "needs_review"
-            } else []
+            } else None
             return self._run_task(
                 task_id,
                 checkpoint["messages"],
@@ -845,6 +845,7 @@ class Runtime:
         scoped_projection: ScopedContextProjection | None = None
         scoped_boundary_message_count: int | None = None
         scoped_pending_tool_use_message: dict[str, Any] | None = None
+        scoped_tool_result_pair: list[dict[str, Any]] | None = None
         self._pending_review = None
         previous_active_task = self._active_task_id
         self._active_task_id = task_id
@@ -867,7 +868,7 @@ class Runtime:
             phase = current_checkpoint["phase"]
             pending_calls = self._pending_calls(messages) if phase in {
                 "model_responded", "waiting_approval", "needs_review"
-            } else []
+            } else None
             if scoped_resume and self.verified_subtask_dag is not None:
                 # The checkpoint recovered above is the resume boundary. Any
                 # messages appended while replaying a pending response/tool
@@ -892,6 +893,8 @@ class Runtime:
                             "role": "assistant",
                             "content": tool_use_blocks,
                         }
+                elif phase == "tool_results_appended":
+                    scoped_tool_result_pair = self._latest_tool_result_pair(messages)
             if phase == "model_responded" and not pending_calls:
                 last_text = self._last_text(messages)
                 if self._uses_verified_subtasks() and self._has_completion_marker(last_text):
@@ -1013,6 +1016,11 @@ class Runtime:
                     if scoped_pending_tool_use_message is not None:
                         post_resume_messages = [
                             scoped_pending_tool_use_message,
+                            *post_resume_messages,
+                        ]
+                    if scoped_tool_result_pair is not None:
+                        post_resume_messages = [
+                            *scoped_tool_result_pair,
                             *post_resume_messages,
                         ]
                     try:
@@ -2447,6 +2455,56 @@ class Runtime:
             if block.get("type") == "tool_use":
                 calls.append(ToolCall(block["id"], block["name"], block.get("input", {})))
         return calls
+
+    @staticmethod
+    def _latest_tool_result_pair(messages: list[dict]) -> list[dict[str, Any]]:
+        """Return the minimal latest assistant/tool-result conversation pair."""
+        result_index: int | None = None
+        result_blocks: list[dict[str, Any]] = []
+        for index in range(len(messages) - 1, -1, -1):
+            if messages[index].get("role") != "user":
+                continue
+            result_content = messages[index].get("content", [])
+            if not isinstance(result_content, list):
+                continue
+            candidate = [
+                copy.deepcopy(block)
+                for block in result_content
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_result"
+                    and block.get("tool_use_id") is not None
+                )
+            ]
+            if candidate:
+                result_index = index
+                result_blocks = candidate
+                break
+        if result_index is None:
+            return []
+        result_ids = {str(block["tool_use_id"]) for block in result_blocks}
+        for assistant in reversed(messages[:result_index]):
+            if assistant.get("role") != "assistant":
+                continue
+            assistant_content = assistant.get("content", [])
+            if not isinstance(assistant_content, list):
+                continue
+            tool_use_blocks = [
+                copy.deepcopy(block)
+                for block in assistant_content
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "tool_use"
+                    and block.get("id") is not None
+                    and str(block["id"]) in result_ids
+                )
+            ]
+            if {str(block["id"]) for block in tool_use_blocks} >= result_ids:
+                return [
+                    {"role": "assistant", "content": tool_use_blocks},
+                    {"role": "user", "content": result_blocks},
+                ]
+        return []
 
     @staticmethod
     def _last_text(messages: list[dict]) -> str:

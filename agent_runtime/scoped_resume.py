@@ -74,21 +74,20 @@ class ScopedContextProjection:
 
 
 def _render_messages(messages: Sequence[Mapping[str, Any]]) -> str:
-    """Render exactly the message text counted by the repository convention."""
+    """Render the complete scoped message view with canonical JSON.
 
-    parts: list[str] = []
-    for message in messages:
-        content = message.get("content", "")
-        if isinstance(content, list):
-            texts = [
-                str(part.get("text", ""))
-                for part in content
-                if isinstance(part, dict) and part.get("text")
-            ]
-            parts.append(" ".join(texts))
-        elif content:
-            parts.append(str(content))
-    return "\n".join(parts)
+    The scoped view can contain structured tool-use and tool-result blocks.
+    Serializing the complete message objects with sorted keys counts those
+    fields exactly once and avoids relying on a process-dependent ``repr``.
+    """
+
+    canonical_messages = [dict(message) for message in messages]
+    return json.dumps(
+        canonical_messages,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 class VerifiedScopedResume:
