@@ -156,6 +156,10 @@ class VerifiedScopedResume:
                 raise ScopedContextError(
                     f"scoped context missing current valid dependency snapshot {subtask_id}"
                 )
+            if checkpoint.get("lifecycle_state") != "valid":
+                raise ScopedContextError(
+                    f"scoped context dependency {subtask_id} is not current valid evidence"
+                )
             dependency_snapshots.append(self._dependency_snapshot(subtask_id, checkpoint))
 
         latest_recovery = self._latest_recovery_reason(task_id, resume_id, required_ids)
@@ -291,6 +295,7 @@ class VerifiedScopedResume:
         manifest.sort(key=lambda entry: entry["path"])
         return {
             "subtask_id": subtask_id,
+            "lifecycle_state": "valid",
             "completion_summary": str(checkpoint.get("completion_summary") or ""),
             "evidence_manifest": manifest,
             "verified_subtask_checkpoint_id": int(
