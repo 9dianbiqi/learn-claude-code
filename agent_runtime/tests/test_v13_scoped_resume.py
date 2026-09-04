@@ -1144,3 +1144,134 @@ def test_scoped_resume_does_not_substitute_older_tool_pair_for_latest_feedback(
     assert "latest verifier feedback" in rendered
     assert "old unrelated result" not in rendered
     assert "old-tool" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("case", "pair"),
+    [
+        (
+            "partial-assistant-ids",
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "a", "name": "read_file", "input": {"path": "artifact.txt"}},
+                        {"type": "tool_use", "id": "b", "name": "read_file", "input": {"path": "artifact.txt"}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "a", "content": "artifact"}],
+                },
+            ],
+        ),
+        (
+            "duplicate-assistant-id",
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "a", "name": "read_file", "input": {"path": "artifact.txt"}},
+                        {"type": "tool_use", "id": "a", "name": "read_file", "input": {"path": "artifact.txt"}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "a", "content": "artifact"}],
+                },
+            ],
+        ),
+        (
+            "duplicate-result-id",
+            [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "a", "name": "read_file", "input": {"path": "artifact.txt"}}],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "a", "content": "artifact"},
+                        {"type": "tool_result", "tool_use_id": "a", "content": "artifact again"},
+                    ],
+                },
+            ],
+        ),
+        (
+            "feedback-unpaired-tool-use",
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "attempt"},
+                        {"type": "tool_use", "id": "unpaired", "name": "read_file", "input": {"path": "artifact.txt"}},
+                    ],
+                },
+                {"role": "user", "content": "verifier feedback"},
+            ],
+        ),
+    ],
+    ids=lambda value: value if isinstance(value, str) else "pair",
+)
+def test_scoped_resume_rejects_inconsistent_adjacent_tool_tail(
+    tmp_path: Path,
+    case: str,
+    pair: list[dict],
+) -> None:
+    repo = tmp_path / case
+    repo.mkdir()
+    dag, task_id = _seed_tool_results_checkpoint(repo, pair)
+    model = ScriptedModel([ModelResponse(text="must not be called")])
+    runtime = Runtime(
+        repo,
+        model,
+        verified_subtask_dag=dag,
+        scoped_context_budget=10_000,
+    )
+
+    result = runtime.resume(task_id)
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert "adjacent assistant/user pair" in result.error
+    assert model.call_count == 0
+    assert any(
+        event["type"] == "verified_scoped_context_failed"
+        for event in runtime.store.list_events(task_id)
+    )
+
+
+def test_scoped_resume_preserves_complete_valid_multi_tool_tail(tmp_path: Path) -> None:
+    pair = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "read both files"},
+                {"type": "tool_use", "id": "a", "name": "read_file", "input": {"path": "artifact.txt"}},
+                {"type": "tool_use", "id": "b", "name": "read_file", "input": {"path": "artifact.txt", "limit": 1}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "artifact"},
+                {"type": "tool_result", "tool_use_id": "b", "content": {"lines": ["artifact"]}},
+            ],
+        },
+    ]
+    repo = tmp_path / "valid-multi-tool"
+    repo.mkdir()
+    dag, task_id = _seed_tool_results_checkpoint(repo, pair)
+    model = ScriptedModel([ModelResponse(text="done\nSUBTASK_COMPLETE")])
+    runtime = Runtime(
+        repo,
+        model,
+        verified_subtask_dag=dag,
+        scoped_context_budget=10_000,
+    )
+
+    result = runtime.resume(task_id)
+
+    assert result.status == "completed"
+    assert model.call_count == 1
+    assert model.calls[0][1:3] == pair
