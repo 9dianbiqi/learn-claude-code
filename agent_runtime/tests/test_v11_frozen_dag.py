@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 import time
 from dataclasses import replace
@@ -38,8 +39,17 @@ from agent_runtime.runtime import InjectedCrash
 from agent_runtime.store import InvariantViolation
 
 
-VALID_SHA256 = "a" * 64
+VALID_SHA256 = hashlib.sha256(b"artifact").hexdigest()
 VALID_VERIFIER_IMPLEMENTATION_HASH = "b" * 64
+
+
+@pytest.fixture(autouse=True)
+def _materialize_evidence_files(tmp_path: Path) -> None:
+    for name in (
+        "prepare", "wire", "docs", "finish", "first", "second", "only",
+        "dependency", "current", "independent", "a", "b", "dag", "single",
+    ):
+        (tmp_path / f"{name}.txt").write_bytes(b"artifact")
 
 
 def _v10_database(tmp_path: Path) -> Path:

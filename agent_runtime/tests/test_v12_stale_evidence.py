@@ -118,6 +118,72 @@ def test_v11_to_v12_migration_rolls_back_before_commit(tmp_path: Path) -> None:
         ).fetchone()[0] == 0
 
 
+def test_v11_to_v12_migration_supersedes_older_checkpoint_history(tmp_path: Path) -> None:
+    database = _v11_database(tmp_path)
+    now = time.time()
+    manifest_json = '[{"path":"artifact.txt","sha256":"' + "a" * 64 + '"}]'
+    evidence_hash = hashlib.sha256(manifest_json.encode()).hexdigest()
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO tasks(task_id, repo_root, prompt, model, status, checkpoint_id, version, created_at, updated_at) "
+            "VALUES ('task-history', ?, 'prompt', 'fake', 'completed', 1, 0, ?, ?)",
+            (str(tmp_path), now, now),
+        )
+        connection.execute(
+            "INSERT INTO checkpoints(checkpoint_id, task_id, phase, messages_json, cursor_json, created_at) "
+            "VALUES (1, 'task-history', 'completed', '[]', '{}', ?)",
+            (now,),
+        )
+        connection.execute(
+            "INSERT INTO plans(plan_id, task_id, status, created_at, updated_at) "
+            "VALUES (1, 'task-history', 'completed', ?, ?)",
+            (now, now),
+        )
+        connection.execute(
+            "INSERT INTO plan_items(plan_item_id, plan_id, subtask_id, status, completion_summary, "
+            "evidence_hash, verifier_bundle_hash, max_turns, consumed_turns, created_at, updated_at) "
+            "VALUES (1, 1, 'artifact', 'completed', 'done', ?, 'bundle', 1, 1, ?, ?)",
+            (evidence_hash, now, now),
+        )
+        for run_id in ("run-old", "run-new"):
+            connection.execute(
+                "INSERT INTO verifier_runs(verifier_run_id, task_id, plan_item_id, subtask_id, status, summary, "
+                "completion_summary, verifier_id, verifier_version, verification_rule, verifier_bundle_hash, "
+                "verifier_implementation_hash, evidence_manifest_json, evidence_hash, authoritative, "
+                "execution_checkpoint_id, created_at) VALUES (?, 'task-history', 1, 'artifact', 'pass', 'ok', 'done', "
+                "'verifier', '1', 'rule', 'bundle', 'impl', ?, ?, 1, 1, ?)",
+                (run_id, manifest_json, evidence_hash, now),
+            )
+        connection.execute(
+            "INSERT INTO semantic_checkpoints(task_id, plan_item_id, subtask_id, verifier_run_id, execution_checkpoint_id, "
+            "completion_summary, verifier_id, verifier_version, verification_rule, verifier_bundle_hash, "
+            "verifier_implementation_hash, evidence_manifest_json, evidence_hash, created_at) "
+            "VALUES ('task-history', 1, 'artifact', 'run-old', 1, 'done', 'verifier', '1', 'rule', 'bundle', 'impl', ?, ?, ?)",
+            (manifest_json, evidence_hash, now),
+        )
+        connection.execute(
+            "INSERT INTO semantic_checkpoints(task_id, plan_item_id, subtask_id, verifier_run_id, execution_checkpoint_id, "
+            "completion_summary, verifier_id, verifier_version, verification_rule, verifier_bundle_hash, "
+            "verifier_implementation_hash, evidence_manifest_json, evidence_hash, created_at) "
+            "VALUES ('task-history', 1, 'artifact', 'run-new', 1, 'done', 'verifier', '1', 'rule', 'bundle', 'impl', ?, ?, ?)",
+            (manifest_json, evidence_hash, now + 1),
+        )
+        connection.execute(
+            "INSERT INTO events(task_id, type, payload_json, created_at) "
+            "VALUES ('task-history', 'task_completed', '{\"final_text\":\"done\\n\"}', ?)",
+            (now,),
+        )
+
+    SchemaManager(database).migrate()
+    store = EventStore(database)
+    checkpoints = store.list_verified_subtask_checkpoints("task-history")
+    assert [checkpoint["lifecycle_state"] for checkpoint in checkpoints] == [
+        "superseded",
+        "valid",
+    ]
+    assert store.scan_invariants("task-history") == []
+
+
 def test_fresh_database_is_v12_with_lifecycle_schema(tmp_path: Path) -> None:
     store = EventStore(tmp_path / "runtime.db")
 
@@ -283,6 +349,60 @@ def test_dag_breaking_mutation_invalidates_transitive_dependents_only(tmp_path: 
     ) == 1
 
 
+def test_dag_rechecks_remaining_completed_branches_after_first_invalidation(tmp_path: Path) -> None:
+    for name in ("first", "second"):
+        (tmp_path / f"{name}.txt").write_text(name, encoding="utf-8")
+    outcomes = iter(["pass", "pass", "fail", "pass", "fail", "pass"])
+
+    def verify(context: VerifierContext) -> VerifierResult:
+        status = next(outcomes)
+        if status == "fail":
+            return VerifierResult("fail", "stale", [])
+        path = Path(context.repo_root) / f"{context.subtask_id}.txt"
+        return VerifierResult(
+            "pass",
+            "ok",
+            [{"path": f"{context.subtask_id}.txt", "sha256": _sha256(path)}],
+        )
+
+    dag = VerifiedSubtaskDAGConfig(
+        nodes=(_node("first", verify), _node("second", verify))
+    )
+    first = Runtime(
+        tmp_path,
+        ScriptedModel(
+            [
+                ModelResponse(text="first\nSUBTASK_COMPLETE"),
+                ModelResponse(text="second\nSUBTASK_COMPLETE"),
+            ]
+        ),
+        verified_subtask_dag=dag,
+    )
+    completed = first.run("Complete both")
+    assert completed.status == "completed"
+    (tmp_path / "first.txt").write_text("first changed", encoding="utf-8")
+    (tmp_path / "second.txt").write_text("second changed", encoding="utf-8")
+
+    recovered = Runtime(
+        tmp_path,
+        ScriptedModel(
+            [
+                ModelResponse(text="first repaired\nSUBTASK_COMPLETE"),
+                ModelResponse(text="second repaired\nSUBTASK_COMPLETE"),
+            ]
+        ),
+        verified_subtask_dag=dag,
+    )
+
+    result = recovered.resume(completed.task_id)
+
+    assert result.status == "completed"
+    assert recovered.model.call_count == 2
+    assert [run["status"] for run in recovered.store.list_verifier_runs(completed.task_id)] == [
+        "pass", "pass", "fail", "pass", "fail", "pass"
+    ]
+
+
 def test_revalidation_pass_with_concurrent_evidence_mutation_is_uncertain(tmp_path: Path) -> None:
     artifact = tmp_path / "artifact.txt"
     artifact.write_text("version one", encoding="utf-8")
@@ -418,6 +538,29 @@ def test_verified_history_and_lifecycle_events_are_append_only(tmp_path: Path) -
                 )
             with pytest.raises(sqlite3.IntegrityError, match="append-only"):
                 connection.execute(f"DELETE FROM {table} WHERE {column} = ?", (value,))
+
+
+def test_initial_pass_without_capturable_evidence_is_not_authoritative(tmp_path: Path) -> None:
+    config = _node(
+        "missing",
+        lambda _: VerifierResult(
+            "pass", "verifier says pass", [{"path": "missing.txt", "sha256": "a" * 64}]
+        ),
+        max_turns=1,
+    )
+    runtime = Runtime(
+        tmp_path,
+        ScriptedModel([ModelResponse(text="done\nSUBTASK_COMPLETE")]),
+        verified_subtask_dag=VerifiedSubtaskDAGConfig(nodes=(config,)),
+    )
+
+    result = runtime.run("Create missing evidence")
+
+    assert result.status == "failed"
+    assert [(run["status"], run["authoritative"]) for run in runtime.store.list_verifier_runs(result.task_id)] == [
+        ("uncertain", False)
+    ]
+    assert runtime.store.list_verified_subtask_checkpoints(result.task_id) == []
 
 
 def test_resume_refreshes_completed_evidence_after_benign_change(tmp_path: Path) -> None:

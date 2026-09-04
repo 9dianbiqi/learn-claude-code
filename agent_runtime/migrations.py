@@ -1405,6 +1405,7 @@ def _apply_v12_stale_evidence(conn: sqlite3.Connection) -> None:
         "FROM semantic_checkpoints ORDER BY semantic_checkpoint_id"
     ).fetchall()
     now = _now()
+    pending_by_item: dict[tuple[str, int], list[tuple[int, str, int, str]]] = {}
     for row in rows:
         semantic_checkpoint_id = int(row[0])
         task_id = str(row[1])
@@ -1417,19 +1418,49 @@ def _apply_v12_stale_evidence(conn: sqlite3.Connection) -> None:
         ).fetchone()
         if exists is not None:
             continue
-        conn.execute(
-            "INSERT INTO semantic_checkpoint_state_events("
-            "task_id, semantic_checkpoint_id, plan_item_id, state, reason, "
-            "observed_manifest_json, observation_complete, created_at) "
-            "VALUES (?, ?, ?, 'valid', 'migration_backfill', ?, 1, ?)",
-            (
-                task_id,
-                semantic_checkpoint_id,
-                plan_item_id,
-                evidence_manifest_json,
-                now,
-            ),
+        pending_by_item.setdefault((task_id, plan_item_id), []).append(
+            (semantic_checkpoint_id, task_id, plan_item_id, evidence_manifest_json)
         )
+
+    for group in pending_by_item.values():
+        newest_checkpoint_id = group[-1][0]
+        for semantic_checkpoint_id, task_id, plan_item_id, evidence_manifest_json in group:
+            try:
+                manifest = _loads(evidence_manifest_json, [])
+                if not isinstance(manifest, list):
+                    raise ValueError("evidence manifest is not a list")
+                manifest = sorted(
+                    manifest,
+                    key=lambda entry: str(entry.get("path", ""))
+                    if isinstance(entry, dict) else "",
+                )
+                observed_manifest_json = _json(manifest)
+            except (TypeError, ValueError):
+                observed_manifest_json = "[]"
+            conn.execute(
+                "INSERT INTO semantic_checkpoint_state_events("
+                "task_id, semantic_checkpoint_id, plan_item_id, state, reason, "
+                "observed_manifest_json, observation_complete, created_at) "
+                "VALUES (?, ?, ?, 'valid', 'migration_backfill', ?, 1, ?)",
+                (
+                    task_id,
+                    semantic_checkpoint_id,
+                    plan_item_id,
+                    observed_manifest_json,
+                    now,
+                ),
+            )
+        for semantic_checkpoint_id, *_ in group[:-1]:
+            conn.execute(
+                "INSERT INTO semantic_checkpoint_state_events("
+                "task_id, semantic_checkpoint_id, plan_item_id, state, reason, "
+                "replacement_checkpoint_id, observed_manifest_json, observation_complete, created_at) "
+                "SELECT task_id, semantic_checkpoint_id, plan_item_id, 'superseded', "
+                "'migration_backfill', ?, observed_manifest_json, observation_complete, ? "
+                "FROM semantic_checkpoint_state_events "
+                "WHERE semantic_checkpoint_id = ? ORDER BY state_event_id DESC LIMIT 1",
+                (newest_checkpoint_id, now, semantic_checkpoint_id),
+            )
 
 
 def _create_latest_schema(conn: sqlite3.Connection) -> None:

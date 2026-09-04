@@ -159,39 +159,14 @@ class VerifiedEvidenceRecovery:
             break
         return EvidenceRecoveryReport(refreshed=refreshed, invalidated=invalidated)
 
-    def needs_recovery(self, task_id: str) -> bool:
-        """Read-only preflight used to preserve the completed fast path."""
-        plan = self.store.get_latest_plan(task_id)
-        if plan is None:
-            return False
-        for item in plan.get("items", []):
-            if item.get("status") != "completed":
-                continue
-            checkpoint = self.store.get_current_verified_subtask_checkpoint(
-                task_id, int(item["plan_item_id"])
-            )
-            if checkpoint is None:
-                raise InvariantViolation(
-                    f"completed plan item {item['plan_item_id']} has no current valid checkpoint"
-                )
-            if self._is_stale(
-                checkpoint,
-                capture_evidence_manifest(self.repo_root, checkpoint["evidence_manifest"]),
-            ):
-                return True
-        return False
-
     @staticmethod
     def _is_stale(checkpoint: dict[str, Any], snapshot: EvidenceSnapshot) -> bool:
         if int(checkpoint.get("observation_complete") or 0):
             return not snapshot.complete or snapshot.manifest != checkpoint.get("observed_manifest", [])
-        # v11 checkpoints migrated without a durable observation.  Compare a
-        # readable current manifest to the immutable verifier result when
-        # possible; retain compatibility with historical synthetic manifests
-        # that never had a corresponding file observation.
-        if snapshot.complete:
-            return snapshot.manifest != checkpoint.get("evidence_manifest", [])
-        return False
+        # An incomplete observation is itself an evidence mismatch.  A
+        # missing, unreadable, non-regular, or escaped path must never reach a
+        # completed fast path without revalidation.
+        return not snapshot.complete or snapshot.manifest != checkpoint.get("evidence_manifest", [])
 
     def _revalidate(
         self,

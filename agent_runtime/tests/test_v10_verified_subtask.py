@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import time
@@ -33,8 +34,14 @@ from agent_runtime.store import EventStore, InvariantViolation
 from agent_runtime.trace import TraceReporter
 
 
-VALID_SHA256 = "a" * 64
+VALID_SHA256 = hashlib.sha256(b"artifact").hexdigest()
 VALID_VERIFIER_IMPLEMENTATION_HASH = "b" * 64
+
+
+@pytest.fixture(autouse=True)
+def _materialize_evidence_files(tmp_path: Path) -> None:
+    for name in ("artifact.txt", "a.txt", "z.txt"):
+        (tmp_path / name).write_bytes(b"artifact")
 
 
 def _config(verifier, evidence_paths: list[str] | tuple[str, ...] = ("artifact.txt",)) -> VerifiedSubtaskConfig:
@@ -145,8 +152,8 @@ def test_bundle_hash_and_evidence_manifest_are_deterministic(tmp_path: Path):
                 "pass",
                 "ok",
                 [
-                    {"path": "z.txt", "sha256": "b" * 64},
-                    {"path": "a.txt", "sha256": "c" * 64},
+                    {"path": "z.txt", "sha256": hashlib.sha256((tmp_path / "z.txt").read_bytes()).hexdigest()},
+                    {"path": "a.txt", "sha256": hashlib.sha256((tmp_path / "a.txt").read_bytes()).hexdigest()},
                 ],
             ),
             verifier_implementation_hash=VALID_VERIFIER_IMPLEMENTATION_HASH,
@@ -157,8 +164,8 @@ def test_bundle_hash_and_evidence_manifest_are_deterministic(tmp_path: Path):
 
     assert result.status == "completed"
     assert runtime.store.list_verifier_runs(result.task_id)[0]["evidence_manifest"] == [
-        {"path": "a.txt", "sha256": "c" * 64},
-        {"path": "z.txt", "sha256": "b" * 64},
+        {"path": "a.txt", "sha256": hashlib.sha256((tmp_path / "a.txt").read_bytes()).hexdigest()},
+        {"path": "z.txt", "sha256": hashlib.sha256((tmp_path / "z.txt").read_bytes()).hexdigest()},
     ]
 
 

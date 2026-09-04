@@ -32,7 +32,7 @@ from .store import EffectBlocked, EventStore, InvariantViolation, LeaseLost, Sta
 from .tools import FileConflict, ShellResult, ToolExecutor
 from .tool_registry import ToolRegistry
 from .projector import ContextProjector, estimate_tokens
-from .verified_evidence import EvidenceSnapshot, VerifiedEvidenceRecovery, capture_evidence_manifest
+from .verified_evidence import VerifiedEvidenceRecovery, capture_evidence_manifest
 
 
 DEFAULT_SUBAGENT_CONTEXT_WINDOW = 32000
@@ -456,12 +456,20 @@ class Runtime:
 
         if verifier_result.status == "pass":
             observed_snapshot = capture_evidence_manifest(self.repo_root, manifest)
-            if observed_snapshot.complete and observed_snapshot.manifest != manifest:
-                observed_snapshot = EvidenceSnapshot(
-                    [],
-                    False,
-                    "verifier manifest did not match the initial file observation",
+            if not observed_snapshot.complete:
+                verifier_result = VerifierResult(
+                    "uncertain",
+                    "Verifier pass rejected because evidence could not be captured: "
+                    + (observed_snapshot.reason or "unknown evidence capture failure"),
+                    manifest,
                 )
+            elif observed_snapshot.manifest != manifest:
+                verifier_result = VerifierResult(
+                    "uncertain",
+                    "Verifier pass rejected because evidence did not match the current files",
+                    manifest,
+                )
+        if verifier_result.status == "pass":
             self._fault(
                 "verified_subtask_f2_pre",
                 task_id=task_id,
@@ -492,6 +500,9 @@ class Runtime:
                 observation_complete=observed_snapshot.complete,
             )
             if is_final:
+                recovery = self._evidence_recovery.recover(task_id)
+                if recovery.invalidated:
+                    return None
                 return RunResult(task_id, "completed", completion_summary)
             return None
 
@@ -583,11 +594,6 @@ class Runtime:
         task = self.store.get_task(task_id)
         if task["status"] in {"failed", "aborted"}:
             raise RuntimeError(f"Task {task_id} is terminal: {task['status']}")
-        if not self._evidence_recovery.needs_recovery(task_id):
-            if task["status"] == "completed":
-                completed = self.store.get_completed_result(task_id)
-                return RunResult(task_id, "completed", completed["final_text"])
-            return self._resume_task(task_id, lease_acquired=False)
         self._acquire(task_id)
         try:
             self.store.assert_invariants(task_id)
@@ -883,6 +889,14 @@ class Runtime:
                         current_item = self._verified_plan_item(task_id)
                 elif self.verified_subtask_dag is not None:
                     current_item = self._select_dag_item(task_id)
+                    if current_item is None:
+                        # A prior F4b recovery intentionally stops after the
+                        # first invalid completed node.  Before declaring the
+                        # DAG exhausted, rescan the remaining completed
+                        # nodes so an unrelated stale branch cannot be
+                        # trusted as a terminal plan.
+                        self._evidence_recovery.recover(task_id)
+                        current_item = self._select_dag_item(task_id)
                     if current_item is None:
                         raise InvariantViolation(
                             f"Frozen DAG for task {task_id} has no executable subtask"
