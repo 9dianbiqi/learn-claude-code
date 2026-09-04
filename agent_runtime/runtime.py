@@ -390,16 +390,6 @@ class Runtime:
                 return None
             if item["status"] == "completed":
                 return None
-            # A completion marker recovered from an old execution checkpoint
-            # cannot complete a node that Ticket #9 reopened as retryable
-            # after stale-evidence invalidation.  The node must receive a new
-            # model turn; otherwise F4 would silently trust the stale marker.
-            if (
-                self.verified_subtask_dag is not None
-                and marker_subtask_id == item["subtask_id"]
-                and item["status"] == "retryable"
-            ):
-                return None
             config = self._dag_config_for_item(item)
         else:
             config = self.verified_subtask

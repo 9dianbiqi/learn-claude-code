@@ -177,7 +177,7 @@ class VerifiedScopedResume:
             "global_constraints": str(task.get("prompt") or ""),
             "resume_unit": {
                 "subtask_id": resume_id,
-                "description": str(item.get("description") or config.description),
+                "description": config.description,
                 "completion_criteria": config.completion_criteria,
                 "remaining_turn_budget": max_turns - consumed_turns,
             },

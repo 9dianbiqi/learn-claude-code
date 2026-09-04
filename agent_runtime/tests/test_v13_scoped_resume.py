@@ -222,6 +222,12 @@ def test_scoped_context_overflow_fails_closed_without_model_call(tmp_path: Path)
     assert len(overflow_events) == 1
     assert overflow_events[0]["payload"]["outcome"] == "overflow"
     assert resumed.store.get_task(task_id)["status"] == "failed"
+    trace = TraceReporter(resumed.store).summary(task_id)
+    assert trace["scoped_context_overflow_count"] == 1
+    assert trace["scoped_context_overflow_outcomes"] == ["overflow"]
+    assert trace["scoped_token_estimates"] == [
+        overflow_events[0]["payload"]["token_estimate"]
+    ]
 
 
 def test_scoped_context_budget_accepts_exact_rendered_estimate(tmp_path: Path) -> None:

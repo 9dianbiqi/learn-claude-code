@@ -46,6 +46,48 @@ class TraceReporter:
             event["type"] == "operation_deduplicated" for event in events
         )
         projection_metrics = self._projection_metrics(models)
+        scoped_overflow_events = [
+            event for event in events
+            if event["type"] == "verified_scoped_context_overflow"
+        ]
+        scoped_overflow_token_estimates = [
+            int(event["payload"]["token_estimate"])
+            for event in scoped_overflow_events
+            if isinstance(event.get("payload", {}).get("token_estimate"), (int, float))
+        ]
+        scoped_overflow_budgets = [
+            int(event["payload"]["scoped_context_budget"])
+            for event in scoped_overflow_events
+            if isinstance(event.get("payload", {}).get("scoped_context_budget"), (int, float))
+        ]
+        scoped_overflow_units = [
+            str(event["payload"]["resume_unit_id"])
+            for event in scoped_overflow_events
+            if event.get("payload", {}).get("resume_unit_id") is not None
+        ]
+        scoped_overflow_dependencies = [
+            int(event["payload"]["dependency_count"])
+            for event in scoped_overflow_events
+            if isinstance(event.get("payload", {}).get("dependency_count"), (int, float))
+        ]
+        scoped_overflow_paths = [
+            int(event["payload"]["relevant_path_count"])
+            for event in scoped_overflow_events
+            if isinstance(event.get("payload", {}).get("relevant_path_count"), (int, float))
+        ]
+        scoped_token_estimates = (
+            projection_metrics["scoped_token_estimates"] + scoped_overflow_token_estimates
+        )
+        scoped_budgets = projection_metrics["scoped_budgets"] + scoped_overflow_budgets
+        scoped_resume_unit_ids = (
+            projection_metrics["scoped_resume_unit_ids"] + scoped_overflow_units
+        )
+        scoped_dependency_counts = (
+            projection_metrics["scoped_dependency_counts"] + scoped_overflow_dependencies
+        )
+        scoped_relevant_path_counts = (
+            projection_metrics["scoped_relevant_path_counts"] + scoped_overflow_paths
+        )
         plan_metrics = self._plan_metrics(task_id)
         verified_metrics = self._verified_metrics(task_id)
         jobs = self.store.list_jobs(task_id)
@@ -95,14 +137,14 @@ class TraceReporter:
             "projection_used_count": projection_metrics["used_count"],
             "projection_token_estimates": projection_metrics["token_estimates"],
             "verified_scoped_resume_count": projection_metrics["scoped_resume_count"],
-            "verified_scoped_token_estimates": projection_metrics["scoped_token_estimates"],
-            "verified_scoped_budgets": projection_metrics["scoped_budgets"],
-            "verified_scoped_resume_unit_ids": projection_metrics["scoped_resume_unit_ids"],
-            "verified_scoped_dependency_counts": projection_metrics["scoped_dependency_counts"],
-            "verified_scoped_relevant_path_counts": projection_metrics["scoped_relevant_path_counts"],
+            "verified_scoped_token_estimates": scoped_token_estimates,
+            "verified_scoped_budgets": scoped_budgets,
+            "verified_scoped_resume_unit_ids": scoped_resume_unit_ids,
+            "verified_scoped_dependency_counts": scoped_dependency_counts,
+            "verified_scoped_relevant_path_counts": scoped_relevant_path_counts,
             "verified_scoped_overflow_count": (
                 projection_metrics["scoped_overflow_count"]
-                + sum(event["type"] == "verified_scoped_context_overflow" for event in events)
+                + len(scoped_overflow_events)
             ),
             "verified_scoped_context_failure_count": sum(
                 event["type"] == "verified_scoped_context_failed" for event in events
@@ -110,15 +152,19 @@ class TraceReporter:
             # Keep concise scoped names alongside the verified-prefixed
             # fields for trace consumers that group projection modes.
             "scoped_resume_count": projection_metrics["scoped_resume_count"],
-            "scoped_token_estimates": projection_metrics["scoped_token_estimates"],
-            "scoped_context_budgets": projection_metrics["scoped_budgets"],
-            "scoped_resume_unit_ids": projection_metrics["scoped_resume_unit_ids"],
-            "scoped_dependency_counts": projection_metrics["scoped_dependency_counts"],
-            "scoped_relevant_path_counts": projection_metrics["scoped_relevant_path_counts"],
+            "scoped_token_estimates": scoped_token_estimates,
+            "scoped_context_budgets": scoped_budgets,
+            "scoped_resume_unit_ids": scoped_resume_unit_ids,
+            "scoped_dependency_counts": scoped_dependency_counts,
+            "scoped_relevant_path_counts": scoped_relevant_path_counts,
             "scoped_context_overflow_count": (
                 projection_metrics["scoped_overflow_count"]
-                + sum(event["type"] == "verified_scoped_context_overflow" for event in events)
+                + len(scoped_overflow_events)
             ),
+            "scoped_context_overflow_outcomes": [
+                str(event["payload"].get("outcome") or "overflow")
+                for event in scoped_overflow_events
+            ],
             "memory_count": projection_metrics["memory_count"],
             "summary_count": projection_metrics["summary_count"],
             "plan_item_count": sum(
