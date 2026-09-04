@@ -846,6 +846,7 @@ class Runtime:
         scoped_boundary_message_count: int | None = None
         scoped_pending_tool_use_message: dict[str, Any] | None = None
         scoped_tool_result_pair: list[dict[str, Any]] | None = None
+        scoped_tool_result_tail_error: str | None = None
         self._pending_review = None
         previous_active_task = self._active_task_id
         self._active_task_id = task_id
@@ -895,6 +896,11 @@ class Runtime:
                         }
                 elif phase == "tool_results_appended":
                     scoped_tool_result_pair = self._latest_tool_result_pair(messages)
+                    if not scoped_tool_result_pair:
+                        scoped_tool_result_tail_error = (
+                            "latest tool_results_appended checkpoint tail is not a "
+                            "valid adjacent assistant/user pair"
+                        )
             if phase == "model_responded" and not pending_calls:
                 last_text = self._last_text(messages)
                 if self._uses_verified_subtasks() and self._has_completion_marker(last_text):
@@ -1024,6 +1030,8 @@ class Runtime:
                             *post_resume_messages,
                         ]
                     try:
+                        if scoped_tool_result_tail_error is not None:
+                            raise ScopedContextError(scoped_tool_result_tail_error)
                         if (
                             scoped_projection is None
                             or scoped_projection.metrics.get("resume_unit_id")
@@ -2458,53 +2466,70 @@ class Runtime:
 
     @staticmethod
     def _latest_tool_result_pair(messages: list[dict]) -> list[dict[str, Any]]:
-        """Return the minimal latest assistant/tool-result conversation pair."""
-        result_index: int | None = None
-        result_blocks: list[dict[str, Any]] = []
-        for index in range(len(messages) - 1, -1, -1):
-            if messages[index].get("role") != "user":
-                continue
-            result_content = messages[index].get("content", [])
-            if not isinstance(result_content, list):
-                continue
-            candidate = [
-                copy.deepcopy(block)
-                for block in result_content
-                if (
-                    isinstance(block, dict)
-                    and block.get("type") == "tool_result"
-                    and block.get("tool_use_id") is not None
-                )
-            ]
-            if candidate:
-                result_index = index
-                result_blocks = candidate
-                break
-        if result_index is None:
+        """Return only the latest adjacent assistant/user recovery pair."""
+        if len(messages) < 2:
+            return []
+        assistant = messages[-2]
+        user = messages[-1]
+        if assistant.get("role") != "assistant" or user.get("role") != "user":
+            return []
+
+        user_content = user.get("content")
+        if isinstance(user_content, str):
+            if not user_content.strip():
+                return []
+            assistant_content = assistant.get("content")
+            if isinstance(assistant_content, str):
+                if not assistant_content.strip():
+                    return []
+                return [copy.deepcopy(assistant), copy.deepcopy(user)]
+            if isinstance(assistant_content, list):
+                text_blocks = [
+                    copy.deepcopy(block)
+                    for block in assistant_content
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "text"
+                        and str(block.get("text") or "").strip()
+                    )
+                ]
+                if text_blocks:
+                    return [
+                        {"role": "assistant", "content": text_blocks},
+                        {"role": "user", "content": user_content},
+                    ]
+            return []
+
+        if not isinstance(user_content, list):
+            return []
+        result_blocks = [
+            copy.deepcopy(block)
+            for block in user_content
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_result"
+                and block.get("tool_use_id") is not None
+            )
+        ]
+        if not result_blocks or not isinstance(assistant.get("content"), list):
             return []
         result_ids = {str(block["tool_use_id"]) for block in result_blocks}
-        for assistant in reversed(messages[:result_index]):
-            if assistant.get("role") != "assistant":
-                continue
-            assistant_content = assistant.get("content", [])
-            if not isinstance(assistant_content, list):
-                continue
-            tool_use_blocks = [
-                copy.deepcopy(block)
-                for block in assistant_content
-                if (
-                    isinstance(block, dict)
-                    and block.get("type") == "tool_use"
-                    and block.get("id") is not None
-                    and str(block["id"]) in result_ids
-                )
-            ]
-            if {str(block["id"]) for block in tool_use_blocks} >= result_ids:
-                return [
-                    {"role": "assistant", "content": tool_use_blocks},
-                    {"role": "user", "content": result_blocks},
-                ]
-        return []
+        tool_use_blocks = [
+            copy.deepcopy(block)
+            for block in assistant["content"]
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("id") is not None
+                and str(block["id"]) in result_ids
+            )
+        ]
+        if {str(block["id"]) for block in tool_use_blocks} != result_ids:
+            return []
+        return [
+            {"role": "assistant", "content": tool_use_blocks},
+            {"role": "user", "content": result_blocks},
+        ]
 
     @staticmethod
     def _last_text(messages: list[dict]) -> str:
