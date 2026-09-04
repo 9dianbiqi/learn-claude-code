@@ -88,6 +88,9 @@ class TraceReporter:
         scoped_relevant_path_counts = (
             projection_metrics["scoped_relevant_path_counts"] + scoped_overflow_paths
         )
+        projection_basis = list(projection_metrics["basis"])
+        if scoped_overflow_events and "verified_scoped" not in projection_basis:
+            projection_basis.append("verified_scoped")
         plan_metrics = self._plan_metrics(task_id)
         verified_metrics = self._verified_metrics(task_id)
         jobs = self.store.list_jobs(task_id)
@@ -133,7 +136,7 @@ class TraceReporter:
             "blocked_outbox_count": sum(
                 operation.get("outbox_state") == "blocked" for operation in operations
             ),
-            "projection_basis": projection_metrics["basis"],
+            "projection_basis": projection_basis,
             "projection_used_count": projection_metrics["used_count"],
             "projection_token_estimates": projection_metrics["token_estimates"],
             "verified_scoped_resume_count": projection_metrics["scoped_resume_count"],

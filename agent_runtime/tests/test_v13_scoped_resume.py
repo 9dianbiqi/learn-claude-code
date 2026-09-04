@@ -223,6 +223,7 @@ def test_scoped_context_overflow_fails_closed_without_model_call(tmp_path: Path)
     assert overflow_events[0]["payload"]["outcome"] == "overflow"
     assert resumed.store.get_task(task_id)["status"] == "failed"
     trace = TraceReporter(resumed.store).summary(task_id)
+    assert "verified_scoped" in trace["projection_basis"]
     assert trace["scoped_context_overflow_count"] == 1
     assert trace["scoped_context_overflow_outcomes"] == ["overflow"]
     assert trace["scoped_token_estimates"] == [
