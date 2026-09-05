@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.3.0.dev8 - Fixed-Budget Scoped Recovery
+
+- Added opt-in Verified-Scoped recovery for interrupted frozen-DAG tasks while
+  retaining complete durable checkpoint and model-call audit history.
+- Added deterministic scoped bundles containing the active resume unit,
+  transitive dependency snapshots, recent failure evidence, and relevant-path
+  state, with explicit fail-closed context-budget enforcement.
+- Added structured tool-message replay validation, scoped trace metrics, and
+  public recovery tests covering context continuity and omission failures.
+
+## v0.3.0.dev7 - Stale Evidence Recovery
+
+- Added resume-time evidence-manifest validation before completed verified
+  subtasks are trusted.
+- Added append-only valid, stale, and superseded checkpoint lifecycle history,
+  benign evidence refresh, breaking-change re-execution, and transitive
+  dependency invalidation through schema v12.
+- Added invariant, trace, migration, idempotency, and public F4 recovery tests.
+
 ## v0.3.0.dev6 - Frozen DAG Orchestration & Deterministic Recovery
 
 - Added opt-in frozen verified-subtask DAG orchestration with deterministic

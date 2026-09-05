@@ -12,7 +12,7 @@ from .models import (
 from .effects import EffectSemantics, OperationSpec, ReconcileEvidence
 from .runtime import Runtime
 
-__version__ = "0.3.0.dev6"
+__version__ = "0.3.0.dev8"
 
 __all__ = [
     "EffectSemantics",

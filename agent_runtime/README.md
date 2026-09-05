@@ -185,6 +185,23 @@ implementation commit is the handoff point for subsequent work. See the
 [v0.3 execution docs](docs/v0.3/README.md) for the phase boundaries and
 verification commands.
 
+## v0.3 Recovery Baseline
+
+The accepted Recovery Baseline extends the frozen Exec-Full runtime with
+verifier-gated subtask completion, frozen-DAG recovery, stale-evidence refresh,
+and fixed-budget Verified-Scoped resume. It uses package version
+`0.3.0.dev8` and schema version `v12`.
+
+The accepted code point is commit `bc886fc`, recorded by the annotated tag
+`agent-runtime-recovery-code-accepted-2026-09-05`. The tag is the immutable
+research comparison point; product development continues from the separate
+`codex/long-horizon-agent-v1-bootstrap` line.
+
+The Recovery Baseline deliberately keeps the DAG frozen. Dynamic plan
+revision, automatic decomposition, recovery routing, workspace recovery, stuck
+detection, model routing, and human escalation belong to the Long-Horizon
+Agent product line rather than this baseline.
+
 ## Requirements
 
 - Python 3.11+
@@ -382,7 +399,7 @@ system sandbox.
 agent_runtime/
   runtime.py       durable loop and recovery
   store.py         SQLite projections, transactions, leases, and ledger API
-  migrations.py    explicit v4-to-v9 schema migrations and backup framework
+  migrations.py    explicit v4-to-v12 schema migrations and backup framework
   projector.py     read-only context projector (memories, summaries, plans)
   mcp_client.py    stdio MCP discovery, invocation, timeout, and auth reference
   tool_registry.py durable built-in + MCP tool registry
