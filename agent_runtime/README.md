@@ -376,11 +376,13 @@ Release-oriented changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## Scope boundaries
 
-The v0.3 baseline remains local and single-repository. Deferred beyond v0.3:
+The v0.3 Recovery Baseline remains local and single-repository. First-class
+verified-subtask checkpoints and semantic ledger state, which the earlier
+frozen Exec-Full v0.3.0.dev4 baseline deferred, are included in v0.3.0.dev8.
+The following remain deferred beyond the Recovery Baseline:
 
 - lane-aware worktree-based parallel execution;
 - retention/GC and the v0.3 release-gate hardening phase;
-- first-class verified-subtask checkpoints and semantic ledger state;
 - distributed or multi-machine coordination;
 - a full OS-level Shell sandbox;
 - OpenTelemetry and visual dashboards;
