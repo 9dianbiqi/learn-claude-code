@@ -39,6 +39,8 @@ def _provider_tool_schemas(
 def _provider_messages(messages: list[dict]) -> list[dict]:
     provider_messages = copy.deepcopy(messages)
     for message in provider_messages:
+        if message.get("role") != "assistant":
+            continue
         content = message.get("content")
         if not isinstance(content, list):
             continue

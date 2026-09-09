@@ -111,3 +111,35 @@ def test_provider_rejects_internal_name_collision_before_wire_call() -> None:
         model.complete([], schemas)
 
     assert messages_api.request is None
+
+
+def test_provider_only_rewrites_historical_assistant_tool_uses() -> None:
+    messages_api = _CapturingMessages()
+    model = AnthropicModel.__new__(AnthropicModel)
+    model.name = "deepseek-chat"
+    model.timeout = 120.0
+    model.client = SimpleNamespace(messages=messages_api)
+    schema = {
+        "name": ".agent_runtime.request_plan_approval",
+        "description": "Request plan approval.",
+        "input_schema": {"type": "object", "properties": {}},
+    }
+    messages = [{
+        "role": "user",
+        "content": [{
+            "type": "tool_use",
+            "id": "not-an-assistant-call",
+            "name": ".agent_runtime.request_plan_approval",
+            "input": {},
+        }],
+    }]
+
+    model.complete(messages, [schema])
+
+    assert messages_api.request is not None
+    assert messages_api.request["messages"][0]["content"][0]["name"] == (
+        ".agent_runtime.request_plan_approval"
+    )
+    assert messages[0]["content"][0]["name"] == (
+        ".agent_runtime.request_plan_approval"
+    )
