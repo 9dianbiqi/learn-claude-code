@@ -128,7 +128,7 @@ def test_job_events_and_records_are_redacted_in_trace(tmp_path: Path):
     assert summary["background_job_count"] == 1
 
 
-def test_v6_database_migrates_through_v7_to_v11(tmp_path: Path):
+def test_v6_database_migrates_through_v7_to_latest(tmp_path: Path):
     db = tmp_path / "runtime.db"
     conn = sqlite3.connect(db)
     conn.execute("PRAGMA foreign_keys=ON")
@@ -144,7 +144,7 @@ def test_v6_database_migrates_through_v7_to_v11(tmp_path: Path):
     assert SchemaManager(db).inspect().current_version == 6
     report = SchemaManager(db).migrate()
     assert report.from_version == 6
-    assert report.to_version == 12
+    assert report.to_version == 13
     assert report.applied == (
         "v7_background_jobs",
         "v8_tool_registry_mcp",
@@ -152,6 +152,7 @@ def test_v6_database_migrates_through_v7_to_v11(tmp_path: Path):
         "v10_verified_subtask",
         "v11_frozen_dag",
         "v12_stale_evidence",
+        "v13_plan_revisions",
     )
 
     store = EventStore(db)

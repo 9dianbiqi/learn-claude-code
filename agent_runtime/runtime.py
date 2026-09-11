@@ -19,6 +19,8 @@ from .effects import (
 )
 from .models import (
     ModelResponse,
+    PlanPatch,
+    PlanRevision,
     RunResult,
     ToolCall,
     VerifierContext,
@@ -265,9 +267,17 @@ class Runtime:
         if plan is None:
             return None
         items = plan["items"]
-        by_id = {item["subtask_id"]: item for item in items}
+        by_id = {
+            item["subtask_id"]: item
+            for item in items
+            if not item.get("tombstoned", False)
+        }
         for status in ("verifying", "in_progress", "retryable"):
-            candidates = [item for item in items if item["status"] == status]
+            candidates = [
+                item
+                for item in items
+                if not item.get("tombstoned", False) and item["status"] == status
+            ]
             if candidates:
                 item = candidates[0]
                 if (
@@ -281,7 +291,7 @@ class Runtime:
                     return self.store.get_plan_item(task_id, str(item["subtask_id"]))
                 return item
         for item in items:
-            if item["status"] != "pending":
+            if item.get("tombstoned", False) or item["status"] != "pending":
                 continue
             ready = all(
                 dependency in by_id and by_id[dependency]["status"] == "completed"
@@ -618,6 +628,31 @@ class Runtime:
             self._assert_verified_subtask_config(task_id)
             return self._resume_verified_task(task_id)
         return self._resume_task(task_id, lease_acquired=False)
+
+    def get_current_plan_revision(self, task_id: str) -> PlanRevision:
+        return self.store.get_current_plan_revision(task_id)
+
+    def apply_plan_patch(
+        self,
+        task_id: str,
+        expected_revision_id: str,
+        patch: PlanPatch,
+    ) -> PlanRevision:
+        if not isinstance(expected_revision_id, str) or not expected_revision_id.strip():
+            raise ValueError("expected_revision_id must be a non-empty string")
+        if not isinstance(patch, PlanPatch):
+            raise TypeError("patch must be a PlanPatch")
+        self._acquire(task_id)
+        try:
+            return self.store.apply_plan_patch(
+                task_id,
+                expected_revision_id,
+                patch,
+                fault_injector=self._fault,
+            )
+        finally:
+            if self._lease_token is not None:
+                self._release()
 
     def _resume_verified_task(self, task_id: str) -> RunResult:
         """Run evidence recovery before terminal fast paths or DAG selection."""

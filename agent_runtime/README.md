@@ -202,6 +202,20 @@ revision, automatic decomposition, recovery routing, workspace recovery, stuck
 detection, model routing, and human escalation belong to the Long-Horizon
 Agent product line rather than this baseline.
 
+## Long-Horizon Agent C1a: Immutable Plan Revisions
+
+Product development after the frozen Recovery Baseline uses package version
+`0.3.0.dev9` and schema version `v13`. A Plan keeps a stable identity and a
+current PlanRevision pointer; every accepted PlanPatch appends an immutable DAG
+snapshot and switches that pointer with compare-and-swap in the same
+transaction. Completing a dependency satisfies its edge without deleting it.
+
+The public mutation seam is `Runtime.apply_plan_patch(task_id,
+expected_revision_id, patch)`. Initial typed operations add a pending PlanItem,
+split a failed or retryable PlanItem, update dependencies among non-completed
+PlanItems, and tombstone an eligible pending PlanItem. Automatic patch
+generation and resume across revised plans remain outside C1a.
+
 ## Requirements
 
 - Python 3.11+
@@ -401,7 +415,7 @@ system sandbox.
 agent_runtime/
   runtime.py       durable loop and recovery
   store.py         SQLite projections, transactions, leases, and ledger API
-  migrations.py    explicit v4-to-v12 schema migrations and backup framework
+  migrations.py    explicit v4-to-v13 schema migrations and backup framework
   projector.py     read-only context projector (memories, summaries, plans)
   mcp_client.py    stdio MCP discovery, invocation, timeout, and auth reference
   tool_registry.py durable built-in + MCP tool registry

@@ -174,6 +174,9 @@ class TraceReporter:
                 len(item.get("items", [])) for item in plan_metrics["plans"]
             ),
             "plan_events": plan_metrics["events"],
+            "plan_revision_count": len(plan_metrics["revisions"]),
+            "current_plan_revision_id": plan_metrics["current_revision_id"],
+            "current_plan_revision_dag_hash": plan_metrics["current_revision_dag_hash"],
             "verifier_run_count": verified_metrics["verifier_run_count"],
             "authoritative_verifier_run_count": verified_metrics["authoritative_verifier_run_count"],
             "non_authoritative_verifier_run_count": verified_metrics["non_authoritative_verifier_run_count"],
@@ -259,8 +262,17 @@ class TraceReporter:
             event["type"]
             for event in self.store.list_events(task_id)
             if event["type"].startswith("plan_item_")
+            or event["type"].startswith("plan_revision_")
         ]
-        return {"plans": result, "events": events}
+        revisions = self.store.list_plan_revisions(task_id)
+        current = revisions[-1] if revisions else None
+        return {
+            "plans": result,
+            "events": events,
+            "revisions": revisions,
+            "current_revision_id": current.revision_id if current else None,
+            "current_revision_dag_hash": current.dag_hash if current else None,
+        }
 
     def _verified_metrics(self, task_id: str) -> dict[str, int]:
         runs = self.store.list_verifier_runs(task_id)
@@ -355,6 +367,15 @@ class TraceReporter:
                 handle.write(
                     json.dumps(
                         _redact({"record_type": "plan", **plan_copy}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+            for revision in self.store.list_plan_revisions(task_id):
+                handle.write(
+                    json.dumps(
+                        _redact({"record_type": "plan_revision", **revision.as_dict()}),
                         ensure_ascii=False,
                         sort_keys=True,
                     )

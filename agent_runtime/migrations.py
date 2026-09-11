@@ -9,9 +9,19 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from .models import PlanRevisionItem
+from .plan_revisions import (
+    canonical_json as _canonical_plan_json,
+    dag_hash as _plan_dag_hash,
+    initial_patch_hash as _initial_plan_patch_hash,
+    revision_id as _plan_revision_id,
+    revision_snapshot as _plan_revision_snapshot,
+    validate_snapshot as _validate_plan_snapshot,
+)
 
-SCHEMA_VERSION = 12
-MIGRATION_NAME = "v12_stale_evidence"
+
+SCHEMA_VERSION = 13
+MIGRATION_NAME = "v13_plan_revisions"
 V5_MIGRATION_NAME = "v5_effect_ledger"
 V6_MIGRATION_NAME = "v6_durable_context"
 V7_MIGRATION_NAME = "v7_background_jobs"
@@ -20,6 +30,7 @@ V9_MIGRATION_NAME = "v9_subagents_mailbox"
 V10_MIGRATION_NAME = "v10_verified_subtask"
 V11_MIGRATION_NAME = "v11_frozen_dag"
 V12_MIGRATION_NAME = "v12_stale_evidence"
+V13_MIGRATION_NAME = "v13_plan_revisions"
 MAX_EVENT_PAYLOAD_BYTES = 1 * 1024 * 1024
 
 _TASK_STATUSES = frozenset({
@@ -823,6 +834,54 @@ _V12_MIGRATION_SOURCE = "\n".join(
 V12_CHECKSUM = _sha256_text(_V12_MIGRATION_SOURCE)
 
 
+_V13_ADDITIONS = (
+    "ALTER TABLE plans ADD COLUMN current_revision_id TEXT",
+    "ALTER TABLE plan_items ADD COLUMN tombstoned INTEGER NOT NULL DEFAULT 0",
+    """
+    CREATE TABLE IF NOT EXISTS plan_revisions (
+        revision_id TEXT PRIMARY KEY,
+        plan_id INTEGER NOT NULL REFERENCES plans(plan_id),
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        parent_revision_id TEXT REFERENCES plan_revisions(revision_id),
+        revision_number INTEGER NOT NULL,
+        dag_hash TEXT NOT NULL,
+        patch_hash TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        trigger TEXT NOT NULL,
+        evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+        snapshot_json TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        UNIQUE(plan_id, revision_number)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_plan_revisions_plan ON "
+    "plan_revisions(plan_id, revision_number)",
+    "CREATE INDEX IF NOT EXISTS idx_plan_revisions_task ON "
+    "plan_revisions(task_id, revision_number)",
+    """
+    CREATE TRIGGER IF NOT EXISTS immutable_plan_revisions
+    BEFORE UPDATE ON plan_revisions
+    BEGIN
+        SELECT RAISE(ABORT, 'plan_revisions are append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS immutable_plan_revisions_delete
+    BEFORE DELETE ON plan_revisions
+    BEGIN
+        SELECT RAISE(ABORT, 'plan_revisions are append-only');
+    END
+    """,
+)
+
+
+_V13_MIGRATION_SOURCE = "\n".join(
+    [_V12_MIGRATION_SOURCE.strip()]
+    + [statement.strip() for statement in _V13_ADDITIONS]
+)
+V13_CHECKSUM = _sha256_text(_V13_MIGRATION_SOURCE)
+
+
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in columns:
@@ -855,6 +914,7 @@ def _business_tables(table_names: set[str]) -> set[str]:
         "summaries",
         "plans",
         "plan_items",
+        "plan_revisions",
         "agent_jobs",
         "job_runs",
         "cron_schedules",
@@ -1463,6 +1523,78 @@ def _apply_v12_stale_evidence(conn: sqlite3.Connection) -> None:
             )
 
 
+def _apply_v13_plan_revisions(conn: sqlite3.Connection) -> None:
+    _ensure_column(conn, "plans", "current_revision_id", "TEXT")
+    _ensure_column(conn, "plan_items", "tombstoned", "INTEGER NOT NULL DEFAULT 0")
+    _execute_all(conn, _V13_ADDITIONS[2:])
+    plans = conn.execute(
+        "SELECT plan_id, task_id, current_revision_id, created_at FROM plans ORDER BY plan_id"
+    ).fetchall()
+    for plan in plans:
+        if plan["current_revision_id"] is not None:
+            continue
+        rows = conn.execute(
+            "SELECT subtask_id, description, blocked_by_json, verifier_bundle_hash, "
+            "max_turns, tombstoned FROM plan_items WHERE plan_id = ? ORDER BY plan_item_id",
+            (int(plan["plan_id"]),),
+        ).fetchall()
+        items = tuple(
+            PlanRevisionItem(
+                subtask_id=str(row["subtask_id"]),
+                description=str(row["description"]),
+                blocked_by=tuple(str(value) for value in json.loads(row["blocked_by_json"])),
+                verifier_bundle_hash=(
+                    str(row["verifier_bundle_hash"])
+                    if row["verifier_bundle_hash"] is not None
+                    else None
+                ),
+                max_turns=int(row["max_turns"]),
+                tombstoned=bool(row["tombstoned"]),
+            )
+            for row in rows
+        )
+        try:
+            _validate_plan_snapshot(items)
+        except ValueError as exc:
+            raise MigrationValidationError(
+                f"plan {int(plan['plan_id'])} cannot be backfilled as a PlanRevision: {exc}"
+            ) from exc
+        reason = "migration_backfill"
+        trigger = "migration"
+        patch_digest = _initial_plan_patch_hash(reason=reason, trigger=trigger)
+        dag_digest = _plan_dag_hash(items)
+        revision = _plan_revision_id(
+            task_id=str(plan["task_id"]),
+            plan_id=int(plan["plan_id"]),
+            parent_revision_id=None,
+            revision_number=0,
+            dag_digest=dag_digest,
+            patch_digest=patch_digest,
+        )
+        created_at = float(plan["created_at"])
+        conn.execute(
+            "INSERT INTO plan_revisions("
+            "revision_id, plan_id, task_id, parent_revision_id, revision_number, "
+            "dag_hash, patch_hash, reason, trigger, evidence_refs_json, snapshot_json, created_at"
+            ") VALUES (?, ?, ?, NULL, 0, ?, ?, ?, ?, '[]', ?, ?)",
+            (
+                revision,
+                int(plan["plan_id"]),
+                str(plan["task_id"]),
+                dag_digest,
+                patch_digest,
+                reason,
+                trigger,
+                _canonical_plan_json(_plan_revision_snapshot(items)),
+                created_at,
+            ),
+        )
+        conn.execute(
+            "UPDATE plans SET current_revision_id = ? WHERE plan_id = ?",
+            (revision, int(plan["plan_id"])),
+        )
+
+
 def _create_latest_schema(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys=ON")
     _execute_all(conn, _BASE_SCHEMA)
@@ -1473,6 +1605,7 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
     _apply_v10_verified_subtask(conn)
     _apply_v11_frozen_dag(conn)
     _apply_v12_stale_evidence(conn)
+    _apply_v13_plan_revisions(conn)
     row = conn.execute("SELECT 1 FROM schema_migrations WHERE version = ?", (SCHEMA_VERSION,)).fetchone()
     if row is None:
         conn.execute(
@@ -1481,7 +1614,7 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
                 version, name, checksum, applied_at, duration_ms, backup_filename, backup_sha256
             ) VALUES (?, ?, ?, ?, ?, NULL, NULL)
             """,
-            (SCHEMA_VERSION, MIGRATION_NAME, V12_CHECKSUM, _now(), 0.0),
+            (SCHEMA_VERSION, MIGRATION_NAME, V13_CHECKSUM, _now(), 0.0),
         )
 
 
@@ -1493,6 +1626,7 @@ V9_MIGRATION = Migration(9, V9_MIGRATION_NAME, V9_CHECKSUM, _apply_v9_subagents_
 V10_MIGRATION = Migration(10, V10_MIGRATION_NAME, V10_CHECKSUM, _apply_v10_verified_subtask)
 V11_MIGRATION = Migration(11, V11_MIGRATION_NAME, V11_CHECKSUM, _apply_v11_frozen_dag)
 V12_MIGRATION = Migration(12, V12_MIGRATION_NAME, V12_CHECKSUM, _apply_v12_stale_evidence)
+V13_MIGRATION = Migration(13, V13_MIGRATION_NAME, V13_CHECKSUM, _apply_v13_plan_revisions)
 
 
 class SchemaManager:
@@ -1528,6 +1662,7 @@ class SchemaManager:
             V10_MIGRATION,
             V11_MIGRATION,
             V12_MIGRATION,
+            V13_MIGRATION,
         )
 
     def _connect(self, *, read_only: bool = False) -> sqlite3.Connection:
@@ -1589,7 +1724,7 @@ class SchemaManager:
             if not {"name", "checksum"} <= columns:
                 raise MigrationValidationError("schema_migrations is missing migration audit columns")
             latest = next(row for row in rows if int(row["version"]) == SCHEMA_VERSION)
-            if str(latest["name"]) != MIGRATION_NAME or str(latest["checksum"]) != V12_CHECKSUM:
+            if str(latest["name"]) != MIGRATION_NAME or str(latest["checksum"]) != V13_CHECKSUM:
                 raise MigrationChecksumMismatch(
                     f"migration checksum mismatch for v{SCHEMA_VERSION}: "
                     f"{latest['name']!r}/{latest['checksum']!r}"
@@ -1603,6 +1738,7 @@ class SchemaManager:
                 "subagent_runs", "mailboxes", "mailbox_messages", "plan_approvals",
                 "verifier_runs", "semantic_checkpoints",
                 "semantic_checkpoint_state_events",
+                "plan_revisions",
             }
             missing = sorted(required - tables)
             if missing:
@@ -1634,13 +1770,19 @@ class SchemaManager:
                     "evidence_hash", "model_call_id", "created_at",
                 },
                 "plans": {
-                    "plan_id", "task_id", "status", "dag_hash", "created_at", "updated_at",
+                    "plan_id", "task_id", "status", "dag_hash", "current_revision_id",
+                    "created_at", "updated_at",
                 },
                 "plan_items": {
                     "plan_item_id", "plan_id", "subtask_id", "description", "status",
                     "blocked_by_json", "completion_summary", "evidence_hash", "version",
                     "created_at", "updated_at", "verifier_bundle_hash", "max_turns",
-                    "consumed_turns",
+                    "consumed_turns", "tombstoned",
+                },
+                "plan_revisions": {
+                    "revision_id", "plan_id", "task_id", "parent_revision_id",
+                    "revision_number", "dag_hash", "patch_hash", "reason", "trigger",
+                    "evidence_refs_json", "snapshot_json", "created_at",
                 },
                 "agent_jobs": {
                     "job_id", "task_id", "repo_root", "lane_id", "kind", "payload_json",
@@ -2010,6 +2152,8 @@ class SchemaManager:
                 _apply_v11_frozen_dag(conn)
             if 12 in expected_versions:
                 _apply_v12_stale_evidence(conn)
+            if 13 in expected_versions:
+                _apply_v13_plan_revisions(conn)
 
             duration_ms = (time.perf_counter() - started) * 1000.0
             for migration in pending:
@@ -2093,4 +2237,5 @@ __all__ = [
     "V10_CHECKSUM",
     "V11_CHECKSUM",
     "V12_CHECKSUM",
+    "V13_CHECKSUM",
 ]

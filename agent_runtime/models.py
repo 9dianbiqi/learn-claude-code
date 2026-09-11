@@ -247,3 +247,180 @@ class VerifiedSubtaskDAGConfig:
             separators=(",", ":"),
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _normalize_subtask_ids(values: tuple[str, ...], label: str) -> tuple[str, ...]:
+    if isinstance(values, str):
+        raise TypeError(f"{label} must be a collection of subtask IDs")
+    normalized = tuple(values)
+    if any(not isinstance(value, str) or not value.strip() for value in normalized):
+        raise ValueError(f"{label} must contain non-empty string subtask IDs")
+    if len(normalized) != len(set(normalized)):
+        raise ValueError(f"{label} must not contain duplicates")
+    return tuple(sorted(normalized))
+
+
+@dataclass(frozen=True)
+class PlanItemDraft:
+    subtask_id: str
+    description: str = ""
+    blocked_by: tuple[str, ...] = ()
+    verifier_bundle_hash: str | None = None
+    max_turns: int = 1
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.subtask_id, str) or not self.subtask_id.strip():
+            raise ValueError("subtask_id must be a non-empty string")
+        if not isinstance(self.description, str):
+            raise TypeError("description must be a string")
+        if isinstance(self.max_turns, bool) or not isinstance(self.max_turns, int) or self.max_turns < 1:
+            raise ValueError("max_turns must be a positive integer")
+        if self.verifier_bundle_hash is not None and not is_valid_sha256(
+            self.verifier_bundle_hash
+        ):
+            raise ValueError("verifier_bundle_hash must be a lowercase SHA-256 value")
+        object.__setattr__(
+            self,
+            "blocked_by",
+            _normalize_subtask_ids(self.blocked_by, "blocked_by"),
+        )
+
+
+@dataclass(frozen=True)
+class PlanRevisionItem:
+    subtask_id: str
+    description: str
+    blocked_by: tuple[str, ...]
+    verifier_bundle_hash: str | None
+    max_turns: int
+    tombstoned: bool = False
+
+    def item_dict(self) -> dict[str, Any]:
+        return {
+            "subtask_id": self.subtask_id,
+            "description": self.description,
+            "blocked_by": list(self.blocked_by),
+            "verifier_bundle_hash": self.verifier_bundle_hash,
+            "max_turns": self.max_turns,
+            "tombstoned": self.tombstoned,
+        }
+
+
+@dataclass(frozen=True)
+class AddPlanItem:
+    item: PlanItemDraft
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.item, PlanItemDraft):
+            raise TypeError("AddPlanItem.item must be a PlanItemDraft")
+
+
+@dataclass(frozen=True)
+class SplitPlanItem:
+    subtask_id: str
+    replacements: tuple[PlanItemDraft, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.subtask_id, str) or not self.subtask_id.strip():
+            raise ValueError("subtask_id must be a non-empty string")
+        replacements = tuple(self.replacements)
+        if len(replacements) < 2 or any(
+            not isinstance(item, PlanItemDraft) for item in replacements
+        ):
+            raise ValueError("SplitPlanItem requires at least two PlanItemDraft replacements")
+        object.__setattr__(self, "replacements", replacements)
+
+
+@dataclass(frozen=True)
+class UpdatePlanItemDependencies:
+    subtask_id: str
+    blocked_by: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.subtask_id, str) or not self.subtask_id.strip():
+            raise ValueError("subtask_id must be a non-empty string")
+        object.__setattr__(
+            self,
+            "blocked_by",
+            _normalize_subtask_ids(self.blocked_by, "blocked_by"),
+        )
+
+
+@dataclass(frozen=True)
+class TombstonePlanItem:
+    subtask_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.subtask_id, str) or not self.subtask_id.strip():
+            raise ValueError("subtask_id must be a non-empty string")
+
+
+@dataclass(frozen=True)
+class PlanPatch:
+    reason: str
+    trigger: str
+    operations: tuple[
+        AddPlanItem | SplitPlanItem | UpdatePlanItemDependencies | TombstonePlanItem,
+        ...,
+    ]
+    evidence_refs: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reason, str) or not self.reason.strip():
+            raise ValueError("PlanPatch.reason must be a non-empty string")
+        if not isinstance(self.trigger, str) or not self.trigger.strip():
+            raise ValueError("PlanPatch.trigger must be a non-empty string")
+        operations = tuple(self.operations)
+        allowed = (
+            AddPlanItem,
+            SplitPlanItem,
+            UpdatePlanItemDependencies,
+            TombstonePlanItem,
+        )
+        if not operations or any(not isinstance(operation, allowed) for operation in operations):
+            raise ValueError("PlanPatch requires typed operations")
+        evidence_refs = tuple(self.evidence_refs)
+        if any(not isinstance(ref, str) or not ref.strip() for ref in evidence_refs):
+            raise ValueError("evidence_refs must contain non-empty strings")
+        if len(evidence_refs) != len(set(evidence_refs)):
+            raise ValueError("evidence_refs must not contain duplicates")
+        object.__setattr__(self, "operations", operations)
+        object.__setattr__(self, "evidence_refs", tuple(sorted(evidence_refs)))
+
+
+@dataclass(frozen=True)
+class PlanRevision:
+    revision_id: str
+    plan_id: int
+    task_id: str
+    parent_revision_id: str | None
+    revision_number: int
+    dag_hash: str
+    patch_hash: str
+    reason: str
+    trigger: str
+    evidence_refs: tuple[str, ...]
+    items: tuple[PlanRevisionItem, ...]
+    created_at: float
+
+    def item(self, subtask_id: str) -> PlanRevisionItem:
+        for item in self.items:
+            if item.subtask_id == subtask_id:
+                return item
+        raise KeyError(f"PlanItem not found in revision: {subtask_id}")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "revision_id": self.revision_id,
+            "plan_id": self.plan_id,
+            "task_id": self.task_id,
+            "parent_revision_id": self.parent_revision_id,
+            "revision_number": self.revision_number,
+            "dag_hash": self.dag_hash,
+            "patch_hash": self.patch_hash,
+            "reason": self.reason,
+            "trigger": self.trigger,
+            "evidence_refs": list(self.evidence_refs),
+            "items": [item.item_dict() for item in self.items],
+            "created_at": self.created_at,
+        }

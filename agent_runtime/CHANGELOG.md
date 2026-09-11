@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.3.0.dev9 - Immutable Plan Revisions & CAS Plan Patches
+
+- Added append-only PlanRevision snapshots with stable Plan identity, parent
+  linkage, deterministic DAG/patch hashes, evidence references, and schema v13
+  migration/backfill.
+- Added the public `Runtime.apply_plan_patch` CAS seam with typed operations to
+  add, split, rewire, or tombstone eligible non-completed PlanItems while
+  preserving completed work and historical dependency edges.
+- Added crash-boundary, stale-writer, immutable-history, invariant, trace, and
+  migration tests without changing the self-contained teaching TaskManager.
+
 ## v0.3.0.dev8 - Fixed-Budget Scoped Recovery
 
 - Added opt-in Verified-Scoped recovery for interrupted frozen-DAG tasks while

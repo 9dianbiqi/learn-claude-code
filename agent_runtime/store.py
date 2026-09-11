@@ -13,7 +13,19 @@ from typing import Any, Callable, Iterator
 
 from .effects import EffectSemantics, OperationSpec, ReconcileEvidence, sha256_json
 from .migrations import SCHEMA_VERSION, SchemaManager, _legacy_projection_violations
-from .models import is_valid_sha256
+from .models import PlanPatch, PlanRevision, PlanRevisionItem, is_valid_sha256
+from .plan_revisions import (
+    PlanPatchError,
+    apply_patch as derive_plan_revision,
+    canonical_json as canonical_plan_json,
+    dag_hash as plan_dag_hash,
+    decode_snapshot,
+    initial_patch_hash,
+    patch_hash as plan_patch_hash,
+    revision_id as make_plan_revision_id,
+    revision_snapshot,
+    validate_snapshot,
+)
 
 
 MAX_CHECKPOINT_BYTES = 4 * 1024 * 1024
@@ -1204,7 +1216,304 @@ class EventStore:
                         now,
                     ),
                 )
+            self._create_initial_plan_revision_conn(
+                conn,
+                plan_id=plan_id,
+                task_id=task_id,
+                reason="initial_plan",
+                trigger="runtime",
+                created_at=now,
+            )
             return plan_id
+
+    @staticmethod
+    def _plan_revision_items_from_rows(rows: list[sqlite3.Row]) -> tuple[PlanRevisionItem, ...]:
+        return tuple(
+            PlanRevisionItem(
+                subtask_id=str(row["subtask_id"]),
+                description=str(row["description"]),
+                blocked_by=tuple(str(value) for value in _loads(row["blocked_by_json"], [])),
+                verifier_bundle_hash=(
+                    str(row["verifier_bundle_hash"])
+                    if row["verifier_bundle_hash"] is not None
+                    else None
+                ),
+                max_turns=int(row["max_turns"]),
+                tombstoned=bool(row["tombstoned"]),
+            )
+            for row in rows
+        )
+
+    def _create_initial_plan_revision_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        plan_id: int,
+        task_id: str,
+        reason: str,
+        trigger: str,
+        created_at: float,
+    ) -> PlanRevision:
+        rows = conn.execute(
+            "SELECT subtask_id, description, blocked_by_json, verifier_bundle_hash, "
+            "max_turns, tombstoned FROM plan_items WHERE plan_id = ? ORDER BY plan_item_id",
+            (plan_id,),
+        ).fetchall()
+        items = self._plan_revision_items_from_rows(rows)
+        validate_snapshot(items)
+        patch_digest = initial_patch_hash(reason=reason, trigger=trigger)
+        dag_digest = plan_dag_hash(items)
+        revision = make_plan_revision_id(
+            task_id=task_id,
+            plan_id=plan_id,
+            parent_revision_id=None,
+            revision_number=0,
+            dag_digest=dag_digest,
+            patch_digest=patch_digest,
+        )
+        conn.execute(
+            "INSERT INTO plan_revisions("
+            "revision_id, plan_id, task_id, parent_revision_id, revision_number, "
+            "dag_hash, patch_hash, reason, trigger, evidence_refs_json, snapshot_json, created_at"
+            ") VALUES (?, ?, ?, NULL, 0, ?, ?, ?, ?, '[]', ?, ?)",
+            (
+                revision,
+                plan_id,
+                task_id,
+                dag_digest,
+                patch_digest,
+                reason,
+                trigger,
+                _checked_json(revision_snapshot(items), MAX_CHECKPOINT_BYTES, "plan revision snapshot"),
+                created_at,
+            ),
+        )
+        updated = conn.execute(
+            "UPDATE plans SET current_revision_id = ?, updated_at = ? "
+            "WHERE plan_id = ? AND current_revision_id IS NULL",
+            (revision, created_at, plan_id),
+        )
+        if updated.rowcount != 1:
+            raise StaleState(f"Plan already has a current revision: {plan_id}")
+        return PlanRevision(
+            revision_id=revision,
+            plan_id=plan_id,
+            task_id=task_id,
+            parent_revision_id=None,
+            revision_number=0,
+            dag_hash=dag_digest,
+            patch_hash=patch_digest,
+            reason=reason,
+            trigger=trigger,
+            evidence_refs=(),
+            items=items,
+            created_at=created_at,
+        )
+
+    @staticmethod
+    def _decode_plan_revision(row: sqlite3.Row | None) -> PlanRevision | None:
+        if row is None:
+            return None
+        return PlanRevision(
+            revision_id=str(row["revision_id"]),
+            plan_id=int(row["plan_id"]),
+            task_id=str(row["task_id"]),
+            parent_revision_id=(
+                str(row["parent_revision_id"])
+                if row["parent_revision_id"] is not None
+                else None
+            ),
+            revision_number=int(row["revision_number"]),
+            dag_hash=str(row["dag_hash"]),
+            patch_hash=str(row["patch_hash"]),
+            reason=str(row["reason"]),
+            trigger=str(row["trigger"]),
+            evidence_refs=tuple(str(value) for value in _loads(row["evidence_refs_json"], [])),
+            items=decode_snapshot(str(row["snapshot_json"])),
+            created_at=float(row["created_at"]),
+        )
+
+    def get_current_plan_revision(self, task_id: str) -> PlanRevision:
+        row = self._fetchone(
+            "SELECT r.* FROM plans p JOIN plan_revisions r "
+            "ON r.revision_id = p.current_revision_id "
+            "WHERE p.task_id = ? ORDER BY p.plan_id DESC LIMIT 1",
+            (task_id,),
+        )
+        revision = self._decode_plan_revision(row)
+        if revision is None:
+            raise KeyError(f"Task has no current PlanRevision: {task_id}")
+        return revision
+
+    def list_plan_revisions(self, task_id: str) -> list[PlanRevision]:
+        rows = self._fetchall(
+            "SELECT * FROM plan_revisions WHERE task_id = ? "
+            "ORDER BY plan_id, revision_number",
+            (task_id,),
+        )
+        return [revision for row in rows if (revision := self._decode_plan_revision(row)) is not None]
+
+    def apply_plan_patch(
+        self,
+        task_id: str,
+        expected_revision_id: str,
+        patch: PlanPatch,
+        *,
+        fault_injector: Callable[..., None] | None = None,
+    ) -> PlanRevision:
+        if not isinstance(patch, PlanPatch):
+            raise TypeError("patch must be a PlanPatch")
+        now = _now()
+        with self.transaction() as conn:
+            plan = conn.execute(
+                "SELECT * FROM plans WHERE task_id = ? ORDER BY plan_id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if plan is None:
+                raise KeyError(f"Task has no Plan: {task_id}")
+            if plan["status"] in {"completed", "superseded"}:
+                raise PlanPatchError(f"Plan cannot be patched from status {plan['status']}")
+            current_revision_id = plan["current_revision_id"]
+            if current_revision_id != expected_revision_id:
+                raise StaleState(
+                    f"Plan revision changed: expected {expected_revision_id}, "
+                    f"current {current_revision_id}"
+                )
+            current_row = conn.execute(
+                "SELECT * FROM plan_revisions WHERE revision_id = ? AND plan_id = ?",
+                (expected_revision_id, int(plan["plan_id"])),
+            ).fetchone()
+            current_revision = self._decode_plan_revision(current_row)
+            if current_revision is None:
+                raise InvariantViolation(f"Current PlanRevision is missing: {expected_revision_id}")
+            item_rows = conn.execute(
+                "SELECT * FROM plan_items WHERE plan_id = ? ORDER BY plan_item_id",
+                (int(plan["plan_id"]),),
+            ).fetchall()
+            statuses = {str(row["subtask_id"]): str(row["status"]) for row in item_rows}
+            next_items = derive_plan_revision(current_revision.items, statuses, patch)
+            patch_digest = plan_patch_hash(patch)
+            dag_digest = plan_dag_hash(next_items)
+            revision_number = current_revision.revision_number + 1
+            next_revision_id = make_plan_revision_id(
+                task_id=task_id,
+                plan_id=int(plan["plan_id"]),
+                parent_revision_id=current_revision.revision_id,
+                revision_number=revision_number,
+                dag_digest=dag_digest,
+                patch_digest=patch_digest,
+            )
+
+            before = {item.subtask_id: item for item in current_revision.items}
+            for item in next_items:
+                previous = before.get(item.subtask_id)
+                if previous is None:
+                    conn.execute(
+                        "INSERT INTO plan_items("
+                        "plan_id, subtask_id, description, status, blocked_by_json, "
+                        "verifier_bundle_hash, max_turns, consumed_turns, tombstoned, "
+                        "version, created_at, updated_at"
+                        ") VALUES (?, ?, ?, 'pending', ?, ?, ?, 0, 0, 0, ?, ?)",
+                        (
+                            int(plan["plan_id"]),
+                            item.subtask_id,
+                            item.description,
+                            _checked_json(list(item.blocked_by), MAX_CHECKPOINT_BYTES, "plan blocked_by"),
+                            item.verifier_bundle_hash,
+                            item.max_turns,
+                            now,
+                            now,
+                        ),
+                    )
+                    continue
+                if previous.blocked_by != item.blocked_by or previous.tombstoned != item.tombstoned:
+                    updated_item = conn.execute(
+                        "UPDATE plan_items SET blocked_by_json = ?, tombstoned = ?, "
+                        "version = version + 1, updated_at = ? "
+                        "WHERE plan_id = ? AND subtask_id = ? AND version = ?",
+                        (
+                            _checked_json(list(item.blocked_by), MAX_CHECKPOINT_BYTES, "plan blocked_by"),
+                            int(item.tombstoned),
+                            now,
+                            int(plan["plan_id"]),
+                            item.subtask_id,
+                            int(next(row["version"] for row in item_rows if row["subtask_id"] == item.subtask_id)),
+                        ),
+                    )
+                    if updated_item.rowcount != 1:
+                        raise StaleState(f"PlanItem changed during PlanPatch: {item.subtask_id}")
+
+            conn.execute(
+                "INSERT INTO plan_revisions("
+                "revision_id, plan_id, task_id, parent_revision_id, revision_number, "
+                "dag_hash, patch_hash, reason, trigger, evidence_refs_json, snapshot_json, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    next_revision_id,
+                    int(plan["plan_id"]),
+                    task_id,
+                    current_revision.revision_id,
+                    revision_number,
+                    dag_digest,
+                    patch_digest,
+                    patch.reason,
+                    patch.trigger,
+                    _checked_json(list(patch.evidence_refs), MAX_CHECKPOINT_BYTES, "plan evidence refs"),
+                    _checked_json(revision_snapshot(next_items), MAX_CHECKPOINT_BYTES, "plan revision snapshot"),
+                    now,
+                ),
+            )
+            switched = conn.execute(
+                "UPDATE plans SET current_revision_id = ?, updated_at = ? "
+                "WHERE plan_id = ? AND current_revision_id = ?",
+                (next_revision_id, now, int(plan["plan_id"]), expected_revision_id),
+            )
+            if switched.rowcount != 1:
+                raise StaleState(f"Plan revision changed before CAS switch: {task_id}")
+            payload = {
+                "plan_id": int(plan["plan_id"]),
+                "revision_id": next_revision_id,
+                "parent_revision_id": current_revision.revision_id,
+                "revision_number": revision_number,
+                "dag_hash": dag_digest,
+                "patch_hash": patch_digest,
+                "reason": patch.reason,
+                "trigger": patch.trigger,
+                "evidence_refs": list(patch.evidence_refs),
+                "operations": [type(operation).__name__ for operation in patch.operations],
+            }
+            conn.execute(
+                "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                (task_id, "plan_revision_created", _checked_json(payload, MAX_EVENT_PAYLOAD_BYTES, "event payload"), now),
+            )
+            if fault_injector:
+                fault_injector(
+                    "plan_patch_before_commit",
+                    task_id=task_id,
+                    revision_id=next_revision_id,
+                )
+
+        result = PlanRevision(
+            revision_id=next_revision_id,
+            plan_id=int(plan["plan_id"]),
+            task_id=task_id,
+            parent_revision_id=current_revision.revision_id,
+            revision_number=revision_number,
+            dag_hash=dag_digest,
+            patch_hash=patch_digest,
+            reason=patch.reason,
+            trigger=patch.trigger,
+            evidence_refs=patch.evidence_refs,
+            items=next_items,
+            created_at=now,
+        )
+        if fault_injector:
+            fault_injector(
+                "plan_patch_after_commit",
+                task_id=task_id,
+                revision_id=next_revision_id,
+            )
+        return result
 
     def get_active_plan(self, task_id: str) -> dict[str, Any] | None:
         row = self._fetchone(
@@ -1228,6 +1537,7 @@ class EventStore:
     def _decode_plan_item(row: sqlite3.Row) -> dict[str, Any]:
         item = dict(row)
         item["blocked_by"] = _loads(item.pop("blocked_by_json"), [])
+        item["tombstoned"] = bool(item.get("tombstoned", 0))
         return item
 
     def get_latest_plan(self, task_id: str) -> dict[str, Any] | None:
@@ -1308,6 +1618,8 @@ class EventStore:
     def start_plan_item(self, plan_item_id: int, *, check_dependencies: bool = True) -> None:
         with self.transaction() as conn:
             row = self._plan_call(conn, plan_item_id)
+            if bool(row["tombstoned"]):
+                raise InvariantViolation(f"plan item {plan_item_id} is tombstoned")
             if row["status"] not in {"pending", "retryable"}:
                 raise InvariantViolation(
                     f"plan item {plan_item_id} cannot start from {row['status']}"
@@ -1316,10 +1628,15 @@ class EventStore:
                 blockers = _loads(row["blocked_by_json"], [])
                 for blocker in blockers:
                     blocked = conn.execute(
-                        "SELECT status FROM plan_items WHERE plan_id = ? AND subtask_id = ?",
+                        "SELECT status, tombstoned FROM plan_items "
+                        "WHERE plan_id = ? AND subtask_id = ?",
                         (row["plan_id"], blocker),
                     ).fetchone()
-                    if blocked is None or blocked["status"] != "completed":
+                    if (
+                        blocked is None
+                        or bool(blocked["tombstoned"])
+                        or blocked["status"] != "completed"
+                    ):
                         raise InvariantViolation(
                             f"plan item {plan_item_id} blocked by uncompleted {blocker}"
                         )
@@ -1331,18 +1648,26 @@ class EventStore:
 
     def plan_item_dependencies_complete(self, plan_item_id: int) -> bool:
         row = self._fetchone(
-            "SELECT plan_id, blocked_by_json FROM plan_items WHERE plan_item_id = ?",
+            "SELECT plan_id, blocked_by_json, tombstoned FROM plan_items "
+            "WHERE plan_item_id = ?",
             (plan_item_id,),
         )
         if row is None:
             raise KeyError(f"Plan item not found: {plan_item_id}")
+        if bool(row["tombstoned"]):
+            return False
         blockers = _loads(row["blocked_by_json"], [])
         for blocker in blockers:
             dependency = self._fetchone(
-                "SELECT status FROM plan_items WHERE plan_id = ? AND subtask_id = ?",
+                "SELECT status, tombstoned FROM plan_items "
+                "WHERE plan_id = ? AND subtask_id = ?",
                 (row["plan_id"], blocker),
             )
-            if dependency is None or dependency["status"] != "completed":
+            if (
+                dependency is None
+                or bool(dependency["tombstoned"])
+                or dependency["status"] != "completed"
+            ):
                 return False
         return True
 
@@ -4902,12 +5227,107 @@ class EventStore:
                     if call["effect"] == "read_only":
                         violations.append(f"operation {operation['operation_id']}: read-only call has operation")
             self._scan_v6_invariants(conn, task_id, violations)
+            self._scan_plan_revision_invariants(conn, task_id, violations)
             self._scan_verified_subtask_invariants(conn, task_id, violations)
             self._scan_job_invariants(conn, task_id, violations)
             self._scan_subagent_invariants(conn, task_id, violations)
         finally:
             conn.close()
         return violations
+
+    def _scan_plan_revision_invariants(
+        self,
+        conn: sqlite3.Connection,
+        task_id: str | None,
+        violations: list[str],
+    ) -> None:
+        if task_id is None:
+            plans = conn.execute("SELECT * FROM plans ORDER BY plan_id").fetchall()
+        else:
+            plans = conn.execute(
+                "SELECT * FROM plans WHERE task_id = ? ORDER BY plan_id",
+                (task_id,),
+            ).fetchall()
+        for plan in plans:
+            plan_id = int(plan["plan_id"])
+            current_revision_id = plan["current_revision_id"]
+            revisions = conn.execute(
+                "SELECT * FROM plan_revisions WHERE plan_id = ? ORDER BY revision_number",
+                (plan_id,),
+            ).fetchall()
+            if not revisions:
+                violations.append(f"plan {plan_id}: missing PlanRevision history")
+                continue
+            expected_parent: str | None = None
+            decoded_by_id: dict[str, tuple[PlanRevisionItem, ...]] = {}
+            for expected_number, revision in enumerate(revisions):
+                revision_id = str(revision["revision_id"])
+                if str(revision["task_id"]) != str(plan["task_id"]):
+                    violations.append(f"PlanRevision {revision_id}: task mismatch")
+                if int(revision["revision_number"]) != expected_number:
+                    violations.append(f"PlanRevision {revision_id}: non-contiguous revision number")
+                actual_parent = (
+                    str(revision["parent_revision_id"])
+                    if revision["parent_revision_id"] is not None
+                    else None
+                )
+                if actual_parent != expected_parent:
+                    violations.append(f"PlanRevision {revision_id}: parent chain mismatch")
+                try:
+                    items = decode_snapshot(str(revision["snapshot_json"]))
+                    validate_snapshot(items)
+                    if plan_dag_hash(items) != str(revision["dag_hash"]):
+                        violations.append(f"PlanRevision {revision_id}: DAG hash mismatch")
+                    decoded_by_id[revision_id] = items
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    violations.append(f"PlanRevision {revision_id}: invalid snapshot: {exc}")
+                if not is_valid_sha256(str(revision["dag_hash"])):
+                    violations.append(f"PlanRevision {revision_id}: invalid DAG hash")
+                if not is_valid_sha256(str(revision["patch_hash"])):
+                    violations.append(f"PlanRevision {revision_id}: invalid patch hash")
+                expected_id = make_plan_revision_id(
+                    task_id=str(revision["task_id"]),
+                    plan_id=plan_id,
+                    parent_revision_id=actual_parent,
+                    revision_number=int(revision["revision_number"]),
+                    dag_digest=str(revision["dag_hash"]),
+                    patch_digest=str(revision["patch_hash"]),
+                )
+                if expected_id != revision_id:
+                    violations.append(f"PlanRevision {revision_id}: revision identity mismatch")
+                expected_parent = revision_id
+
+            latest_revision_id = str(revisions[-1]["revision_id"])
+            if current_revision_id != latest_revision_id:
+                violations.append(
+                    f"plan {plan_id}: current revision {current_revision_id!r} "
+                    f"does not match latest {latest_revision_id!r}"
+                )
+            current_items = decoded_by_id.get(str(current_revision_id))
+            if current_items is None:
+                violations.append(f"plan {plan_id}: current PlanRevision is missing or invalid")
+                continue
+            projection_rows = conn.execute(
+                "SELECT subtask_id, description, blocked_by_json, verifier_bundle_hash, "
+                "max_turns, tombstoned FROM plan_items WHERE plan_id = ? ORDER BY plan_item_id",
+                (plan_id,),
+            ).fetchall()
+            projection = self._plan_revision_items_from_rows(projection_rows)
+            if projection != current_items:
+                violations.append(f"plan {plan_id}: PlanItem projection differs from current revision")
+
+            revision_events = {
+                str(json.loads(event["payload_json"]).get("revision_id"))
+                for event in conn.execute(
+                    "SELECT payload_json FROM events WHERE task_id = ? "
+                    "AND type = 'plan_revision_created'",
+                    (str(plan["task_id"]),),
+                ).fetchall()
+            }
+            for revision in revisions[1:]:
+                revision_id = str(revision["revision_id"])
+                if revision_id not in revision_events:
+                    violations.append(f"PlanRevision {revision_id}: missing audit event")
 
     def _scan_verified_subtask_invariants(
         self,

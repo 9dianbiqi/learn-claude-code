@@ -25,6 +25,7 @@ from agent_runtime.migrations import (
     V9_CHECKSUM,
     V10_CHECKSUM,
     V11_CHECKSUM,
+    V13_CHECKSUM,
 )
 from agent_runtime.store import EventStore
 from agent_runtime.trace import TraceReporter
@@ -77,8 +78,8 @@ def test_v11_to_v12_migration_backfills_lifecycle_and_is_idempotent(tmp_path: Pa
 
     assert report.ok is True
     assert report.from_version == 11
-    assert report.to_version == 12
-    assert report.applied == ("v12_stale_evidence",)
+    assert report.to_version == 13
+    assert report.applied == ("v12_stale_evidence", "v13_plan_revisions")
     with sqlite3.connect(database) as connection:
         tables = {
             row[0]
@@ -184,14 +185,14 @@ def test_v11_to_v12_migration_supersedes_older_checkpoint_history(tmp_path: Path
     assert store.scan_invariants("task-history") == []
 
 
-def test_fresh_database_is_v12_with_lifecycle_schema(tmp_path: Path) -> None:
+def test_fresh_database_is_latest_with_lifecycle_schema(tmp_path: Path) -> None:
     store = EventStore(tmp_path / "runtime.db")
 
-    assert SchemaManager(store.path).inspect().current_version == 12
+    assert SchemaManager(store.path).inspect().current_version == 13
     with sqlite3.connect(store.path) as connection:
         assert connection.execute(
-            "SELECT name FROM schema_migrations WHERE version = 12"
-        ).fetchone()[0] == "v12_stale_evidence"
+            "SELECT name, checksum FROM schema_migrations WHERE version = 13"
+        ).fetchone() == ("v13_plan_revisions", V13_CHECKSUM)
         assert connection.execute(
             "SELECT COUNT(*) FROM semantic_checkpoint_state_events"
         ).fetchone()[0] == 0

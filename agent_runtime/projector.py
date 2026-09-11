@@ -89,7 +89,11 @@ class ContextProjector:
 
     @staticmethod
     def _select_active_subtask(plan: dict[str, Any]) -> dict[str, Any] | None:
-        item_by_subtask = {item["subtask_id"]: item for item in plan["items"]}
+        item_by_subtask = {
+            item["subtask_id"]: item
+            for item in plan["items"]
+            if not item.get("tombstoned", False)
+        }
         frozen_dag = plan.get("dag_hash") is not None
 
         def unblocked(item: dict[str, Any]) -> bool:
@@ -105,6 +109,8 @@ class ContextProjector:
         )
         for preferred in preference:
             for item in plan["items"]:
+                if item.get("tombstoned", False):
+                    continue
                 if item["status"] != preferred:
                     continue
                 if (not frozen_dag or preferred == "pending") and not unblocked(item):
