@@ -522,3 +522,84 @@ def test_trace_exposes_current_plan_revision_and_append_only_history(tmp_path: P
         updated.revision_id,
     ]
     assert revision_records[0]["items"][1]["blocked_by"] == ["prepare"]
+
+
+def test_tombstoned_history_does_not_block_final_verified_completion(tmp_path: Path) -> None:
+    runtime = Runtime(tmp_path, ScriptedModel([]))
+    task_id = "task-tombstone-completion"
+    checkpoint_id = runtime.store.bootstrap_task(
+        task_id,
+        str(tmp_path.resolve()),
+        "Complete active work",
+        "scripted",
+        [{"role": "user", "content": "Complete active work"}],
+        {"turn": 0},
+    )
+    bundle_hash = "a" * 64
+    plan_id = runtime.store.create_plan(
+        task_id,
+        [
+            {
+                "subtask_id": "active",
+                "description": "Active work",
+                "verifier_bundle_hash": bundle_hash,
+            },
+            {"subtask_id": "obsolete", "description": "Obsolete work"},
+        ],
+    )
+    initial = runtime.get_current_plan_revision(task_id)
+    runtime.apply_plan_patch(
+        task_id,
+        initial.revision_id,
+        PlanPatch(
+            reason="Remove obsolete work",
+            trigger="operator",
+            operations=(TombstonePlanItem("obsolete"),),
+        ),
+    )
+    active = next(
+        item for item in runtime.store.list_plan_items(plan_id)
+        if item["subtask_id"] == "active"
+    )
+    runtime.store.start_plan_item(active["plan_item_id"])
+    runtime.store.submit_plan_item_for_verification(active["plan_item_id"], "done")
+
+    runtime.store.commit_verified_subtask(
+        task_id=task_id,
+        plan_item_id=active["plan_item_id"],
+        subtask_id="active",
+        completion_summary="done",
+        verifier_summary="passed",
+        evidence_manifest=[{"path": "active.txt", "sha256": "b" * 64}],
+        verifier_id="active-verifier",
+        verifier_version="1",
+        verification_rule="active exists",
+        verifier_bundle_hash=bundle_hash,
+        verifier_implementation_hash="c" * 64,
+        execution_checkpoint_id=checkpoint_id,
+        complete_task=True,
+    )
+
+    assert runtime.store.get_task(task_id)["status"] == "completed"
+    assert runtime.store.get_latest_plan(task_id)["status"] == "completed"
+
+
+def test_plan_revision_decoder_rejects_coerced_snapshot_types(tmp_path: Path) -> None:
+    runtime, task_id = _runtime_with_plan(tmp_path)
+    revision = runtime.get_current_plan_revision(task_id)
+    with sqlite3.connect(runtime.store.path) as connection:
+        connection.execute("DROP TRIGGER immutable_plan_revisions")
+        snapshot = json.loads(
+            connection.execute(
+                "SELECT snapshot_json FROM plan_revisions WHERE revision_id = ?",
+                (revision.revision_id,),
+            ).fetchone()[0]
+        )
+        snapshot[0]["tombstoned"] = "false"
+        connection.execute(
+            "UPDATE plan_revisions SET snapshot_json = ? WHERE revision_id = ?",
+            (json.dumps(snapshot), revision.revision_id),
+        )
+
+    with pytest.raises(PlanPatchError, match="tombstoned"):
+        runtime.get_current_plan_revision(task_id)

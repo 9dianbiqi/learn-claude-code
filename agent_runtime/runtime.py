@@ -267,17 +267,9 @@ class Runtime:
         if plan is None:
             return None
         items = plan["items"]
-        by_id = {
-            item["subtask_id"]: item
-            for item in items
-            if not item.get("tombstoned", False)
-        }
+        by_id = {item["subtask_id"]: item for item in items}
         for status in ("verifying", "in_progress", "retryable"):
-            candidates = [
-                item
-                for item in items
-                if not item.get("tombstoned", False) and item["status"] == status
-            ]
+            candidates = [item for item in items if item["status"] == status]
             if candidates:
                 item = candidates[0]
                 if (
@@ -291,7 +283,7 @@ class Runtime:
                     return self.store.get_plan_item(task_id, str(item["subtask_id"]))
                 return item
         for item in items:
-            if item.get("tombstoned", False) or item["status"] != "pending":
+            if item["status"] != "pending":
                 continue
             ready = all(
                 dependency in by_id and by_id[dependency]["status"] == "completed"

@@ -33,24 +33,60 @@ def decode_snapshot(value: str) -> tuple[PlanRevisionItem, ...]:
     if not isinstance(raw, list):
         raise PlanPatchError("plan revision snapshot must be a list")
     items: list[PlanRevisionItem] = []
+    required_fields = {
+        "subtask_id",
+        "description",
+        "blocked_by",
+        "verifier_bundle_hash",
+        "max_turns",
+        "tombstoned",
+    }
     for entry in raw:
         if not isinstance(entry, dict):
             raise PlanPatchError("plan revision item must be an object")
+        if set(entry) != required_fields:
+            raise PlanPatchError("plan revision item has missing or unknown fields")
+        subtask_id = entry["subtask_id"]
+        description = entry["description"]
+        blocked_by = entry["blocked_by"]
+        verifier_bundle_hash = entry["verifier_bundle_hash"]
+        max_turns = entry["max_turns"]
+        tombstoned = entry["tombstoned"]
+        if not isinstance(subtask_id, str) or not subtask_id.strip():
+            raise PlanPatchError("plan revision subtask_id must be a non-empty string")
+        if not isinstance(description, str):
+            raise PlanPatchError("plan revision description must be a string")
+        if not isinstance(blocked_by, list) or any(
+            not isinstance(dependency, str) or not dependency.strip()
+            for dependency in blocked_by
+        ):
+            raise PlanPatchError("plan revision blocked_by must be a string list")
+        if blocked_by != sorted(blocked_by) or len(blocked_by) != len(set(blocked_by)):
+            raise PlanPatchError("plan revision blocked_by must be sorted and unique")
+        if verifier_bundle_hash is not None and (
+            not isinstance(verifier_bundle_hash, str)
+            or not verifier_bundle_hash.strip()
+        ):
+            raise PlanPatchError(
+                "plan revision verifier_bundle_hash must be a non-empty string"
+            )
+        if isinstance(max_turns, bool) or not isinstance(max_turns, int) or max_turns < 1:
+            raise PlanPatchError("plan revision max_turns must be a positive integer")
+        if not isinstance(tombstoned, bool):
+            raise PlanPatchError("plan revision tombstoned must be a boolean")
         items.append(
             PlanRevisionItem(
-                subtask_id=str(entry["subtask_id"]),
-                description=str(entry.get("description", "")),
-                blocked_by=tuple(str(value) for value in entry.get("blocked_by", [])),
-                verifier_bundle_hash=(
-                    str(entry["verifier_bundle_hash"])
-                    if entry.get("verifier_bundle_hash") is not None
-                    else None
-                ),
-                max_turns=int(entry.get("max_turns", 1)),
-                tombstoned=bool(entry.get("tombstoned", False)),
+                subtask_id=subtask_id,
+                description=description,
+                blocked_by=tuple(blocked_by),
+                verifier_bundle_hash=verifier_bundle_hash,
+                max_turns=max_turns,
+                tombstoned=tombstoned,
             )
         )
-    return tuple(items)
+    result = tuple(items)
+    validate_snapshot(result)
+    return result
 
 
 def draft_item(item: PlanItemDraft) -> PlanRevisionItem:

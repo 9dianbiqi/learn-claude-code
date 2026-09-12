@@ -2185,7 +2185,8 @@ class EventStore:
             if updated_item.rowcount != 1:
                 raise StaleState(f"Plan item changed during verified completion: {plan_item_id}")
             remaining = conn.execute(
-                "SELECT COUNT(*) FROM plan_items WHERE plan_id = ? AND status != 'completed'",
+                "SELECT COUNT(*) FROM plan_items WHERE plan_id = ? "
+                "AND tombstoned = 0 AND status != 'completed'",
                 (item["plan_id"],),
             ).fetchone()[0]
             if complete_task:
