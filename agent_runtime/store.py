@@ -1527,7 +1527,8 @@ class EventStore:
             return None
         plan = dict(row)
         items = self._fetchall(
-            "SELECT * FROM plan_items WHERE plan_id = ? ORDER BY plan_item_id",
+            "SELECT * FROM plan_items WHERE plan_id = ? AND tombstoned = 0 "
+            "ORDER BY plan_item_id",
             (plan["plan_id"],),
         )
         plan["items"] = [self._decode_plan_item(item) for item in items]

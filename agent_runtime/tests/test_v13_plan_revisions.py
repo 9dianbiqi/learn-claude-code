@@ -603,3 +603,35 @@ def test_plan_revision_decoder_rejects_coerced_snapshot_types(tmp_path: Path) ->
 
     with pytest.raises(PlanPatchError, match="tombstoned"):
         runtime.get_current_plan_revision(task_id)
+
+
+def test_current_plan_excludes_tombstones_while_revision_history_retains_them(
+    tmp_path: Path,
+) -> None:
+    runtime, task_id = _runtime_with_plan(tmp_path)
+    initial = runtime.get_current_plan_revision(task_id)
+    updated = runtime.apply_plan_patch(
+        task_id,
+        initial.revision_id,
+        PlanPatch(
+            reason="Remove preparation from the current Plan",
+            trigger="operator",
+            operations=(
+                UpdatePlanItemDependencies("ship", ()),
+                TombstonePlanItem("prepare"),
+            ),
+        ),
+    )
+
+    active_plan = runtime.store.get_active_plan(task_id)
+    assert active_plan is not None
+    assert [item["subtask_id"] for item in active_plan["items"]] == ["ship"]
+    checkpoint_id = runtime.store.get_task(task_id)["checkpoint_id"]
+    checkpoint = runtime.store.get_checkpoint(checkpoint_id)
+    projection = runtime.projector.project(task_id, checkpoint["messages"], checkpoint_id)
+    assert projection.metrics["active_subtask_id"] == "ship"
+
+    assert updated.item("prepare").tombstoned is True
+    assert {
+        item["subtask_id"] for item in runtime.store.list_plan_items(updated.plan_id)
+    } == {"prepare", "ship"}
