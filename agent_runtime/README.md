@@ -216,6 +216,27 @@ split a failed or retryable PlanItem, update dependencies among non-completed
 PlanItems, and tombstone an eligible pending PlanItem. Automatic patch
 generation and resume across revised plans remain outside C1a.
 
+## Long-Horizon Agent C1b: Durable Plan Revision Resume
+
+C1b uses package version `0.3.0.dev10` and schema v14. Independent Standards/Spec
+review passed with no C1b blockers. `plans.current_revision_id` remains the latest
+accepted structure; `tasks.execution_plan_revision_id` records the revision
+acknowledged by execution. A PlanPatch changes only the former.
+
+To resume a revised verified DAG, construct `Runtime` with the exact current
+`VerifiedSubtaskDAGConfig`, including active item order, dependencies, budgets,
+and verifier bundles, then call `resume(task_id)`. Missing or stale configuration
+fails closed. Matching configuration advances the execution pointer in one
+leased transaction with an activation event and any eligible failed-plan
+reopening. Completed items and tombstoned history remain intact.
+
+Existing databases require explicit `db-migrate`. The migration binds revision
+0 of the latest Plan, including when later revisions already exist: migration
+does not acknowledge those revisions on the caller's behalf. Ordinary frozen
+DAG recovery and existing stale-evidence/effect-ledger rules still apply.
+
+See [C1b contract and validation](docs/c1b-durable-plan-revision-resume.md).
+
 ## Requirements
 
 - Python 3.11+
@@ -415,7 +436,7 @@ system sandbox.
 agent_runtime/
   runtime.py       durable loop and recovery
   store.py         SQLite projections, transactions, leases, and ledger API
-  migrations.py    explicit v4-to-v13 schema migrations and backup framework
+  migrations.py    explicit v4-to-v14 schema migrations and backup framework
   projector.py     read-only context projector (memories, summaries, plans)
   mcp_client.py    stdio MCP discovery, invocation, timeout, and auth reference
   tool_registry.py durable built-in + MCP tool registry

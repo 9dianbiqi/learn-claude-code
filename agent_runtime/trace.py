@@ -176,6 +176,8 @@ class TraceReporter:
             "plan_events": plan_metrics["events"],
             "plan_revision_count": len(plan_metrics["revisions"]),
             "current_plan_revision_id": plan_metrics["current_revision_id"],
+            "execution_plan_revision_id": self.store.get_task(task_id)["execution_plan_revision_id"],
+            "plan_revision_activation_count": plan_metrics["events"].count("plan_revision_activated"),
             "current_plan_revision_dag_hash": plan_metrics["current_revision_dag_hash"],
             "verifier_run_count": verified_metrics["verifier_run_count"],
             "authoritative_verifier_run_count": verified_metrics["authoritative_verifier_run_count"],

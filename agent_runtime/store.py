@@ -1216,13 +1216,18 @@ class EventStore:
                         now,
                     ),
                 )
-            self._create_initial_plan_revision_conn(
+            revision = self._create_initial_plan_revision_conn(
                 conn,
                 plan_id=plan_id,
                 task_id=task_id,
                 reason="initial_plan",
                 trigger="runtime",
                 created_at=now,
+            )
+            conn.execute(
+                "UPDATE tasks SET execution_plan_revision_id = ?, "
+                "version = version + 1, updated_at = ? WHERE task_id = ?",
+                (revision.revision_id, now, task_id),
             )
             return plan_id
 
@@ -1514,6 +1519,97 @@ class EventStore:
                 revision_id=next_revision_id,
             )
         return result
+
+    def activate_plan_revision(
+        self,
+        task_id: str,
+        expected_revision_id: str,
+        dag_hash: str,
+        *,
+        fault_injector: Callable[..., None] | None = None,
+    ) -> bool:
+        """Acknowledge validated structure without rewriting execution history."""
+        now = _now()
+        with self.transaction() as conn:
+            plan = conn.execute(
+                "SELECT * FROM plans WHERE task_id = ? ORDER BY plan_id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if plan is None or plan["current_revision_id"] != expected_revision_id:
+                raise StaleState(f"Plan revision changed before activation: {task_id}")
+            revision = conn.execute(
+                "SELECT * FROM plan_revisions WHERE revision_id = ?",
+                (expected_revision_id,),
+            ).fetchone()
+            if plan["dag_hash"] is None or revision is None or revision["dag_hash"] != dag_hash:
+                raise RuntimeError(f"DAG hash mismatch for task {task_id}")
+            violations: list[str] = []
+            self._scan_plan_revision_invariants(conn, task_id, violations)
+            if violations:
+                raise InvariantViolation("; ".join(violations))
+            task = conn.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+            previous = task["execution_plan_revision_id"]
+            if previous == expected_revision_id:
+                return False
+            if task["status"] in {"completed", "aborted"} or plan["status"] not in {"active", "failed"}:
+                raise RuntimeError(f"Task {task_id} cannot activate a revision from {task['status']}")
+            checkpoint_id = task["checkpoint_id"]
+            reopened = task["status"] == "failed"
+            if reopened or plan["status"] == "failed":
+                items = conn.execute(
+                    "SELECT * FROM plan_items WHERE plan_id = ? AND tombstoned = 0 ORDER BY plan_item_id",
+                    (plan["plan_id"],),
+                ).fetchall()
+                completed = {row["subtask_id"] for row in items if row["status"] == "completed"}
+                runnable = any(
+                    row["status"] in {"pending", "retryable", "in_progress", "verifying"}
+                    and int(row["consumed_turns"]) < int(row["max_turns"])
+                    and set(_loads(row["blocked_by_json"], [])) <= completed
+                    for row in items
+                )
+                checkpoint = conn.execute(
+                    "SELECT * FROM checkpoints WHERE checkpoint_id = ? AND task_id = ?",
+                    (checkpoint_id, task_id),
+                ).fetchone()
+                if (not reopened or plan["status"] != "failed" or not runnable
+                        or any(row["status"] == "failed" for row in items)
+                        or checkpoint is None or checkpoint["phase"] != "failed"):
+                    raise RuntimeError(f"Task {task_id} is not eligible for failed plan revision resume")
+                # Preserve the failed checkpoint and messages. Only the new
+                # continuation boundary drops the obsolete active-item cursor.
+                cursor = _loads(checkpoint["cursor_json"], {})
+                cursor.pop("active_subtask_id", None)
+                saved = conn.execute(
+                    "INSERT INTO checkpoints(task_id, phase, messages_json, cursor_json, created_at) "
+                    "VALUES (?, 'input_ready', ?, ?, ?)",
+                    (task_id, checkpoint["messages_json"], _json(cursor), now),
+                )
+                checkpoint_id = int(saved.lastrowid)
+                self._emit_conn(conn, task_id, "checkpoint_saved",
+                                {"checkpoint_id": checkpoint_id, "phase": "input_ready"})
+                conn.execute("UPDATE plans SET status = 'active', updated_at = ? WHERE plan_id = ?",
+                             (now, plan["plan_id"]))
+            updated = conn.execute(
+                "UPDATE tasks SET execution_plan_revision_id = ?, checkpoint_id = ?, "
+                "status = ?, last_error = ?, updated_at = ?, version = version + 1 "
+                "WHERE task_id = ? AND version = ? AND execution_plan_revision_id = ?",
+                (expected_revision_id, checkpoint_id, "running" if reopened else task["status"],
+                 None if reopened else task["last_error"], now, task_id, task["version"], previous),
+            )
+            if updated.rowcount != 1:
+                raise StaleState(f"Execution revision changed before activation: {task_id}")
+            self._emit_conn(conn, task_id, "plan_revision_activated", {
+                "plan_id": int(plan["plan_id"]), "revision_id": expected_revision_id,
+                "previous_execution_revision_id": previous, "dag_hash": dag_hash,
+                "checkpoint_id": checkpoint_id, "reopened": reopened,
+            })
+            if fault_injector:
+                fault_injector("plan_revision_activation_before_commit", task_id=task_id,
+                               revision_id=expected_revision_id)
+        if fault_injector:
+            fault_injector("plan_revision_activation_after_commit", task_id=task_id,
+                           revision_id=expected_revision_id)
+        return True
 
     def get_active_plan(self, task_id: str) -> dict[str, Any] | None:
         row = self._fetchone(
@@ -5243,6 +5339,33 @@ class EventStore:
         task_id: str | None,
         violations: list[str],
     ) -> None:
+        tasks = conn.execute(
+            "SELECT * FROM tasks" + (" WHERE task_id = ?" if task_id is not None else ""),
+            (task_id,) if task_id is not None else (),
+        ).fetchall()
+        for task in tasks:
+            latest = conn.execute(
+                "SELECT * FROM plans WHERE task_id = ? ORDER BY plan_id DESC LIMIT 1",
+                (task["task_id"],),
+            ).fetchone()
+            binding = task["execution_plan_revision_id"]
+            if latest is None:
+                if binding is not None:
+                    violations.append(f"task {task['task_id']}: execution revision without Plan")
+                continue
+            execution = conn.execute(
+                "SELECT * FROM plan_revisions WHERE revision_id = ?", (binding,),
+            ).fetchone()
+            if (execution is None or execution["plan_id"] != latest["plan_id"]
+                    or execution["task_id"] != task["task_id"]):
+                violations.append(f"task {task['task_id']}: missing or foreign execution revision binding")
+            elif int(execution["revision_number"]) > 0:
+                events = conn.execute(
+                    "SELECT payload_json FROM events WHERE task_id = ? AND type = 'plan_revision_activated'",
+                    (task["task_id"],),
+                ).fetchall()
+                if not any(_loads(event["payload_json"], {}).get("revision_id") == binding for event in events):
+                    violations.append(f"task {task['task_id']}: execution revision missing activation audit")
         if task_id is None:
             plans = conn.execute("SELECT * FROM plans ORDER BY plan_id").fetchall()
         else:

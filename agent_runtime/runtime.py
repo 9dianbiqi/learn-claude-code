@@ -237,7 +237,8 @@ class Runtime:
         plan = self.store.get_latest_plan(task_id)
         if plan is None or plan.get("dag_hash") is None:
             raise RuntimeError(f"Task {task_id} does not use a frozen verified-subtask DAG")
-        if plan["dag_hash"] != self.verified_subtask_dag.dag_hash:
+        revision = self.store.get_current_plan_revision(task_id)
+        if revision.dag_hash != self.verified_subtask_dag.dag_hash:
             raise RuntimeError(f"DAG hash mismatch for task {task_id}")
         items = plan.get("items", [])
         nodes = self.verified_subtask_dag.nodes
@@ -614,7 +615,6 @@ class Runtime:
         if self.verified_subtask_dag is not None or (
             latest_plan is not None and latest_plan.get("dag_hash") is not None
         ):
-            self._assert_dag_config(task_id)
             return self._resume_verified_task(task_id)
         elif self.verified_subtask is not None or self.store.has_verified_subtask(task_id):
             self._assert_verified_subtask_config(task_id)
@@ -650,11 +650,20 @@ class Runtime:
         """Run evidence recovery before terminal fast paths or DAG selection."""
         self.store.assert_invariants(task_id)
         task = self.store.get_task(task_id)
-        if task["status"] in {"failed", "aborted"}:
+        if task["status"] == "aborted":
             raise RuntimeError(f"Task {task_id} is terminal: {task['status']}")
         self._acquire(task_id)
         try:
             self.store.assert_invariants(task_id)
+            if self.verified_subtask_dag is not None or self.store.has_frozen_dag(task_id):
+                plan = self._assert_dag_config(task_id)
+                self.store.activate_plan_revision(
+                    task_id, plan["current_revision_id"], self.verified_subtask_dag.dag_hash,
+                    fault_injector=self._fault,
+                )
+            task = self.store.get_task(task_id)
+            if task["status"] in {"failed", "aborted"}:
+                raise RuntimeError(f"Task {task_id} is terminal: {task['status']}")
             self._evidence_recovery.recover(task_id)
             task = self.store.get_task(task_id)
             if task["status"] == "completed":

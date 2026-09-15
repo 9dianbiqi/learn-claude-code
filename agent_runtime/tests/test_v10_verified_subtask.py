@@ -23,6 +23,7 @@ from agent_runtime.migrations import (
     V11_CHECKSUM,
     V12_CHECKSUM,
     V13_CHECKSUM,
+    V14_CHECKSUM,
     _BASE_SCHEMA,
     _apply_v6_durable_context,
     _apply_v7_background_jobs,
@@ -177,14 +178,15 @@ def test_v9_migrates_to_latest_with_verified_subtask_schema(tmp_path: Path):
 
     assert report.ok is True
     assert report.from_version == 9
-    assert report.to_version == 13
+    assert report.to_version == 14
     assert report.applied == (
         "v10_verified_subtask",
         "v11_frozen_dag",
         "v12_stale_evidence",
         "v13_plan_revisions",
+        "v14_plan_revision_resume",
     )
-    assert SchemaManager(database).inspect().current_version == 13
+    assert SchemaManager(database).inspect().current_version == 14
     with sqlite3.connect(database) as connection:
         tables = {
             row[0]
@@ -208,8 +210,8 @@ def test_v9_migrates_to_latest_with_verified_subtask_schema(tmp_path: Path):
             "SELECT checksum FROM schema_migrations WHERE version = 12"
         ).fetchone()[0] == V12_CHECKSUM
         assert connection.execute(
-            "SELECT checksum FROM schema_migrations WHERE version = 13"
-        ).fetchone()[0] == V13_CHECKSUM
+            "SELECT checksum FROM schema_migrations WHERE version = 14"
+        ).fetchone()[0] == V14_CHECKSUM
         assert "verifier_bundle_hash" in {
             row[1] for row in connection.execute("PRAGMA table_info(plan_items)")
         }
@@ -250,14 +252,14 @@ def test_fresh_database_is_latest_and_integrity_checked(tmp_path: Path):
     store = EventStore(tmp_path / "runtime.db")
 
     assert store.integrity_check() == []
-    assert SchemaManager(store.path).inspect().current_version == 13
+    assert SchemaManager(store.path).inspect().current_version == 14
     with sqlite3.connect(store.path) as connection:
         assert [row[0] for row in connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
-        )] == [13]
+        )] == [14]
         assert connection.execute(
-            "SELECT checksum FROM schema_migrations WHERE version = 13"
-        ).fetchone()[0] == V13_CHECKSUM
+            "SELECT checksum FROM schema_migrations WHERE version = 14"
+        ).fetchone()[0] == V14_CHECKSUM
 
 
 def test_verified_tables_without_migration_history_fail_closed(tmp_path: Path):

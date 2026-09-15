@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.0.dev10 - Durable Plan Revision Resume
+
+- Added schema v14 task execution-revision binding. Migration binds the latest
+  Plan's revision 0, preserving any newer revision as pending activation.
+- Resume validates the exact current DAG and verifier configuration under the
+  repository lease, then atomically activates the execution revision and audits
+  the switch. Eligible failed plans reopen without resetting old item budgets.
+- Preserved immutable revision/checkpoint history, deterministic selection,
+  completed evidence, and existing tool-effect reconciliation across restarts.
+
 ## v0.3.0.dev9 - Immutable Plan Revisions & CAS Plan Patches
 
 - Added append-only PlanRevision snapshots with stable Plan identity, parent

@@ -20,8 +20,8 @@ from .plan_revisions import (
 )
 
 
-SCHEMA_VERSION = 13
-MIGRATION_NAME = "v13_plan_revisions"
+SCHEMA_VERSION = 14
+MIGRATION_NAME = "v14_plan_revision_resume"
 V5_MIGRATION_NAME = "v5_effect_ledger"
 V6_MIGRATION_NAME = "v6_durable_context"
 V7_MIGRATION_NAME = "v7_background_jobs"
@@ -31,6 +31,7 @@ V10_MIGRATION_NAME = "v10_verified_subtask"
 V11_MIGRATION_NAME = "v11_frozen_dag"
 V12_MIGRATION_NAME = "v12_stale_evidence"
 V13_MIGRATION_NAME = "v13_plan_revisions"
+V14_MIGRATION_NAME = "v14_plan_revision_resume"
 MAX_EVENT_PAYLOAD_BYTES = 1 * 1024 * 1024
 
 _TASK_STATUSES = frozenset({
@@ -881,6 +882,14 @@ _V13_MIGRATION_SOURCE = "\n".join(
 )
 V13_CHECKSUM = _sha256_text(_V13_MIGRATION_SOURCE)
 
+_V14_ADDITIONS = (
+    "ALTER TABLE tasks ADD COLUMN execution_plan_revision_id TEXT REFERENCES plan_revisions(revision_id)",
+)
+V14_CHECKSUM = _sha256_text(
+    _V13_MIGRATION_SOURCE + "\n" + "\n".join(_V14_ADDITIONS)
+    + "\nbackfill latest plan revision 0; preserve unacknowledged patches"
+)
+
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -1595,6 +1604,19 @@ def _apply_v13_plan_revisions(conn: sqlite3.Connection) -> None:
         )
 
 
+def _apply_v14_plan_revision_resume(conn: sqlite3.Connection) -> None:
+    _ensure_column(conn, "tasks", "execution_plan_revision_id",
+                   "TEXT REFERENCES plan_revisions(revision_id)")
+    # v13 never acknowledged revised execution. Binding to current would skip
+    # the caller's configuration validation on the first v14 resume.
+    conn.execute(
+        "UPDATE tasks SET execution_plan_revision_id = ("
+        "SELECT r.revision_id FROM plan_revisions r "
+        "WHERE r.plan_id = (SELECT MAX(p.plan_id) FROM plans p WHERE p.task_id = tasks.task_id) "
+        "AND r.revision_number = 0) WHERE execution_plan_revision_id IS NULL"
+    )
+
+
 def _create_latest_schema(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys=ON")
     _execute_all(conn, _BASE_SCHEMA)
@@ -1606,6 +1628,7 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
     _apply_v11_frozen_dag(conn)
     _apply_v12_stale_evidence(conn)
     _apply_v13_plan_revisions(conn)
+    _apply_v14_plan_revision_resume(conn)
     row = conn.execute("SELECT 1 FROM schema_migrations WHERE version = ?", (SCHEMA_VERSION,)).fetchone()
     if row is None:
         conn.execute(
@@ -1614,7 +1637,7 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
                 version, name, checksum, applied_at, duration_ms, backup_filename, backup_sha256
             ) VALUES (?, ?, ?, ?, ?, NULL, NULL)
             """,
-            (SCHEMA_VERSION, MIGRATION_NAME, V13_CHECKSUM, _now(), 0.0),
+            (SCHEMA_VERSION, MIGRATION_NAME, V14_CHECKSUM, _now(), 0.0),
         )
 
 
@@ -1627,6 +1650,7 @@ V10_MIGRATION = Migration(10, V10_MIGRATION_NAME, V10_CHECKSUM, _apply_v10_verif
 V11_MIGRATION = Migration(11, V11_MIGRATION_NAME, V11_CHECKSUM, _apply_v11_frozen_dag)
 V12_MIGRATION = Migration(12, V12_MIGRATION_NAME, V12_CHECKSUM, _apply_v12_stale_evidence)
 V13_MIGRATION = Migration(13, V13_MIGRATION_NAME, V13_CHECKSUM, _apply_v13_plan_revisions)
+V14_MIGRATION = Migration(14, V14_MIGRATION_NAME, V14_CHECKSUM, _apply_v14_plan_revision_resume)
 
 
 class SchemaManager:
@@ -1663,6 +1687,7 @@ class SchemaManager:
             V11_MIGRATION,
             V12_MIGRATION,
             V13_MIGRATION,
+            V14_MIGRATION,
         )
 
     def _connect(self, *, read_only: bool = False) -> sqlite3.Connection:
@@ -1724,7 +1749,7 @@ class SchemaManager:
             if not {"name", "checksum"} <= columns:
                 raise MigrationValidationError("schema_migrations is missing migration audit columns")
             latest = next(row for row in rows if int(row["version"]) == SCHEMA_VERSION)
-            if str(latest["name"]) != MIGRATION_NAME or str(latest["checksum"]) != V13_CHECKSUM:
+            if str(latest["name"]) != MIGRATION_NAME or str(latest["checksum"]) != V14_CHECKSUM:
                 raise MigrationChecksumMismatch(
                     f"migration checksum mismatch for v{SCHEMA_VERSION}: "
                     f"{latest['name']!r}/{latest['checksum']!r}"
@@ -1746,6 +1771,7 @@ class SchemaManager:
                     f"v{SCHEMA_VERSION} database is missing required tables: {', '.join(missing)}"
                 )
             required_columns = {
+                "tasks": {"execution_plan_revision_id"},
                 "schema_migrations": {"version", "name", "checksum", "applied_at", "duration_ms", "backup_filename", "backup_sha256"},
                 "tool_calls": {"operation_id"},
                 "effect_reservations": {"operation_id"},
@@ -2154,6 +2180,8 @@ class SchemaManager:
                 _apply_v12_stale_evidence(conn)
             if 13 in expected_versions:
                 _apply_v13_plan_revisions(conn)
+            if 14 in expected_versions:
+                _apply_v14_plan_revision_resume(conn)
 
             duration_ms = (time.perf_counter() - started) * 1000.0
             for migration in pending:
@@ -2238,4 +2266,5 @@ __all__ = [
     "V11_CHECKSUM",
     "V12_CHECKSUM",
     "V13_CHECKSUM",
+    "V14_CHECKSUM",
 ]

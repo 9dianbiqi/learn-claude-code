@@ -21,7 +21,7 @@ from .effects import EffectSemantics, OperationSpec, ReconcileEvidence
 from .runtime import Runtime
 from .plan_revisions import PlanPatchError
 
-__version__ = "0.3.0.dev9"
+__version__ = "0.3.0.dev10"
 
 __all__ = [
     "AddPlanItem",
