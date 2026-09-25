@@ -32,8 +32,11 @@ PlanItem state and verifier capabilities before any mutation.
 
 The controller does not execute tools, create verifier implementations,
 rewrite checkpoints, select the next item, or create its own revision store.
-Only `Runtime.apply_plan_patch(task_id, expected_revision_id, patch)` may accept
-a structural patch. `Runtime.resume(task_id)` retains responsibility for exact
+It reuses the validation and persistence behind the public
+`Runtime.apply_plan_patch(task_id, expected_revision_id, patch)` seam. A small
+internal store helper may let the controller pair that existing patch operation
+with its decision record in one transaction; the public seam and its C1a
+semantics stay intact. `Runtime.resume(task_id)` retains responsibility for exact
 current DAG/verifier configuration, atomic execution activation, evidence
 recovery and frontier selection.
 
