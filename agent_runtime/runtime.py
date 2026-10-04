@@ -399,6 +399,24 @@ class Runtime:
             cursor,
         )
 
+    def _append_verified_continuation(self, task_id: str, messages: list[dict], turn: int) -> None:
+        # A successful non-final marker (including an already committed F3
+        # marker) has no tool results. Start the next exchange with actual
+        # instructions, never an empty tool-result batch or assistant prefill.
+        if self.verified_subtask_dag is None or not messages or messages[-1].get("role") != "assistant":
+            return
+        item = self._select_dag_item(task_id, start_selected_item=False)
+        if item is None:
+            return
+        config = self._dag_config_for_item(item)
+        messages.append({"role": "user", "content": (
+            f"Continue subtask {config.subtask_id}: {config.description}\n"
+            f"Completion criteria: {config.completion_criteria}\n"
+            "After the tools finish, report SUBTASK_COMPLETE in a text-only response."
+        )})
+        self.store.save_checkpoint(task_id, "input_ready", messages,
+                                   {"turn": turn + 1, "active_subtask_id": config.subtask_id})
+
     def _handle_verified_marker(
         self,
         task_id: str,
@@ -978,7 +996,7 @@ class Runtime:
             messages = current_checkpoint["messages"]
             turn = int(current_checkpoint["cursor"].get("turn", 0))
             phase = current_checkpoint["phase"]
-            pending_calls = self._pending_calls(messages) if phase in {
+            pending_calls = (self._pending_calls(messages) or None) if phase in {
                 "model_responded", "waiting_approval", "needs_review"
             } else None
             if scoped_resume and self.verified_subtask_dag is not None:
@@ -1062,6 +1080,7 @@ class Runtime:
                     verified_marker_subtask_id = None
                     if marker_result is not None:
                         return marker_result
+                    self._append_verified_continuation(task_id, messages, turn)
                     turn += 1
                     continue
 
@@ -1310,6 +1329,7 @@ class Runtime:
                             )
                             if marker_result is not None:
                                 return marker_result
+                            self._append_verified_continuation(task_id, messages, turn)
                             turn += 1
                             continue
                         if self.verified_subtask_dag is not None and current_item is not None and int(
