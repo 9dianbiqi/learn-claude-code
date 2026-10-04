@@ -1,0 +1,21 @@
+name: c1c-replanning-fixed-v1
+kind: c1c_replanning
+tasks:
+  - {id: keep, decision: KEEP}
+  - {id: retry, decision: RETRY}
+  - {id: split, decision: SPLIT}
+  - {id: add-item, decision: ADD_ITEM}
+  - {id: change-dependency, decision: CHANGE_DEPENDENCY}
+  - {id: tombstone-pending, decision: TOMBSTONE_PENDING}
+  - {id: fail, decision: FAIL}
+  - {id: invalid-patch, decision: TOMBSTONE_PENDING, scenario: invalid_patch}
+  - {id: missing-verifier, decision: ADD_ITEM, scenario: missing_verifier}
+  - {id: duplicate-signal, decision: ADD_ITEM, scenario: duplicate}
+  - {id: crash-before-decision, decision: ADD_ITEM, scenario: crash_before_decision}
+  - {id: crash-after-decision, decision: ADD_ITEM, scenario: crash_after_decision}
+  - {id: crash-before-activation, decision: ADD_ITEM, scenario: crash_before_activation}
+  - {id: crash-after-activation, decision: ADD_ITEM, scenario: crash_after_activation}
+  - {id: completed-preservation, decision: ADD_ITEM, scenario: completed_preservation}
+  - {id: verifier-failure-signal, decision: ADD_ITEM, scenario: verifier_failure}
+  - {id: execution-failure-signal, decision: SPLIT, scenario: execution_failure}
+  - {id: committed-effect-recovery, decision: ADD_ITEM, scenario: committed_effect_recovery}

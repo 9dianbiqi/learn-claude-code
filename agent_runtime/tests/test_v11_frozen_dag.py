@@ -28,6 +28,7 @@ from agent_runtime.migrations import (
     V12_CHECKSUM,
     V13_CHECKSUM,
     V14_CHECKSUM,
+    V15_CHECKSUM,
 )
 from agent_runtime.models import (
     ModelResponse,
@@ -179,14 +180,15 @@ def test_v10_to_latest_migration_is_audited_and_idempotent(tmp_path: Path) -> No
 
     assert report.ok is True
     assert report.from_version == 10
-    assert report.to_version == 14
+    assert report.to_version == 15
     assert report.applied == (
         "v11_frozen_dag",
         "v12_stale_evidence",
         "v13_plan_revisions",
         "v14_plan_revision_resume",
+        "v15_replan_decisions",
     )
-    assert SchemaManager(database).inspect().current_version == 14
+    assert SchemaManager(database).inspect().current_version == 15
     with sqlite3.connect(database) as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(plan_items)")}
         assert {"max_turns", "consumed_turns"} <= columns
@@ -197,8 +199,8 @@ def test_v10_to_latest_migration_is_audited_and_idempotent(tmp_path: Path) -> No
             "SELECT checksum FROM schema_migrations WHERE version = 12"
         ).fetchone()[0] == V12_CHECKSUM
         assert connection.execute(
-            "SELECT checksum FROM schema_migrations WHERE version = 14"
-        ).fetchone()[0] == V14_CHECKSUM
+            "SELECT checksum FROM schema_migrations WHERE version = 15"
+        ).fetchone()[0] == V15_CHECKSUM
 
     repeated = SchemaManager(database).migrate()
     assert repeated.ok is True

@@ -219,6 +219,8 @@ def _downgrade_fixture_to_v13(runtime):
     # The production migration remains forward-only; remove v14 from this
     # isolated test database to exercise a real v13 startup and migration.
     with sqlite3.connect(runtime.store.path) as conn:
+        conn.execute("DROP TABLE replan_decisions")
+        conn.execute("ALTER TABLE verifier_runs DROP COLUMN observed_plan_item_version")
         conn.execute("ALTER TABLE tasks DROP COLUMN execution_plan_revision_id")
         conn.execute("UPDATE schema_migrations SET version = 13, name = 'v13_plan_revisions', checksum = ?",
                      (V13_CHECKSUM,))
@@ -242,7 +244,7 @@ def test_v13_migration_backfills_revision_zero_and_preserves_pending_activation(
         with sqlite3.connect(runtime.store.path) as conn:
             assert "execution_plan_revision_id" not in {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
     report = SchemaManager(runtime.store.path).migrate()
-    assert report.applied == ("v14_plan_revision_resume",)
+    assert report.applied == ("v14_plan_revision_resume", "v15_replan_decisions")
     assert report.backup is not None
     fresh = Runtime(tmp_path, ScriptedModel([]), verified_subtask_dag=current)
     assert fresh.store.get_task(task_id)["execution_plan_revision_id"] == initial.revision_id

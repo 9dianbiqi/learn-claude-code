@@ -237,6 +237,26 @@ DAG recovery and existing stale-evidence/effect-ledger rules still apply.
 
 See [C1b contract and validation](docs/c1b-durable-plan-revision-resume.md).
 
+## Long-Horizon Agent C1c: Recovery / Plan Revision Controller
+
+C1c uses package version `0.3.0.dev11` and schema v15. Independent Standards/Spec
+review passed; product integration and acceptance tagging remain pending.
+A deterministic controller consumes a task-owned durable
+failure signal and records exactly one decision. KEEP, RETRY and FAIL preserve
+the PlanRevision; SPLIT, ADD_ITEM, CHANGE_DEPENDENCY and TOMBSTONE_PENDING use
+the existing typed PlanPatch operations. A structural decision and its revision
+commit in one transaction. Exact verifier capabilities are required for the
+proposed active DAG; C1b remains responsible for activation, recovery and
+execution selection.
+
+The fixed C1c evaluation suite is `evals/c1c-replanning.yaml`:
+
+```powershell
+python -m agent_runtime eval --suite evals/c1c-replanning.yaml --runs $env:TEMP\c1c-eval
+```
+
+See [C1c scope and acceptance contract](docs/c1c-adaptive-replanning-controller.md).
+
 ## Requirements
 
 - Python 3.11+
@@ -436,7 +456,7 @@ system sandbox.
 agent_runtime/
   runtime.py       durable loop and recovery
   store.py         SQLite projections, transactions, leases, and ledger API
-  migrations.py    explicit v4-to-v14 schema migrations and backup framework
+  migrations.py    explicit v4-to-v15 schema migrations and backup framework
   projector.py     read-only context projector (memories, summaries, plans)
   mcp_client.py    stdio MCP discovery, invocation, timeout, and auth reference
   tool_registry.py durable built-in + MCP tool registry

@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.3.0.dev11 - C1c Recovery / Plan Revision Controller
+
+- Added a durable, signal-keyed recovery decision ledger and deterministic
+  controller for KEEP, RETRY, SPLIT, ADD_ITEM, CHANGE_DEPENDENCY,
+  TOMBSTONE_PENDING and FAIL. Structural decisions reuse C1a typed PlanPatches.
+- Added schema v15 migration and a transaction seam that commits a structural
+  decision with its PlanRevision, while C1b still owns activation and resume.
+- Pinned migration preflight inventory and version reads to one SQLite snapshot
+  so concurrent migration readers do not combine old tables with new metadata.
+- Added verifier/failure-signal integration, decision trace, fixed evaluation
+  scenarios and crash/restart tests without model-generated replanning.
+
 ## v0.3.0.dev10 - Durable Plan Revision Resume
 
 - Added schema v14 task execution-revision binding. Migration binds the latest

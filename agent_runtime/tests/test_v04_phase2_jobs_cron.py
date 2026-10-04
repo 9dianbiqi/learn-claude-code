@@ -144,7 +144,7 @@ def test_v6_database_migrates_through_v7_to_latest(tmp_path: Path):
     assert SchemaManager(db).inspect().current_version == 6
     report = SchemaManager(db).migrate()
     assert report.from_version == 6
-    assert report.to_version == 14
+    assert report.to_version == 15
     assert report.applied == (
         "v7_background_jobs",
         "v8_tool_registry_mcp",
@@ -154,6 +154,7 @@ def test_v6_database_migrates_through_v7_to_latest(tmp_path: Path):
         "v12_stale_evidence",
         "v13_plan_revisions",
         "v14_plan_revision_resume",
+        "v15_replan_decisions",
     )
 
     store = EventStore(db)

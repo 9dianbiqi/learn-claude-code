@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import agent_runtime.migrations as migrations_module
 from agent_runtime.migrations import (
     MigrationBlocked,
     MigrationChecksumMismatch,
@@ -29,6 +30,7 @@ from agent_runtime.migrations import (
     V12_CHECKSUM,
     V13_CHECKSUM,
     V14_CHECKSUM,
+    V15_CHECKSUM,
     _BASE_SCHEMA,
     _apply_v5_effect_ledger,
     _apply_v6_durable_context,
@@ -245,10 +247,10 @@ def _v7_database(tmp_path: Path) -> Path:
 def test_fresh_store_creates_latest_schema_directly(tmp_path: Path):
     store = EventStore(tmp_path / "runtime.db")
     versions = store._fetchall("SELECT version FROM schema_migrations ORDER BY version")
-    assert [int(row["version"]) for row in versions] == [14]
+    assert [int(row["version"]) for row in versions] == [15]
     assert store._fetchone(
-        "SELECT name, checksum FROM schema_migrations WHERE version = 14"
-    )["checksum"] == V14_CHECKSUM
+        "SELECT name, checksum FROM schema_migrations WHERE version = 15"
+    )["checksum"] == V15_CHECKSUM
     tables = {
         str(row[0])
         for row in store._fetchall(
@@ -286,7 +288,7 @@ def test_v7_database_migrates_to_latest(tmp_path: Path):
     report = SchemaManager(database).migrate()
     assert report.ok is True
     assert report.from_version == 7
-    assert report.to_version == 14
+    assert report.to_version == 15
     assert report.applied == (
         "v8_tool_registry_mcp",
         "v9_subagents_mailbox",
@@ -295,14 +297,15 @@ def test_v7_database_migrates_to_latest(tmp_path: Path):
         "v12_stale_evidence",
         "v13_plan_revisions",
         "v14_plan_revision_resume",
+        "v15_replan_decisions",
     )
     assert report.backup is not None
 
     store = EventStore(database)
     assert store.integrity_check() == []
     assert store._fetchone(
-        "SELECT name, checksum FROM schema_migrations WHERE version = 14"
-    )["checksum"] == V14_CHECKSUM
+        "SELECT name, checksum FROM schema_migrations WHERE version = 15"
+    )["checksum"] == V15_CHECKSUM
     tables = {
         str(row[0])
         for row in store._fetchall(
@@ -335,7 +338,7 @@ def test_v4_fixture_migrates_without_losing_rows_or_reservations(tmp_path: Path)
     report = SchemaManager(database).migrate()
     assert report.ok is True
     assert report.from_version == 4
-    assert report.to_version == 14
+    assert report.to_version == 15
     assert report.applied == (
         "v5_effect_ledger",
         "v6_durable_context",
@@ -347,6 +350,7 @@ def test_v4_fixture_migrates_without_losing_rows_or_reservations(tmp_path: Path)
         "v12_stale_evidence",
         "v13_plan_revisions",
         "v14_plan_revision_resume",
+        "v15_replan_decisions",
     )
     assert report.backup is not None
     assert Path(report.backup.path).exists()
@@ -379,6 +383,7 @@ def test_v4_fixture_migrates_without_losing_rows_or_reservations(tmp_path: Path)
         (12, "v12_stale_evidence", V12_CHECKSUM),
         (13, "v13_plan_revisions", V13_CHECKSUM),
         (14, "v14_plan_revision_resume", V14_CHECKSUM),
+        (15, "v15_replan_decisions", V15_CHECKSUM),
     ]
     assert metadata[-1]["backup_filename"] == report.backup.filename
     assert metadata[-1]["backup_sha256"] == report.backup.sha256
@@ -447,7 +452,7 @@ def test_completed_reservation_with_succeeded_tool_migrates(tmp_path: Path):
     report = SchemaManager(database).migrate()
 
     assert report.ok
-    assert SchemaManager(database).inspect().current_version == 14
+    assert SchemaManager(database).inspect().current_version == 15
     store = EventStore(database)
     assert store.get_tool_call("task-0", "tool-0")["status"] == "succeeded"
     assert store.get_effect_reservation("task-0", "tool-0")["state"] == "completed"
@@ -549,7 +554,7 @@ def test_dry_run_has_zero_writes_and_no_backup(tmp_path: Path):
     report = SchemaManager(database).migrate(dry_run=True)
     assert report.dry_run is True
     assert report.from_version == 4
-    assert report.to_version == 14
+    assert report.to_version == 15
     assert report.backup is None
     assert database.stat().st_mtime_ns == before_mtime
     assert not list(tmp_path.glob("*.backup.*.db"))
@@ -581,7 +586,7 @@ def test_checksum_mismatch_fails_closed(tmp_path: Path):
     store = EventStore(tmp_path / "runtime.db")
     with sqlite3.connect(store.path) as connection:
         connection.execute(
-            "UPDATE schema_migrations SET checksum = 'tampered' WHERE version = 14"
+            "UPDATE schema_migrations SET checksum = 'tampered' WHERE version = 15"
         )
         connection.commit()
     with pytest.raises(MigrationChecksumMismatch):
@@ -613,12 +618,13 @@ def test_repeated_migrate_is_idempotent_and_does_not_add_a_second_audit_row(tmp_
         "v12_stale_evidence",
         "v13_plan_revisions",
         "v14_plan_revision_resume",
+        "v15_replan_decisions",
     )
-    assert second.from_version == 14
-    assert second.to_version == 14
+    assert second.from_version == 15
+    assert second.to_version == 15
     assert second.applied == ()
     with sqlite3.connect(database) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 11
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 12
 
 
 def test_v5_database_migrates_to_latest(tmp_path: Path):
@@ -628,7 +634,7 @@ def test_v5_database_migrates_to_latest(tmp_path: Path):
     report = SchemaManager(database).migrate()
     assert report.ok is True
     assert report.from_version == 5
-    assert report.to_version == 14
+    assert report.to_version == 15
     assert report.applied == (
         "v6_durable_context",
         "v7_background_jobs",
@@ -639,6 +645,7 @@ def test_v5_database_migrates_to_latest(tmp_path: Path):
         "v12_stale_evidence",
         "v13_plan_revisions",
         "v14_plan_revision_resume",
+        "v15_replan_decisions",
     )
 
     store = EventStore(database)
@@ -647,8 +654,8 @@ def test_v5_database_migrates_to_latest(tmp_path: Path):
         "SELECT name, checksum FROM schema_migrations WHERE version = 10"
     )["checksum"] == V10_CHECKSUM
     assert store._fetchone(
-        "SELECT name, checksum FROM schema_migrations WHERE version = 14"
-    )["checksum"] == V14_CHECKSUM
+        "SELECT name, checksum FROM schema_migrations WHERE version = 15"
+    )["checksum"] == V15_CHECKSUM
 
 
 def test_future_schema_version_fails_closed(tmp_path: Path):
@@ -659,7 +666,7 @@ def test_future_schema_version_fails_closed(tmp_path: Path):
             "checksum TEXT NOT NULL, applied_at REAL NOT NULL)"
         )
         connection.execute(
-            "INSERT INTO schema_migrations(version, name, checksum, applied_at) VALUES (15, 'future', 'future', 0)"
+            "INSERT INTO schema_migrations(version, name, checksum, applied_at) VALUES (16, 'future', 'future', 0)"
         )
     with pytest.raises(UnsupportedSchemaVersion):
         SchemaManager(database).inspect()
@@ -688,7 +695,7 @@ def test_concurrent_migrate_has_one_writer_and_one_final_latest_reader(tmp_path:
     assert sorted(reports) == [
         (
             4,
-            14,
+            15,
             (
                 "v5_effect_ledger",
                 "v6_durable_context",
@@ -700,11 +707,53 @@ def test_concurrent_migrate_has_one_writer_and_one_final_latest_reader(tmp_path:
                 "v12_stale_evidence",
                 "v13_plan_revisions",
                 "v14_plan_revision_resume",
+                "v15_replan_decisions",
             ),
         ),
-        (14, 14, ()),
+        (15, 15, ()),
     ]
-    assert SchemaManager(database).inspect().current_version == 14
+    assert SchemaManager(database).inspect().current_version == 15
+
+
+def test_inspect_reads_one_schema_snapshot_across_concurrent_migration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _v4_database(tmp_path, ("completed",))
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA journal_mode=WAL")
+    inventory_read = threading.Event()
+    writer_committed = threading.Event()
+    original_table_names = migrations_module._table_names
+    result: dict[str, object] = {}
+
+    def pause_after_inventory(conn: sqlite3.Connection) -> set[str]:
+        tables = original_table_names(conn)
+        if threading.current_thread().name == "snapshot-reader":
+            inventory_read.set()
+            assert writer_committed.wait(20), "writer did not commit while reader held its snapshot"
+        return tables
+
+    monkeypatch.setattr(migrations_module, "_table_names", pause_after_inventory)
+
+    def read_during_migration() -> None:
+        try:
+            result["status"] = SchemaManager(database).inspect()
+        except Exception as exc:  # assertion below reports the actual failure
+            result["error"] = exc
+
+    reader = threading.Thread(target=read_during_migration, name="snapshot-reader")
+    reader.start()
+    try:
+        assert inventory_read.wait(20), "reader did not reach the inventory query"
+        report = SchemaManager(database).migrate()
+        assert report.to_version == 15
+    finally:
+        writer_committed.set()
+        reader.join(20)
+    assert not reader.is_alive()
+    assert "error" not in result, result.get("error")
+    assert result["status"].current_version == 4
+    assert SchemaManager(database).inspect().current_version == 15
 
 
 @pytest.mark.parametrize("point", ["after_migration_backup", "after_migration_commit"])
@@ -718,7 +767,7 @@ def test_migration_boundary_faults_leave_a_valid_pre_or_post_state(tmp_path: Pat
     with pytest.raises(RuntimeError, match=point):
         SchemaManager(database, fault_injector=inject).migrate()
     version = SchemaManager(database).inspect().current_version
-    assert version == (4 if point == "after_migration_backup" else 14)
+    assert version == (4 if point == "after_migration_backup" else 15)
 
 
 def test_migration_subprocess_exit_after_ddl_reopens_as_complete_v4(tmp_path: Path):

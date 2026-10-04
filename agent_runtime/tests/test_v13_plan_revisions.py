@@ -28,6 +28,7 @@ from agent_runtime.migrations import (
     V12_CHECKSUM,
     V13_CHECKSUM,
     V14_CHECKSUM,
+    V15_CHECKSUM,
     _BASE_SCHEMA,
     _apply_v6_durable_context,
     _apply_v7_background_jobs,
@@ -338,9 +339,9 @@ def test_v12_to_v13_migration_backfills_initial_revision_without_mutating_plan_i
 
     assert report.ok is True
     assert report.from_version == 12
-    assert report.to_version == 14
-    assert report.applied == ("v13_plan_revisions", "v14_plan_revision_resume")
-    assert SchemaManager(database).inspect().current_version == 14
+    assert report.to_version == 15
+    assert report.applied == ("v13_plan_revisions", "v14_plan_revision_resume", "v15_replan_decisions")
+    assert SchemaManager(database).inspect().current_version == 15
     with sqlite3.connect(database) as connection:
         connection.row_factory = sqlite3.Row
         plan = connection.execute("SELECT * FROM plans").fetchone()
@@ -351,8 +352,8 @@ def test_v12_to_v13_migration_backfills_initial_revision_without_mutating_plan_i
         assert revision["revision_number"] == 0
         assert revision["reason"] == "migration_backfill"
         assert connection.execute(
-            "SELECT checksum FROM schema_migrations WHERE version = 14"
-        ).fetchone()[0] == V14_CHECKSUM
+            "SELECT checksum FROM schema_migrations WHERE version = 15"
+        ).fetchone()[0] == V15_CHECKSUM
         items = connection.execute(
             "SELECT subtask_id, status, blocked_by_json, tombstoned "
             "FROM plan_items ORDER BY plan_item_id"

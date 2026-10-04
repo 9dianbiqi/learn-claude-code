@@ -118,7 +118,8 @@ class Runtime:
                  tool_scope: set[str] | None = None,
                  verified_subtask: VerifiedSubtaskConfig | None = None,
                  verified_subtask_dag: VerifiedSubtaskDAGConfig | None = None,
-                 scoped_context_budget: int | None = None):
+                 scoped_context_budget: int | None = None,
+                 replan_policy: Callable[..., Any] | None = None):
         if verified_subtask is not None and verified_subtask_dag is not None:
             raise ValueError("verified_subtask and verified_subtask_dag are mutually exclusive")
         self.repo_root = Path(repo_root).resolve()
@@ -142,6 +143,9 @@ class Runtime:
         self._subagent_fencing: dict[str, str] = {}
         self._subagent_tool_scopes: dict[str, set[str] | None] = {}
         self.verified_subtask_dag = verified_subtask_dag
+        if replan_policy is not None and verified_subtask_dag is None:
+            raise ValueError("adaptive replanning requires a verified-subtask DAG")
+        self.replan_policy = replan_policy
         if scoped_context_budget is not None:
             if (
                 isinstance(scoped_context_budget, bool)
@@ -327,6 +331,30 @@ class Runtime:
             {"turn": turn, "active_subtask_id": item["subtask_id"]},
             error,
         )
+        if self.replan_policy is not None and self.verified_subtask_dag is not None:
+            from .replanning import RecoveryPlanRevisionController
+
+            self._fault("replan_after_failure_signal", task_id=task_id,
+                        plan_item_id=int(item["plan_item_id"]))
+
+            failure = next(
+                (
+                    event for event in reversed(self.store.list_events(task_id))
+                    if event["type"] == "plan_item_failed"
+                    and event["payload"].get("plan_item_id") == int(item["plan_item_id"])
+                    and event["payload"].get("budget_exhausted") is True
+                ),
+                None,
+            )
+            if failure is None:
+                raise InvariantViolation(f"Budget failure has no durable PlanItem signal: {task_id}")
+            outcome = RecoveryPlanRevisionController(self, self.replan_policy).process(
+                task_id, f"event:{failure['event_id']}", lease_acquired=True,
+            )
+            if outcome.result_revision_id is not None:
+                return RunResult(task_id, "replan_pending", error=outcome.result_revision_id)
+            if outcome.outcome == "rejected":
+                return RunResult(task_id, "failed", error=f"{error}; replan rejected: {outcome.rejection_reason}")
         return RunResult(task_id, "failed", error=error)
 
     def _handle_blocked_dag_marker(
@@ -540,7 +568,7 @@ class Runtime:
                 return RunResult(task_id, "completed", completion_summary)
             return None
 
-        self.store.record_non_authoritative_verifier_run(
+        verifier_run_id = self.store.record_non_authoritative_verifier_run(
             task_id=task_id,
             plan_item_id=int(item["plan_item_id"]),
             subtask_id=config.subtask_id,
@@ -555,6 +583,21 @@ class Runtime:
             verifier_implementation_hash=config.verifier_implementation_hash,
             execution_checkpoint_id=execution_checkpoint_id,
         )
+        if self.replan_policy is not None and self.verified_subtask_dag is not None:
+            from .replanning import RecoveryPlanRevisionController
+
+            self._fault("replan_after_verifier_signal", task_id=task_id,
+                        signal_id=verifier_run_id)
+
+            outcome = RecoveryPlanRevisionController(self, self.replan_policy).process(
+                task_id, verifier_run_id, lease_acquired=True,
+            )
+            if outcome.outcome == "rejected":
+                return RunResult(task_id, "replan_rejected", error=outcome.rejection_reason)
+            if outcome.result_revision_id is not None:
+                return RunResult(task_id, "replan_pending", error=outcome.result_revision_id)
+            if outcome.decision_type == "FAIL":
+                return RunResult(task_id, "failed", error=outcome.reason)
         self._append_verified_feedback(
             task_id,
             messages,
@@ -624,6 +667,12 @@ class Runtime:
     def get_current_plan_revision(self, task_id: str) -> PlanRevision:
         return self.store.get_current_plan_revision(task_id)
 
+    def handle_recovery_signal(self, task_id: str, signal_id: str, policy: Callable[..., Any]):
+        """Apply one deterministic decision to an existing durable signal."""
+        from .replanning import RecoveryPlanRevisionController
+
+        return RecoveryPlanRevisionController(self, policy).process(task_id, signal_id)
+
     def apply_plan_patch(
         self,
         task_id: str,
@@ -655,6 +704,9 @@ class Runtime:
         self._acquire(task_id)
         try:
             self.store.assert_invariants(task_id)
+            pending_replan = self._resume_pending_replan(task_id)
+            if pending_replan is not None:
+                return pending_replan
             if self.verified_subtask_dag is not None or self.store.has_frozen_dag(task_id):
                 plan = self._assert_dag_config(task_id)
                 self.store.activate_plan_revision(
@@ -665,6 +717,9 @@ class Runtime:
             if task["status"] in {"failed", "aborted"}:
                 raise RuntimeError(f"Task {task_id} is terminal: {task['status']}")
             self._evidence_recovery.recover(task_id)
+            pending_replan = self._resume_pending_replan(task_id)
+            if pending_replan is not None:
+                return pending_replan
             task = self.store.get_task(task_id)
             if task["status"] == "completed":
                 self.store.assert_invariants(task_id)
@@ -678,6 +733,26 @@ class Runtime:
         finally:
             if self._lease_token is not None:
                 self._release()
+
+    def _resume_pending_replan(self, task_id: str) -> RunResult | None:
+        if self.replan_policy is None or self.verified_subtask_dag is None:
+            return None
+        from .replanning import RecoveryPlanRevisionController
+
+        controller = RecoveryPlanRevisionController(self, self.replan_policy)
+        for signal_id in controller.pending_signal_ids(task_id):
+            try:
+                outcome = controller.process(task_id, signal_id, lease_acquired=True)
+            except StaleState:
+                continue
+            if outcome.result_revision_id is not None:
+                return RunResult(task_id, "replan_pending", error=outcome.result_revision_id)
+            if outcome.outcome == "rejected":
+                return RunResult(task_id, "replan_rejected", error=outcome.rejection_reason)
+            if outcome.decision_type == "FAIL":
+                return RunResult(task_id, "failed", error=outcome.reason)
+            break
+        return None
 
     def _assert_verified_subtask_config(self, task_id: str) -> dict[str, Any]:
         latest_plan = self.store.get_latest_plan(task_id)

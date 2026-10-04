@@ -18,6 +18,7 @@ class TraceReporter:
         models = self.store.list_model_calls(task_id)
         tools = self.store.list_tool_calls(task_id)
         operations = self.store.list_operations(task_id)
+        decisions = self.store.list_replan_decisions(task_id)
         permission_counts = {"allow": 0, "ask": 0, "deny": 0}
         for event in events:
             if event["type"] == "permission_decision":
@@ -178,6 +179,19 @@ class TraceReporter:
             "current_plan_revision_id": plan_metrics["current_revision_id"],
             "execution_plan_revision_id": self.store.get_task(task_id)["execution_plan_revision_id"],
             "plan_revision_activation_count": plan_metrics["events"].count("plan_revision_activated"),
+            "replan_decision_count": len(decisions),
+            "replan_decision_types": [item["decision_type"] for item in decisions],
+            "replan_accepted_count": sum(item["outcome"] == "accepted" for item in decisions),
+            "replan_rejected_count": sum(item["outcome"] == "rejected" for item in decisions),
+            "replan_unnecessary_revision_count": sum(
+                item["decision_type"] in {"KEEP", "RETRY", "FAIL"}
+                and item["result_revision_id"] is not None for item in decisions
+            ),
+            "replan_missing_revision_count": sum(
+                item["outcome"] == "accepted" and item["decision_type"] in {
+                    "SPLIT", "ADD_ITEM", "CHANGE_DEPENDENCY", "TOMBSTONE_PENDING"
+                } and item["result_revision_id"] is None for item in decisions
+            ),
             "current_plan_revision_dag_hash": plan_metrics["current_revision_dag_hash"],
             "verifier_run_count": verified_metrics["verifier_run_count"],
             "authoritative_verifier_run_count": verified_metrics["authoritative_verifier_run_count"],
@@ -383,6 +397,11 @@ class TraceReporter:
                     )
                     + "\n"
                 )
+            for decision in self.store.list_replan_decisions(task_id):
+                handle.write(json.dumps(
+                    _redact({"record_type": "replan_decision", **decision}),
+                    ensure_ascii=False, sort_keys=True,
+                ) + "\n")
             for verifier_run in self.store.list_verifier_runs(task_id):
                 handle.write(
                     json.dumps(

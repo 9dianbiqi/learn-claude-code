@@ -20,8 +20,8 @@ from .plan_revisions import (
 )
 
 
-SCHEMA_VERSION = 14
-MIGRATION_NAME = "v14_plan_revision_resume"
+SCHEMA_VERSION = 15
+MIGRATION_NAME = "v15_replan_decisions"
 V5_MIGRATION_NAME = "v5_effect_ledger"
 V6_MIGRATION_NAME = "v6_durable_context"
 V7_MIGRATION_NAME = "v7_background_jobs"
@@ -32,6 +32,7 @@ V11_MIGRATION_NAME = "v11_frozen_dag"
 V12_MIGRATION_NAME = "v12_stale_evidence"
 V13_MIGRATION_NAME = "v13_plan_revisions"
 V14_MIGRATION_NAME = "v14_plan_revision_resume"
+V15_MIGRATION_NAME = "v15_replan_decisions"
 MAX_EVENT_PAYLOAD_BYTES = 1 * 1024 * 1024
 
 _TASK_STATUSES = frozenset({
@@ -890,6 +891,30 @@ V14_CHECKSUM = _sha256_text(
     + "\nbackfill latest plan revision 0; preserve unacknowledged patches"
 )
 
+_V15_ADDITIONS = (
+    "ALTER TABLE verifier_runs ADD COLUMN observed_plan_item_version INTEGER",
+    """CREATE TABLE IF NOT EXISTS replan_decisions (
+        decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        signal_id TEXT NOT NULL,
+        signal_type TEXT NOT NULL,
+        plan_item_id INTEGER REFERENCES plan_items(plan_item_id),
+        base_revision_id TEXT NOT NULL REFERENCES plan_revisions(revision_id),
+        result_revision_id TEXT REFERENCES plan_revisions(revision_id),
+        decision_type TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK(outcome IN ('accepted', 'rejected')),
+        rejection_reason TEXT,
+        created_at REAL NOT NULL,
+        UNIQUE(task_id, signal_id, base_revision_id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_replan_decisions_task ON replan_decisions(task_id, decision_id)",
+)
+V15_CHECKSUM = _sha256_text(
+    _V13_MIGRATION_SOURCE + "\n" + "\n".join(_V14_ADDITIONS)
+    + "\n" + "\n".join(statement.strip() for statement in _V15_ADDITIONS)
+)
+
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -924,6 +949,7 @@ def _business_tables(table_names: set[str]) -> set[str]:
         "plans",
         "plan_items",
         "plan_revisions",
+        "replan_decisions",
         "agent_jobs",
         "job_runs",
         "cron_schedules",
@@ -1617,6 +1643,10 @@ def _apply_v14_plan_revision_resume(conn: sqlite3.Connection) -> None:
     )
 
 
+def _apply_v15_replan_decisions(conn: sqlite3.Connection) -> None:
+    _execute_all(conn, _V15_ADDITIONS)
+
+
 def _create_latest_schema(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys=ON")
     _execute_all(conn, _BASE_SCHEMA)
@@ -1629,6 +1659,7 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
     _apply_v12_stale_evidence(conn)
     _apply_v13_plan_revisions(conn)
     _apply_v14_plan_revision_resume(conn)
+    _apply_v15_replan_decisions(conn)
     row = conn.execute("SELECT 1 FROM schema_migrations WHERE version = ?", (SCHEMA_VERSION,)).fetchone()
     if row is None:
         conn.execute(
@@ -1637,7 +1668,7 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
                 version, name, checksum, applied_at, duration_ms, backup_filename, backup_sha256
             ) VALUES (?, ?, ?, ?, ?, NULL, NULL)
             """,
-            (SCHEMA_VERSION, MIGRATION_NAME, V14_CHECKSUM, _now(), 0.0),
+            (SCHEMA_VERSION, MIGRATION_NAME, V15_CHECKSUM, _now(), 0.0),
         )
 
 
@@ -1651,6 +1682,7 @@ V11_MIGRATION = Migration(11, V11_MIGRATION_NAME, V11_CHECKSUM, _apply_v11_froze
 V12_MIGRATION = Migration(12, V12_MIGRATION_NAME, V12_CHECKSUM, _apply_v12_stale_evidence)
 V13_MIGRATION = Migration(13, V13_MIGRATION_NAME, V13_CHECKSUM, _apply_v13_plan_revisions)
 V14_MIGRATION = Migration(14, V14_MIGRATION_NAME, V14_CHECKSUM, _apply_v14_plan_revision_resume)
+V15_MIGRATION = Migration(15, V15_MIGRATION_NAME, V15_CHECKSUM, _apply_v15_replan_decisions)
 
 
 class SchemaManager:
@@ -1688,6 +1720,7 @@ class SchemaManager:
             V12_MIGRATION,
             V13_MIGRATION,
             V14_MIGRATION,
+            V15_MIGRATION,
         )
 
     def _connect(self, *, read_only: bool = False) -> sqlite3.Connection:
@@ -1749,7 +1782,7 @@ class SchemaManager:
             if not {"name", "checksum"} <= columns:
                 raise MigrationValidationError("schema_migrations is missing migration audit columns")
             latest = next(row for row in rows if int(row["version"]) == SCHEMA_VERSION)
-            if str(latest["name"]) != MIGRATION_NAME or str(latest["checksum"]) != V14_CHECKSUM:
+            if str(latest["name"]) != MIGRATION_NAME or str(latest["checksum"]) != V15_CHECKSUM:
                 raise MigrationChecksumMismatch(
                     f"migration checksum mismatch for v{SCHEMA_VERSION}: "
                     f"{latest['name']!r}/{latest['checksum']!r}"
@@ -1764,6 +1797,7 @@ class SchemaManager:
                 "verifier_runs", "semantic_checkpoints",
                 "semantic_checkpoint_state_events",
                 "plan_revisions",
+                "replan_decisions",
             }
             missing = sorted(required - tables)
             if missing:
@@ -1771,6 +1805,10 @@ class SchemaManager:
                     f"v{SCHEMA_VERSION} database is missing required tables: {', '.join(missing)}"
                 )
             required_columns = {
+                "replan_decisions": {"decision_id", "task_id", "signal_id", "signal_type",
+                                     "plan_item_id", "base_revision_id", "result_revision_id",
+                                     "decision_type", "reason", "outcome", "rejection_reason", "created_at"},
+                "verifier_runs": {"observed_plan_item_version"},
                 "tasks": {"execution_plan_revision_id"},
                 "schema_migrations": {"version", "name", "checksum", "applied_at", "duration_ms", "backup_filename", "backup_sha256"},
                 "tool_calls": {"operation_id"},
@@ -1899,6 +1937,9 @@ class SchemaManager:
         except sqlite3.DatabaseError as exc:
             raise SchemaError(f"cannot open Runtime database: {self.database}") from exc
         try:
+            # Pin table inventory, migration rows and integrity checks to one
+            # SQLite snapshot while another process may commit a migration.
+            conn.execute("BEGIN")
             try:
                 current, tables, has_business = self._read_metadata(conn)
                 integrity = tuple(_integrity(conn))
@@ -1920,6 +1961,7 @@ class SchemaManager:
                 active_leases,
             )
         finally:
+            conn.rollback()
             conn.close()
 
     def plan(self) -> list[Migration]:
@@ -2182,6 +2224,8 @@ class SchemaManager:
                 _apply_v13_plan_revisions(conn)
             if 14 in expected_versions:
                 _apply_v14_plan_revision_resume(conn)
+            if 15 in expected_versions:
+                _apply_v15_replan_decisions(conn)
 
             duration_ms = (time.perf_counter() - started) * 1000.0
             for migration in pending:
@@ -2267,4 +2311,5 @@ __all__ = [
     "V12_CHECKSUM",
     "V13_CHECKSUM",
     "V14_CHECKSUM",
+    "V15_CHECKSUM",
 ]

@@ -573,7 +573,7 @@ class EventStore:
         messages_json = _checked_json(messages, MAX_CHECKPOINT_BYTES, "checkpoint messages")
         cursor_json = _checked_json(cursor, MAX_CHECKPOINT_BYTES, "checkpoint cursor")
         with self.transaction() as conn:
-            task = conn.execute("SELECT status FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+            task = conn.execute("SELECT status, version FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
             if task is None:
                 raise KeyError(f"Task not found: {task_id}")
             if task["status"] in {"completed", "failed", "aborted"}:
@@ -594,13 +594,75 @@ class EventStore:
             )
             conn.execute(
                 "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'task_failed', ?, ?)",
-                (task_id, _checked_json({"error": error}, MAX_EVENT_PAYLOAD_BYTES, "event payload"), now),
+                (task_id, _checked_json(
+                    self._task_failure_payload_conn(conn, task_id, error, int(task["version"]) + 1),
+                    MAX_EVENT_PAYLOAD_BYTES, "event payload",
+                ), now),
             )
             conn.execute(
                 "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'checkpoint_saved', ?, ?)",
                 (task_id, _checked_json({"checkpoint_id": checkpoint_id, "phase": "failed"}, MAX_EVENT_PAYLOAD_BYTES, "event payload"), now),
             )
         return checkpoint_id
+
+    @staticmethod
+    def _task_failure_payload_conn(
+        conn: sqlite3.Connection, task_id: str, error: str, observed_version: int
+    ) -> dict[str, Any]:
+        plan = conn.execute(
+            "SELECT current_revision_id FROM plans WHERE task_id = ? "
+            "ORDER BY plan_id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        return {
+            "error": error,
+            "observed_revision_id": plan["current_revision_id"] if plan else None,
+            "observed_task_version": observed_version,
+        }
+
+    def _fail_task_conn(self, conn: sqlite3.Connection, task_id: str, error: str) -> int:
+        """Use the existing failure shape within a controller-owned transaction."""
+        task = conn.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+        if task is None:
+            raise KeyError(f"Task not found: {task_id}")
+        if task["status"] in {"completed", "aborted"}:
+            raise InvariantViolation(f"Cannot fail terminal task: {task_id}")
+        if task["status"] == "failed":
+            return int(task["checkpoint_id"])
+        previous = conn.execute(
+            "SELECT * FROM checkpoints WHERE checkpoint_id = ? AND task_id = ?",
+            (task["checkpoint_id"], task_id),
+        ).fetchone()
+        if previous is None:
+            raise InvariantViolation(f"Missing task checkpoint: {task_id}")
+        now = _now()
+        conn.execute(
+            "UPDATE tool_calls SET status = 'failed', error = ?, finished_at = ?, version = version + 1 "
+            "WHERE task_id = ? AND status = 'running'", (error, now, task_id),
+        )
+        saved = conn.execute(
+            "INSERT INTO checkpoints(task_id, phase, messages_json, cursor_json, created_at) "
+            "VALUES (?, 'failed', ?, ?, ?)",
+            (task_id, previous["messages_json"], previous["cursor_json"], now),
+        )
+        checkpoint_id = int(saved.lastrowid)
+        updated = conn.execute(
+            "UPDATE tasks SET status = 'failed', checkpoint_id = ?, last_error = ?, "
+            "updated_at = ?, version = version + 1 WHERE task_id = ? AND version = ?",
+            (checkpoint_id, error, now, task_id, task["version"]),
+        )
+        if updated.rowcount != 1:
+            raise StaleState(f"Task changed during failure decision: {task_id}")
+        self._emit_conn(conn, task_id, "task_failed", self._task_failure_payload_conn(
+            conn, task_id, error, int(task["version"]) + 1,
+        ))
+        self._emit_conn(conn, task_id, "checkpoint_saved",
+                        {"checkpoint_id": checkpoint_id, "phase": "failed"})
+        return checkpoint_id
+
+    def list_replan_decisions(self, task_id: str) -> list[dict[str, Any]]:
+        return [dict(row) for row in self._fetchall(
+            "SELECT * FROM replan_decisions WHERE task_id = ? ORDER BY decision_id", (task_id,),
+        )]
 
     def fail_plan_item_and_task(
         self,
@@ -669,6 +731,11 @@ class EventStore:
                             "from": item["status"],
                             "reason": error,
                             "budget_exhausted": True,
+                            "observed_revision_id": conn.execute(
+                                "SELECT current_revision_id FROM plans WHERE plan_id = ?",
+                                (item["plan_id"],),
+                            ).fetchone()[0],
+                            "observed_item_version": int(item["version"]) + 1,
                         },
                         MAX_EVENT_PAYLOAD_BYTES,
                         "event payload",
@@ -678,7 +745,10 @@ class EventStore:
             )
             conn.execute(
                 "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'task_failed', ?, ?)",
-                (task_id, _checked_json({"error": error}, MAX_EVENT_PAYLOAD_BYTES, "event payload"), now),
+                (task_id, _checked_json(
+                    self._task_failure_payload_conn(conn, task_id, error, int(task["version"]) + 1),
+                    MAX_EVENT_PAYLOAD_BYTES, "event payload",
+                ), now),
             )
             conn.execute(
                 "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'checkpoint_saved', ?, ?)",
@@ -1368,135 +1438,157 @@ class EventStore:
     ) -> PlanRevision:
         if not isinstance(patch, PlanPatch):
             raise TypeError("patch must be a PlanPatch")
-        now = _now()
         with self.transaction() as conn:
-            plan = conn.execute(
-                "SELECT * FROM plans WHERE task_id = ? ORDER BY plan_id DESC LIMIT 1",
-                (task_id,),
-            ).fetchone()
-            if plan is None:
-                raise KeyError(f"Task has no Plan: {task_id}")
-            if plan["status"] in {"completed", "superseded"}:
-                raise PlanPatchError(f"Plan cannot be patched from status {plan['status']}")
-            current_revision_id = plan["current_revision_id"]
-            if current_revision_id != expected_revision_id:
-                raise StaleState(
-                    f"Plan revision changed: expected {expected_revision_id}, "
-                    f"current {current_revision_id}"
+            result = self._apply_plan_patch_conn(
+                conn, task_id, expected_revision_id, patch, fault_injector=fault_injector,
+            )
+        if fault_injector:
+            fault_injector(
+                "plan_patch_after_commit", task_id=task_id,
+                revision_id=result.revision_id,
+            )
+        return result
+
+    def _apply_plan_patch_conn(
+        self,
+        conn: sqlite3.Connection,
+        task_id: str,
+        expected_revision_id: str,
+        patch: PlanPatch,
+        *,
+        fault_injector: Callable[..., None] | None = None,
+    ) -> PlanRevision:
+        """Apply the existing C1a PlanPatch inside a caller-owned transaction."""
+        if not isinstance(patch, PlanPatch):
+            raise TypeError("patch must be a PlanPatch")
+        now = _now()
+        plan = conn.execute(
+            "SELECT * FROM plans WHERE task_id = ? ORDER BY plan_id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if plan is None:
+            raise KeyError(f"Task has no Plan: {task_id}")
+        if plan["status"] in {"completed", "superseded"}:
+            raise PlanPatchError(f"Plan cannot be patched from status {plan['status']}")
+        current_revision_id = plan["current_revision_id"]
+        if current_revision_id != expected_revision_id:
+            raise StaleState(
+                f"Plan revision changed: expected {expected_revision_id}, "
+                f"current {current_revision_id}"
+            )
+        current_row = conn.execute(
+            "SELECT * FROM plan_revisions WHERE revision_id = ? AND plan_id = ?",
+            (expected_revision_id, int(plan["plan_id"])),
+        ).fetchone()
+        current_revision = self._decode_plan_revision(current_row)
+        if current_revision is None:
+            raise InvariantViolation(f"Current PlanRevision is missing: {expected_revision_id}")
+        item_rows = conn.execute(
+            "SELECT * FROM plan_items WHERE plan_id = ? ORDER BY plan_item_id",
+            (int(plan["plan_id"]),),
+        ).fetchall()
+        statuses = {str(row["subtask_id"]): str(row["status"]) for row in item_rows}
+        next_items = derive_plan_revision(current_revision.items, statuses, patch)
+        patch_digest = plan_patch_hash(patch)
+        dag_digest = plan_dag_hash(next_items)
+        revision_number = current_revision.revision_number + 1
+        next_revision_id = make_plan_revision_id(
+            task_id=task_id,
+            plan_id=int(plan["plan_id"]),
+            parent_revision_id=current_revision.revision_id,
+            revision_number=revision_number,
+            dag_digest=dag_digest,
+            patch_digest=patch_digest,
+        )
+
+        before = {item.subtask_id: item for item in current_revision.items}
+        for item in next_items:
+            previous = before.get(item.subtask_id)
+            if previous is None:
+                conn.execute(
+                    "INSERT INTO plan_items("
+                    "plan_id, subtask_id, description, status, blocked_by_json, "
+                    "verifier_bundle_hash, max_turns, consumed_turns, tombstoned, "
+                    "version, created_at, updated_at"
+                    ") VALUES (?, ?, ?, 'pending', ?, ?, ?, 0, 0, 0, ?, ?)",
+                    (
+                        int(plan["plan_id"]),
+                        item.subtask_id,
+                        item.description,
+                        _checked_json(list(item.blocked_by), MAX_CHECKPOINT_BYTES, "plan blocked_by"),
+                        item.verifier_bundle_hash,
+                        item.max_turns,
+                        now,
+                        now,
+                    ),
                 )
-            current_row = conn.execute(
-                "SELECT * FROM plan_revisions WHERE revision_id = ? AND plan_id = ?",
-                (expected_revision_id, int(plan["plan_id"])),
-            ).fetchone()
-            current_revision = self._decode_plan_revision(current_row)
-            if current_revision is None:
-                raise InvariantViolation(f"Current PlanRevision is missing: {expected_revision_id}")
-            item_rows = conn.execute(
-                "SELECT * FROM plan_items WHERE plan_id = ? ORDER BY plan_item_id",
-                (int(plan["plan_id"]),),
-            ).fetchall()
-            statuses = {str(row["subtask_id"]): str(row["status"]) for row in item_rows}
-            next_items = derive_plan_revision(current_revision.items, statuses, patch)
-            patch_digest = plan_patch_hash(patch)
-            dag_digest = plan_dag_hash(next_items)
-            revision_number = current_revision.revision_number + 1
-            next_revision_id = make_plan_revision_id(
+                continue
+            if previous.blocked_by != item.blocked_by or previous.tombstoned != item.tombstoned:
+                updated_item = conn.execute(
+                    "UPDATE plan_items SET blocked_by_json = ?, tombstoned = ?, "
+                    "version = version + 1, updated_at = ? "
+                    "WHERE plan_id = ? AND subtask_id = ? AND version = ?",
+                    (
+                        _checked_json(list(item.blocked_by), MAX_CHECKPOINT_BYTES, "plan blocked_by"),
+                        int(item.tombstoned),
+                        now,
+                        int(plan["plan_id"]),
+                        item.subtask_id,
+                        int(next(row["version"] for row in item_rows if row["subtask_id"] == item.subtask_id)),
+                    ),
+                )
+                if updated_item.rowcount != 1:
+                    raise StaleState(f"PlanItem changed during PlanPatch: {item.subtask_id}")
+
+        conn.execute(
+            "INSERT INTO plan_revisions("
+            "revision_id, plan_id, task_id, parent_revision_id, revision_number, "
+            "dag_hash, patch_hash, reason, trigger, evidence_refs_json, snapshot_json, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                next_revision_id,
+                int(plan["plan_id"]),
+                task_id,
+                current_revision.revision_id,
+                revision_number,
+                dag_digest,
+                patch_digest,
+                patch.reason,
+                patch.trigger,
+                _checked_json(list(patch.evidence_refs), MAX_CHECKPOINT_BYTES, "plan evidence refs"),
+                _checked_json(revision_snapshot(next_items), MAX_CHECKPOINT_BYTES, "plan revision snapshot"),
+                now,
+            ),
+        )
+        switched = conn.execute(
+            "UPDATE plans SET current_revision_id = ?, updated_at = ? "
+            "WHERE plan_id = ? AND current_revision_id = ?",
+            (next_revision_id, now, int(plan["plan_id"]), expected_revision_id),
+        )
+        if switched.rowcount != 1:
+            raise StaleState(f"Plan revision changed before CAS switch: {task_id}")
+        payload = {
+            "plan_id": int(plan["plan_id"]),
+            "revision_id": next_revision_id,
+            "parent_revision_id": current_revision.revision_id,
+            "revision_number": revision_number,
+            "dag_hash": dag_digest,
+            "patch_hash": patch_digest,
+            "reason": patch.reason,
+            "trigger": patch.trigger,
+            "evidence_refs": list(patch.evidence_refs),
+            "operations": [type(operation).__name__ for operation in patch.operations],
+        }
+        conn.execute(
+            "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, "plan_revision_created", _checked_json(payload, MAX_EVENT_PAYLOAD_BYTES, "event payload"), now),
+        )
+        if fault_injector:
+            fault_injector(
+                "plan_patch_before_commit",
                 task_id=task_id,
-                plan_id=int(plan["plan_id"]),
-                parent_revision_id=current_revision.revision_id,
-                revision_number=revision_number,
-                dag_digest=dag_digest,
-                patch_digest=patch_digest,
+                revision_id=next_revision_id,
             )
-
-            before = {item.subtask_id: item for item in current_revision.items}
-            for item in next_items:
-                previous = before.get(item.subtask_id)
-                if previous is None:
-                    conn.execute(
-                        "INSERT INTO plan_items("
-                        "plan_id, subtask_id, description, status, blocked_by_json, "
-                        "verifier_bundle_hash, max_turns, consumed_turns, tombstoned, "
-                        "version, created_at, updated_at"
-                        ") VALUES (?, ?, ?, 'pending', ?, ?, ?, 0, 0, 0, ?, ?)",
-                        (
-                            int(plan["plan_id"]),
-                            item.subtask_id,
-                            item.description,
-                            _checked_json(list(item.blocked_by), MAX_CHECKPOINT_BYTES, "plan blocked_by"),
-                            item.verifier_bundle_hash,
-                            item.max_turns,
-                            now,
-                            now,
-                        ),
-                    )
-                    continue
-                if previous.blocked_by != item.blocked_by or previous.tombstoned != item.tombstoned:
-                    updated_item = conn.execute(
-                        "UPDATE plan_items SET blocked_by_json = ?, tombstoned = ?, "
-                        "version = version + 1, updated_at = ? "
-                        "WHERE plan_id = ? AND subtask_id = ? AND version = ?",
-                        (
-                            _checked_json(list(item.blocked_by), MAX_CHECKPOINT_BYTES, "plan blocked_by"),
-                            int(item.tombstoned),
-                            now,
-                            int(plan["plan_id"]),
-                            item.subtask_id,
-                            int(next(row["version"] for row in item_rows if row["subtask_id"] == item.subtask_id)),
-                        ),
-                    )
-                    if updated_item.rowcount != 1:
-                        raise StaleState(f"PlanItem changed during PlanPatch: {item.subtask_id}")
-
-            conn.execute(
-                "INSERT INTO plan_revisions("
-                "revision_id, plan_id, task_id, parent_revision_id, revision_number, "
-                "dag_hash, patch_hash, reason, trigger, evidence_refs_json, snapshot_json, created_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    next_revision_id,
-                    int(plan["plan_id"]),
-                    task_id,
-                    current_revision.revision_id,
-                    revision_number,
-                    dag_digest,
-                    patch_digest,
-                    patch.reason,
-                    patch.trigger,
-                    _checked_json(list(patch.evidence_refs), MAX_CHECKPOINT_BYTES, "plan evidence refs"),
-                    _checked_json(revision_snapshot(next_items), MAX_CHECKPOINT_BYTES, "plan revision snapshot"),
-                    now,
-                ),
-            )
-            switched = conn.execute(
-                "UPDATE plans SET current_revision_id = ?, updated_at = ? "
-                "WHERE plan_id = ? AND current_revision_id = ?",
-                (next_revision_id, now, int(plan["plan_id"]), expected_revision_id),
-            )
-            if switched.rowcount != 1:
-                raise StaleState(f"Plan revision changed before CAS switch: {task_id}")
-            payload = {
-                "plan_id": int(plan["plan_id"]),
-                "revision_id": next_revision_id,
-                "parent_revision_id": current_revision.revision_id,
-                "revision_number": revision_number,
-                "dag_hash": dag_digest,
-                "patch_hash": patch_digest,
-                "reason": patch.reason,
-                "trigger": patch.trigger,
-                "evidence_refs": list(patch.evidence_refs),
-                "operations": [type(operation).__name__ for operation in patch.operations],
-            }
-            conn.execute(
-                "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
-                (task_id, "plan_revision_created", _checked_json(payload, MAX_EVENT_PAYLOAD_BYTES, "event payload"), now),
-            )
-            if fault_injector:
-                fault_injector(
-                    "plan_patch_before_commit",
-                    task_id=task_id,
-                    revision_id=next_revision_id,
-                )
 
         result = PlanRevision(
             revision_id=next_revision_id,
@@ -1512,12 +1604,6 @@ class EventStore:
             items=next_items,
             created_at=now,
         )
-        if fault_injector:
-            fault_injector(
-                "plan_patch_after_commit",
-                task_id=task_id,
-                revision_id=next_revision_id,
-            )
         return result
 
     def activate_plan_revision(
@@ -1698,13 +1784,20 @@ class EventStore:
             (_now(), row["plan_id"]),
         )
         if event_type is not None:
+            payload = {"plan_item_id": plan_item_id, **(event_payload or {})}
+            if event_type == "plan_item_failed":
+                payload["observed_revision_id"] = conn.execute(
+                    "SELECT current_revision_id FROM plans WHERE plan_id = ?",
+                    (row["plan_id"],),
+                ).fetchone()[0]
+                payload["observed_item_version"] = int(row["version"]) + 1
             conn.execute(
                 "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
                 (
                     row["task_id"],
                     event_type,
                     _checked_json(
-                        {"plan_item_id": plan_item_id, **(event_payload or {})},
+                        payload,
                         MAX_EVENT_PAYLOAD_BYTES,
                         "event payload",
                     ),
@@ -2091,8 +2184,8 @@ class EventStore:
                 "completion_summary, verifier_id, verifier_version, verification_rule, "
                 "verifier_bundle_hash, verifier_implementation_hash, evidence_manifest_json, "
                 "evidence_hash, authoritative, "
-                "execution_checkpoint_id, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                "execution_checkpoint_id, created_at, observed_plan_item_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
                 (
                     verifier_run_id,
                     task_id,
@@ -2110,6 +2203,7 @@ class EventStore:
                     evidence_hash,
                     execution_checkpoint_id,
                     now,
+                    int(item["version"]) + 1,
                 ),
             )
             updated = conn.execute(
@@ -2642,13 +2736,14 @@ class EventStore:
                 "verifier_run_id, task_id, plan_item_id, subtask_id, status, summary, "
                 "completion_summary, verifier_id, verifier_version, verification_rule, "
                 "verifier_bundle_hash, verifier_implementation_hash, evidence_manifest_json, "
-                "evidence_hash, authoritative, execution_checkpoint_id, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+                "evidence_hash, authoritative, execution_checkpoint_id, created_at, "
+                "observed_plan_item_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
                 (
                     verifier_run_id, task_id, plan_item_id, subtask_id, status, summary,
                     completion_summary, verifier_id, verifier_version, verification_rule,
                     verifier_bundle_hash, verifier_implementation_hash, evidence_json,
-                    evidence_hash, execution_checkpoint_id, now,
+                    evidence_hash, execution_checkpoint_id, now, int(item["version"]) + 1,
                 ),
             )
             conn.execute(
@@ -2751,6 +2846,11 @@ class EventStore:
                 "plan_item_id": plan_item_id,
                 "subtask_id": subtask_id,
                 "checkpoint_id": checkpoint_id,
+                "observed_revision_id": conn.execute(
+                    "SELECT current_revision_id FROM plans WHERE plan_id = ?",
+                    (item["plan_id"],),
+                ).fetchone()[0],
+                "observed_item_version": int(item["version"]) + 1,
                 "verifier_run_id": verifier_run_id,
                 "status": status,
                 "authoritative": False,
@@ -4147,8 +4247,8 @@ class EventStore:
     # ------------------------------------------------------------------
 
     def _emit_conn(self, conn: sqlite3.Connection, task_id: str, event_type: str,
-                   payload: dict[str, Any]) -> None:
-        conn.execute(
+                   payload: dict[str, Any]) -> int:
+        cursor = conn.execute(
             "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
             (
                 task_id,
@@ -4157,6 +4257,7 @@ class EventStore:
                 _now(),
             ),
         )
+        return int(cursor.lastrowid)
 
     def _job_lease_conn(self, conn: sqlite3.Connection, job_id: str) -> tuple[str, int]:
         if self._lease_context is None:
@@ -5326,12 +5427,50 @@ class EventStore:
                         violations.append(f"operation {operation['operation_id']}: read-only call has operation")
             self._scan_v6_invariants(conn, task_id, violations)
             self._scan_plan_revision_invariants(conn, task_id, violations)
+            self._scan_replan_decision_invariants(conn, task_id, violations)
             self._scan_verified_subtask_invariants(conn, task_id, violations)
             self._scan_job_invariants(conn, task_id, violations)
             self._scan_subagent_invariants(conn, task_id, violations)
         finally:
             conn.close()
         return violations
+
+    def _scan_replan_decision_invariants(
+        self, conn: sqlite3.Connection, task_id: str | None, violations: list[str]
+    ) -> None:
+        rows = conn.execute(
+            "SELECT * FROM replan_decisions" + (" WHERE task_id = ?" if task_id else "")
+            + " ORDER BY decision_id", (task_id,) if task_id else (),
+        ).fetchall()
+        structural = {"SPLIT", "ADD_ITEM", "CHANGE_DEPENDENCY", "TOMBSTONE_PENDING"}
+        for row in rows:
+            label = f"replan decision {row['decision_id']}"
+            if row["outcome"] not in {"accepted", "rejected"}:
+                violations.append(f"{label}: invalid outcome")
+            revision_id = row["result_revision_id"]
+            if row["outcome"] == "accepted" and row["decision_type"] in structural:
+                revision = conn.execute(
+                    "SELECT * FROM plan_revisions WHERE revision_id = ?", (revision_id,)
+                ).fetchone()
+                if (revision is None or revision["task_id"] != row["task_id"]
+                        or revision["parent_revision_id"] != row["base_revision_id"]
+                        or revision["trigger"] != "c1c_controller"):
+                    violations.append(f"{label}: accepted patch has no matching PlanRevision")
+                elif row["signal_id"] not in _loads(revision["evidence_refs_json"], []):
+                    violations.append(f"{label}: PlanRevision lacks signal evidence")
+            elif revision_id is not None:
+                violations.append(f"{label}: non-structural or rejected decision has a revision")
+            recorded = conn.execute(
+                "SELECT payload_json FROM events WHERE task_id = ? AND type = 'replan_decision_recorded'",
+                (row["task_id"],),
+            ).fetchall()
+            if not any(
+                (payload := _loads(event["payload_json"], {})).get("signal_id") == row["signal_id"]
+                and payload.get("base_revision_id") == row["base_revision_id"]
+                and payload.get("outcome") == row["outcome"]
+                for event in recorded
+            ):
+                violations.append(f"{label}: missing decision audit event")
 
     def _scan_plan_revision_invariants(
         self,

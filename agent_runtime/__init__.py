@@ -20,8 +20,11 @@ from .models import (
 from .effects import EffectSemantics, OperationSpec, ReconcileEvidence
 from .runtime import Runtime
 from .plan_revisions import PlanPatchError
+from .replanning import (
+    RecoveryPlanRevisionController, RecoverySignal, ReplanDecision, ReplanOutcome,
+)
 
-__version__ = "0.3.0.dev10"
+__version__ = "0.3.0.dev11"
 
 __all__ = [
     "AddPlanItem",
@@ -34,6 +37,10 @@ __all__ = [
     "PlanRevisionItem",
     "OperationSpec",
     "ReconcileEvidence",
+    "RecoveryPlanRevisionController",
+    "RecoverySignal",
+    "ReplanDecision",
+    "ReplanOutcome",
     "RunResult",
     "Runtime",
     "SplitPlanItem",
