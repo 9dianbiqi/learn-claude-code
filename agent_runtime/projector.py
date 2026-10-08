@@ -107,7 +107,7 @@ class ContextProjector:
             for item in plan["items"]:
                 if item["status"] != preferred:
                     continue
-                if (not frozen_dag or preferred == "pending") and not unblocked(item):
+                if not unblocked(item):
                     continue
                 return item
         return None

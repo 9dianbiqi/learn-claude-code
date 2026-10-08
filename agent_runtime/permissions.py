@@ -52,13 +52,6 @@ class PermissionEngine:
         r"\b(?:invoke-expression|iex|start-process)\b",
         r"(?:^|\s)(?:curl|wget)\b[^\r\n]*\|",
     )
-    _read_only_commands = (
-        r"git\s+(?:status|diff|log)(?:\s+.*)?",
-        r"rg\s+.+",
-        r"(?:get-childitem|dir|ls)(?:\s+.*)?",
-        r"(?:cat|type|more)\s+.+",
-        r"python\s+-m\s+pytest\s+--collect-only(?:\s+.*)?",
-    )
 
     def __init__(
         self,
@@ -117,9 +110,8 @@ class PermissionEngine:
         if tool_name in {"write_file", "edit_file"}:
             return "file_write"
         if tool_name == "bash":
-            command = self.normalize_command(args.get("command", ""))
-            if any(re.fullmatch(pattern, command) for pattern in self._read_only_commands):
-                return "read_only"
+            # Approval is not proof of replay safety. Flags, configuration and
+            # child programs can give even inspection commands opaque effects.
             return "unknown_write"
         if self.tool_registry is not None:
             entry = self.tool_registry.get(tool_name)
@@ -225,7 +217,7 @@ class PermissionEngine:
             "glob": ("allow", "default.glob", "Read-only file listing"),
             "write_file": ("ask", "default.file-write", "Writing a repository file"),
             "edit_file": ("ask", "default.file-edit", "Editing a repository file"),
-            "bash": ("ask", "default.shell", "Shell command is not in the read-only allowlist"),
+            "bash": ("ask", "default.shell", "Shell command requires explicit approval"),
         }
         effect, rule_id, reason = defaults.get(tool_name, ("deny", "default.unknown-tool", "Unknown tool"))
         if composition:

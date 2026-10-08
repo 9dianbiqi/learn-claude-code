@@ -465,7 +465,7 @@ def test_resume_prefers_in_progress_node_over_another_ready_pending_node(
     ]
 
 
-def test_resume_retryable_blocked_node_returns_fixed_feedback_without_verifying(
+def test_resume_retryable_blocked_node_runs_ready_dependency_first(
     tmp_path: Path,
 ) -> None:
     dag = VerifiedSubtaskDAGConfig(
@@ -515,11 +515,11 @@ def test_resume_retryable_blocked_node_returns_fixed_feedback_without_verifying(
     )
     result = recovered.resume(task_id)
 
-    assert result.status == "failed"
+    assert result.status == "completed"
     assert [run["subtask_id"] for run in recovered.store.list_verifier_runs(task_id)] == [
-        "first",
+        "first", "first", "second",
     ]
-    assert recovered.store.get_plan_item(task_id, "second")["status"] == "failed"
+    assert recovered.store.get_plan_item(task_id, "second")["status"] == "completed"
 
 
 @pytest.mark.parametrize("fault_point", ["verified_subtask_f2_pre", "verified_subtask_f2_mid"])

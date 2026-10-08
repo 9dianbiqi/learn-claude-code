@@ -32,7 +32,7 @@ from .models import (
 )
 from .permissions import PermissionDecision, PermissionEngine
 from .store import EffectBlocked, EventStore, InvariantViolation, LeaseLost, StaleState
-from .tools import FileConflict, ShellResult, ToolExecutor
+from .tools import FileConflict, ReadFileResult, ShellResult, ToolExecutor
 from .tool_registry import ToolRegistry
 from .projector import ContextProjector, estimate_tokens
 from .scoped_resume import (
@@ -49,6 +49,10 @@ MAX_SUBAGENT_DEPTH = 3
 
 class InjectedCrash(RuntimeError):
     """Raised by tests at a named durable boundary."""
+
+
+class PendingPlanConflict(StaleState):
+    """Pending tool intent is blocked by a revised plan; preserve it for the caller."""
 
 
 class WaitingForApproval(RuntimeError):
@@ -274,7 +278,8 @@ class Runtime:
         items = plan["items"]
         by_id = {item["subtask_id"]: item for item in items}
         for status in ("verifying", "in_progress", "retryable"):
-            candidates = [item for item in items if item["status"] == status]
+            candidates = [item for item in items if item["status"] == status
+                          and self.store.plan_item_dependencies_complete(int(item["plan_item_id"]))]
             if candidates:
                 item = candidates[0]
                 if (
@@ -954,6 +959,18 @@ class Runtime:
             raise RuntimeError(f"Repository is leased by another active task: {self.repo_root}")
         self._lease_token = int(token)
         self.store.bind_lease(str(self.repo_root), self.owner_id, self._lease_token)
+        try:
+            legacy = self.store.list_untracked_shell_calls(str(self.repo_root))
+            if legacy and not any(call['task_id'] == task_id for call in legacy):
+                owners = ', '.join(sorted({call['task_id'] for call in legacy}))
+                raise InvariantViolation(f'Untracked legacy shell effect in {owners}: resume an owning task for quarantine and operator reconciliation first')
+            # Adopt every owned record before any review/terminal fast path.
+            for call in legacy:
+                if call['task_id'] == task_id:
+                    self.store.quarantine_legacy_shell(task_id, call['tool_use_id'])
+        except Exception:
+            self._release()
+            raise
 
     def _release(self) -> None:
         token = self._lease_token
@@ -1085,6 +1102,18 @@ class Runtime:
                     continue
 
                 if pending_calls is not None:
+                    if pending_calls and self.verified_subtask_dag is not None:
+                        checkpoint = self.store.get_checkpoint(self.store.get_task(task_id)["checkpoint_id"])
+                        owner_id = checkpoint["cursor"].get("active_subtask_id")
+                        owner = self.store.get_plan_item(task_id, str(owner_id)) if owner_id else None
+                        if owner is None:
+                            self.store.append_event(task_id, 'pending_tool_owner_unknown', {'tool_use_ids': [call.id for call in pending_calls]})
+                            raise PendingPlanConflict('Cannot identify the owner of a DAG pending tool batch; explicit reconciliation is required')
+                        if owner is not None and not self.store.plan_item_dependencies_complete(int(owner["plan_item_id"])):
+                            self.store.append_event(task_id, "pending_tools_blocked_by_dependency", {
+                                "subtask_id": owner_id, "tool_use_ids": [call.id for call in pending_calls],
+                            })
+                            raise PendingPlanConflict(f"Cannot replay pending tools for blocked subtask {owner_id}; reconcile the revised plan first")
                     self._append_tool_results(task_id, turn, messages, pending_calls)
                     pending_calls = None
                     turn += 1
@@ -1110,27 +1139,11 @@ class Runtime:
                         raise InvariantViolation(
                             f"Frozen DAG for task {task_id} has no executable subtask"
                         )
-                    if current_item["status"] == "retryable" and not self.store.plan_item_dependencies_complete(
-                        int(current_item["plan_item_id"])
-                    ):
-                        self.store.start_plan_item(
-                            int(current_item["plan_item_id"]),
-                            check_dependencies=False,
-                        )
-                        current_item = self.store.get_plan_item(
-                            task_id, str(current_item["subtask_id"])
-                        )
-                        if current_item is None:
-                            raise InvariantViolation(
-                                f"Frozen DAG subtask disappeared: {task_id}"
-                            )
-                        blocked_result = self._handle_blocked_dag_marker(
-                            task_id, current_item, messages, turn
-                        )
-                        if blocked_result is not None:
-                            return blocked_result
-                        turn += 1
-                        continue
+                    if current_item["status"] == "verifying":
+                        # A revised dependency may postpone an old completion
+                        # request. Once ready, ask anew without resetting budget.
+                        self.store.return_plan_item_to_progress(int(current_item["plan_item_id"]))
+                        current_item = self.store.get_plan_item(task_id, str(current_item["subtask_id"]))
                     if current_item["status"] != "in_progress":
                         raise InvariantViolation(
                             f"Frozen DAG subtask {current_item['subtask_id']} is not in progress"
@@ -1393,7 +1406,7 @@ class Runtime:
             )
             self._pending_review = None
             return RunResult(task_id, "needs_review", error=reason)
-        except (InjectedCrash, LeaseLost, InvariantViolation):
+        except (InjectedCrash, LeaseLost, InvariantViolation, PendingPlanConflict):
             raise
         except Exception as exc:
             self.store.fail_task(task_id, messages, {"turn": turn}, str(exc))
@@ -2147,7 +2160,9 @@ class Runtime:
             output = raw_output.output if isinstance(raw_output, ShellResult) else str(raw_output)
             self._fault("after_tool_effect_before_persist", task_id=task_id, tool_use_id=call.id)
             if call.name == "read_file":
-                state = self.tools.file_state(call.input["path"])
+                if not isinstance(raw_output, ReadFileResult):
+                    raise InvariantViolation("Built-in read_file returned no bound file observation")
+                state = raw_output.observed_state
                 if state["exists"]:
                     self.store.upsert_file_observation(
                         task_id,
@@ -2398,6 +2413,11 @@ class Runtime:
         return "[deduplicated committed operation]"
 
     def _reconcile_running_call(self, task_id: str, call: dict[str, Any]) -> str | None:
+        if call['name'] == 'bash' and call.get('effect') == 'read_only' and not call.get('operation_id'):
+            self.store.quarantine_legacy_shell(task_id, call['tool_use_id'])
+            reason = 'Legacy shell execution has no durable effect outcome; operator reconciliation is required'
+            self._mark_needs_review(task_id, call['tool_use_id'], reason)
+            raise NeedsReview(call['tool_use_id'], reason)
         operation_id = call.get("operation_id")
         operation = self.store.get_operation(operation_id) if operation_id else None
         if operation is not None:

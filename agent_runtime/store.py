@@ -387,7 +387,7 @@ class EventStore:
         metadata["reason"] = safe_reason
         with self.transaction() as conn:
             task = conn.execute(
-                "SELECT status, version FROM tasks WHERE task_id = ?", (task_id,)
+                "SELECT status, version, checkpoint_id FROM tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
             call = conn.execute(
                 "SELECT status, version FROM tool_calls WHERE task_id = ? AND tool_use_id = ?",
@@ -399,6 +399,12 @@ class EventStore:
             ).fetchone()
             if task is None or call is None:
                 raise KeyError(f"Review item not found: {tool_use_id}")
+            if "active_subtask_id" not in cursor:
+                previous = conn.execute("SELECT cursor_json FROM checkpoints WHERE checkpoint_id=? AND task_id=?",
+                                        (task['checkpoint_id'], task_id)).fetchone()
+                owner = _loads(previous['cursor_json'], {}).get('active_subtask_id') if previous else None
+                if owner:
+                    cursor_json = _checked_json({**cursor, 'active_subtask_id': owner}, MAX_CHECKPOINT_BYTES, 'checkpoint cursor')
             if task["status"] in {"completed", "failed", "aborted"}:
                 raise StaleState(f"Task is terminal during review transition: {task_id}")
             if call["status"] in {"succeeded", "denied", "failed", "aborted"}:
@@ -3066,6 +3072,43 @@ class EventStore:
                 (task_id, tool_use_id, owner_id, int(owner_pid or os.getpid()), int(fencing_token), effect, now, deadline_at),
             )
             return int(cursor.lastrowid)
+
+    def list_untracked_shell_calls(self, repo_root: str) -> list[dict[str, Any]]:
+        """Legacy read-only classification cannot establish an interrupted shell's outcome."""
+        rows = self._fetchall(
+            "SELECT c.task_id,c.tool_use_id FROM tool_calls c JOIN tasks t ON t.task_id=c.task_id "
+            "WHERE t.repo_root=? AND c.name='bash' AND c.effect='read_only' "
+            "AND c.status IN ('running','needs_review') AND c.operation_id IS NULL",
+            (repo_root,),
+        )
+        return [dict(row) for row in rows]
+
+    def quarantine_legacy_shell(self, task_id: str, tool_use_id: str) -> None:
+        """Adopt an old untracked possible effect as UNKNOWN, without dispatching it."""
+        with self.transaction() as conn:
+            self._operation_lease_conn(conn, task_id)
+            call = conn.execute("SELECT * FROM tool_calls WHERE task_id=? AND tool_use_id=?",
+                                (task_id, tool_use_id)).fetchone()
+            if (call is None or call['name'] != 'bash' or call['effect'] != 'read_only'
+                    or call['status'] not in {'running', 'needs_review'} or call['operation_id'] is not None):
+                raise StaleState('Legacy shell call is no longer eligible for quarantine')
+            if self._lease_context is None:
+                raise LeaseLost('Legacy quarantine requires a bound lease')
+            _, owner, token = self._lease_context
+            existing = conn.execute("SELECT reservation_id FROM effect_reservations WHERE task_id=? AND tool_use_id=?",
+                                    (task_id, tool_use_id)).fetchone()
+            if existing is None:
+                now = _now()
+                conn.execute(
+                    "INSERT INTO effect_reservations(task_id,tool_use_id,owner_id,owner_pid,fencing_token,effect,state,started_at,finished_at,details_json) "
+                    "VALUES (?,?,?,?,?,'unknown_write','unknown',?,?,?)",
+                    (task_id, tool_use_id, owner, os.getpid(), token, call['started_at'] or now, now,
+                     _json({'reason':'legacy untracked shell outcome unknown','adopted_by':owner})),
+                )
+            conn.execute("UPDATE tool_calls SET effect='unknown_write',effect_key=COALESCE(effect_key,args_hash), "
+                         "effect_attempts=MAX(effect_attempts,execution_attempts),version=version+1 WHERE task_id=? AND tool_use_id=?",
+                         (task_id, tool_use_id))
+            self._emit_conn(conn, task_id, 'legacy_shell_quarantined', {'tool_use_id':tool_use_id})
 
     def get_effect_reservation(self, task_id: str, tool_use_id: str) -> dict[str, Any] | None:
         row = self._fetchone(
