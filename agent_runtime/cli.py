@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -13,16 +15,20 @@ from dotenv import find_dotenv, load_dotenv
 
 from . import __version__
 from .eval_runner import run_suite, write_report
-from .migrations import SchemaError, SchemaManager
+from .migrations import SCHEMA_VERSION, SchemaError, SchemaManager
 from .permissions import PermissionEngine
 from .providers import AnthropicModel
 from .runtime import Runtime
 from .store import EventStore
+from .tool_registry import ToolRegistry
 from .trace import TraceReporter
 
 
 TASK_STATUSES = (
     "created", "running", "waiting_approval", "needs_review", "completed", "failed", "aborted"
+)
+SUBAGENT_RUN_STATUSES = (
+    "pending", "running", "completed", "failed", "needs_review", "cancelled"
 )
 
 
@@ -67,6 +73,11 @@ def _add_policy(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--policy", help="Optional allow/ask/deny YAML policy.")
 
 
+def _mcp_connection_id(server_name: str) -> str:
+    slug = re.sub(r"[^0-9A-Za-z]+", "-", str(server_name)).strip("-").casefold()
+    return f"conn-{slug or 'mcp'}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-runtime", description="Durable local coding-agent runtime.")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -89,6 +100,19 @@ def build_parser() -> argparse.ArgumentParser:
     list_command = sub.add_parser("list", help="List tasks in the repository Runtime database.")
     _add_repo(list_command)
     list_command.add_argument("--status", choices=TASK_STATUSES)
+
+    jobs = sub.add_parser("jobs", help="Inspect durable background jobs.")
+    job_sub = jobs.add_subparsers(dest="job_action", required=True)
+    jobs_list = job_sub.add_parser("list", help="List background jobs.")
+    _add_repo(jobs_list)
+    jobs_list.add_argument("--task-id")
+    jobs_list.add_argument("--status")
+
+    cron = sub.add_parser("cron", help="Inspect cron schedules.")
+    cron_sub = cron.add_subparsers(dest="cron_action", required=True)
+    cron_list = cron_sub.add_parser("list", help="List cron schedules.")
+    _add_repo(cron_list)
+    cron_list.add_argument("--enabled-only", action="store_true")
 
     show = sub.add_parser("show", help="Show task, checkpoint, tools, and unresolved effects.")
     show.add_argument("task_id")
@@ -135,6 +159,85 @@ def build_parser() -> argparse.ArgumentParser:
     db_migrate = sub.add_parser("db-migrate", help="Plan or apply an explicit SQLite schema migration.")
     _add_repo(db_migrate)
     db_migrate.add_argument("--dry-run", action="store_true")
+
+    mcp = sub.add_parser("mcp", help="Manage MCP server connections and discovered tools.")
+    mcp_sub = mcp.add_subparsers(dest="mcp_action", required=True)
+
+    mcp_add = mcp_sub.add_parser("add", help="Add or update an MCP server connection.")
+    _add_repo(mcp_add)
+    mcp_add.add_argument("--server", required=True, help="Stable MCP server name.")
+    mcp_add.add_argument("--endpoint", required=True, help="Executable that launches the stdio MCP server.")
+    mcp_add.add_argument("--arg", action="append", default=[], help="Argument passed to the executable (repeatable).")
+    mcp_add.add_argument("--auth-token-env", help="Environment variable that carries the server auth token.")
+    mcp_add.add_argument("--connection", help="Optional explicit connection id (default: derived from server name).")
+
+    mcp_list = mcp_sub.add_parser("list", help="List MCP connections and their registered tools.")
+    _add_repo(mcp_list)
+
+    mcp_refresh = mcp_sub.add_parser("refresh", help="Discover tools from configured MCP servers.")
+    _add_repo(mcp_refresh)
+    mcp_refresh.add_argument("--connection", help="Refresh only this connection id (default: all).")
+
+    subagent = sub.add_parser("subagent", help="Manage durable subagents, plan approvals, and mailboxes.")
+    subagent_sub = subagent.add_subparsers(dest="subagent_action", required=True)
+
+    subagent_spawn = subagent_sub.add_parser("spawn", help="Spawn and run a durable subagent.")
+    _add_repo(subagent_spawn)
+    _add_policy(subagent_spawn)
+    subagent_spawn.add_argument("--prompt", required=True)
+    subagent_spawn.add_argument("--role", default="assistant")
+    subagent_spawn.add_argument("--tool-scope", action="append", default=[])
+    subagent_spawn.add_argument("--context-window", type=int, default=32000)
+    subagent_spawn.add_argument("--model")
+
+    subagent_run = subagent_sub.add_parser("run", help="Run a pending subagent run.")
+    subagent_run.add_argument("run_id")
+    _add_repo(subagent_run)
+    _add_policy(subagent_run)
+
+    subagent_resume = subagent_sub.add_parser("resume", help="Resume a pending or running subagent run.")
+    subagent_resume.add_argument("run_id")
+    _add_repo(subagent_resume)
+    _add_policy(subagent_resume)
+
+    subagent_list = subagent_sub.add_parser("list", help="List durable subagent runs.")
+    _add_repo(subagent_list)
+    subagent_list.add_argument("--status", choices=SUBAGENT_RUN_STATUSES)
+    subagent_list.add_argument("--parent-task-id")
+
+    subagent_approvals = subagent_sub.add_parser("approvals", help="List plan approvals for a subagent run.")
+    subagent_approvals.add_argument("run_id")
+    _add_repo(subagent_approvals)
+
+    subagent_approve = subagent_sub.add_parser("approve", help="Approve a subagent plan.")
+    subagent_approve.add_argument("approval_id")
+    _add_repo(subagent_approve)
+    _add_policy(subagent_approve)
+    subagent_approve.add_argument("--reason")
+
+    subagent_reject = subagent_sub.add_parser("reject", help="Reject a subagent plan.")
+    subagent_reject.add_argument("approval_id")
+    _add_repo(subagent_reject)
+    _add_policy(subagent_reject)
+    subagent_reject.add_argument("--reason")
+
+    subagent_show_plan = subagent_sub.add_parser("show-plan", help="Show a persisted subagent plan file.")
+    subagent_show_plan.add_argument("approval_id")
+    _add_repo(subagent_show_plan)
+
+    mailbox = subagent_sub.add_parser("mailbox", help="Send or read durable mailbox messages.")
+    mailbox_sub = mailbox.add_subparsers(dest="mailbox_action", required=True)
+    mailbox_send = mailbox_sub.add_parser("send", help="Send a durable mailbox message.")
+    _add_repo(mailbox_send)
+    mailbox_send.add_argument("--mailbox", required=True)
+    mailbox_send.add_argument("--sender", required=True)
+    mailbox_send.add_argument("--recipient", required=True)
+    mailbox_send.add_argument("--payload", required=True, help="JSON payload")
+    mailbox_send.add_argument("--message-id")
+    mailbox_read = mailbox_sub.add_parser("read", help="Atomically read delivered mailbox messages.")
+    _add_repo(mailbox_read)
+    mailbox_read.add_argument("--mailbox", required=True)
+    mailbox_read.add_argument("--recipient", required=True)
 
     evaluation = sub.add_parser("eval", help="Run a deterministic fixed-task suite.")
     evaluation.add_argument("--suite", required=True)
@@ -266,6 +369,85 @@ def _events(args: argparse.Namespace) -> list[dict[str, Any]]:
     return events[-args.limit:]
 
 
+def _mcp_add(args: argparse.Namespace) -> dict[str, Any]:
+    server_name = str(args.server)
+    auth_profile = {}
+    if args.auth_token_env:
+        auth_profile["auth_token_env"] = str(args.auth_token_env)
+    store = _store(args, must_exist=False)
+    return store.upsert_mcp_connection(
+        connection_id=args.connection or _mcp_connection_id(server_name),
+        server_name=server_name,
+        endpoint=str(args.endpoint),
+        args=list(args.arg),
+        auth_profile=auth_profile,
+    )
+
+
+def _mcp_list(args: argparse.Namespace) -> list[dict[str, Any]]:
+    store = _store(args)
+    connections = store.list_mcp_connections()
+    tools_by_connection: dict[str, list[dict[str, Any]]] = {
+        str(connection["connection_id"]): [] for connection in connections
+    }
+    for item in store.list_tool_registrations(enabled_only=True):
+        connection_id = item.get("connection_id")
+        if connection_id is not None and str(connection_id) in tools_by_connection:
+            tools_by_connection[str(connection_id)].append({
+                "tool_name": item["tool_name"],
+                "source_tool_name": item.get("source_tool_name"),
+                "effect_kind": item["effect_kind"],
+            })
+    return [
+        {
+            **connection,
+            "tools": tools_by_connection[str(connection["connection_id"])],
+        }
+        for connection in connections
+    ]
+
+
+def _mcp_refresh(args: argparse.Namespace) -> list[dict[str, Any]]:
+    store = _store(args)
+    if args.connection:
+        connection = store.get_mcp_connection(args.connection)
+        if connection is None:
+            raise SystemExit(f"MCP connection not found: {args.connection}")
+        connections = [connection]
+    else:
+        connections = store.list_mcp_connections()
+
+    registry = ToolRegistry(_repo(args), store=store)
+    results: list[dict[str, Any]] = []
+    for connection in connections:
+        connection_id = str(connection["connection_id"])
+        try:
+            entries = registry.discover_mcp(connection_id)
+        except Exception as exc:
+            results.append({
+                "connection_id": connection_id,
+                "server_name": str(connection["server_name"]),
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "tools": [],
+            })
+            continue
+        results.append({
+            "connection_id": connection_id,
+            "server_name": str(connection["server_name"]),
+            "status": "connected",
+            "tools": [
+                {
+                    "tool_name": entry.tool_name,
+                    "source_tool_name": entry.source_tool_name,
+                    "effect_kind": entry.effect_kind,
+                }
+                for entry in entries
+            ],
+        })
+    return results
+
+
 def _check(name: str, status: str, message: str, **details: Any) -> dict[str, Any]:
     return {"name": name, "status": status, "message": message, **details}
 
@@ -376,7 +558,7 @@ def _db_check(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "database": str(_db_path(repo)),
             "schema_error": str(exc),
             "current_version": None,
-            "target_version": 5,
+            "target_version": SCHEMA_VERSION,
             "pending_migrations": [],
         }
         return report, 2
@@ -455,6 +637,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "list":
         _print_json(_task_list(args))
         return 0
+    if args.command == "jobs":
+        if args.job_action == "list":
+            _print_json(_store(args).list_jobs(task_id=args.task_id, status=args.status))
+            return 0
+    if args.command == "cron":
+        if args.cron_action == "list":
+            _print_json(_store(args).list_cron_schedules(enabled_only=args.enabled_only))
+            return 0
     if args.command == "show":
         _print_json(_task_show(args))
         return 0
@@ -493,4 +683,81 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         _print_json(report.as_dict())
         return 0 if report.ok else 2
+    if args.command == "mcp":
+        if args.mcp_action == "add":
+            _print_json(_mcp_add(args))
+            return 0
+        if args.mcp_action == "list":
+            _print_json(_mcp_list(args))
+            return 0
+        if args.mcp_action == "refresh":
+            results = _mcp_refresh(args)
+            _print_json(results)
+            return 0 if all(item["status"] != "error" for item in results) else 2
+    if args.command == "subagent":
+        if args.subagent_action == "spawn":
+            scope = set(args.tool_scope) if args.tool_scope else None
+            result = _runtime(args).spawn_subagent(
+                args.prompt,
+                role=args.role,
+                tool_scope=scope,
+                context_window=args.context_window,
+                model=args.model,
+                parent_task_id=None,
+            )
+            _print_json(result)
+            return 0 if result["status"] == "completed" else 2
+        if args.subagent_action == "run":
+            return _print_result(_runtime(args).run_subagent(args.run_id))
+        if args.subagent_action == "resume":
+            return _print_result(_runtime(args).resume_subagent(args.run_id))
+        if args.subagent_action == "list":
+            _print_json(_store(args).list_subagent_runs(
+                parent_task_id=args.parent_task_id,
+                status=args.status,
+            ))
+            return 0
+        if args.subagent_action == "approvals":
+            approvals = _store(args).list_plan_approvals(subagent_run_id=args.run_id)
+            plans_dir = _repo(args) / ".agent_runtime" / "plans"
+            for approval in approvals:
+                approval["plan_file"] = str(plans_dir / f"{approval['approval_id']}.md")
+            _print_json(approvals)
+            return 0
+        if args.subagent_action == "approve":
+            return _print_result(
+                _runtime(args).approve_subagent_plan(args.approval_id, approve=True, reason=args.reason)
+            )
+        if args.subagent_action == "reject":
+            return _print_result(
+                _runtime(args).approve_subagent_plan(args.approval_id, approve=False, reason=args.reason)
+            )
+        if args.subagent_action == "show-plan":
+            path = _repo(args) / ".agent_runtime" / "plans" / f"{args.approval_id}.md"
+            if not path.exists():
+                raise SystemExit(f"Plan file does not exist: {path}")
+            print(path.read_text(encoding="utf-8"), end="")
+            return 0
+        if args.subagent_action == "mailbox":
+            if args.mailbox_action == "send":
+                try:
+                    payload = json.loads(args.payload)
+                except json.JSONDecodeError as exc:
+                    raise SystemExit(f"Invalid --payload JSON: {exc}")
+                store = _store(args)
+                store.ensure_mailbox(args.recipient, "operator", mailbox_id=args.mailbox)
+                message_id = args.message_id or f"msg-{uuid.uuid4().hex}"
+                message = store.send_mailbox_message(
+                    message_id,
+                    args.mailbox,
+                    args.sender,
+                    args.recipient,
+                    payload,
+                )
+                _print_json(message)
+                return 0
+            if args.mailbox_action == "read":
+                messages = _store(args).read_mailbox_messages(args.mailbox, args.recipient)
+                _print_json(messages)
+                return 0
     raise SystemExit(f"Unsupported command: {args.command}")

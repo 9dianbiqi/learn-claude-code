@@ -9,9 +9,30 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from .models import PlanRevisionItem
+from .plan_revisions import (
+    canonical_json as _canonical_plan_json,
+    dag_hash as _plan_dag_hash,
+    initial_patch_hash as _initial_plan_patch_hash,
+    revision_id as _plan_revision_id,
+    revision_snapshot as _plan_revision_snapshot,
+    validate_snapshot as _validate_plan_snapshot,
+)
 
-SCHEMA_VERSION = 5
-MIGRATION_NAME = "v5_effect_ledger"
+
+SCHEMA_VERSION = 15
+MIGRATION_NAME = "v15_replan_decisions"
+V5_MIGRATION_NAME = "v5_effect_ledger"
+V6_MIGRATION_NAME = "v6_durable_context"
+V7_MIGRATION_NAME = "v7_background_jobs"
+V8_MIGRATION_NAME = "v8_tool_registry_mcp"
+V9_MIGRATION_NAME = "v9_subagents_mailbox"
+V10_MIGRATION_NAME = "v10_verified_subtask"
+V11_MIGRATION_NAME = "v11_frozen_dag"
+V12_MIGRATION_NAME = "v12_stale_evidence"
+V13_MIGRATION_NAME = "v13_plan_revisions"
+V14_MIGRATION_NAME = "v14_plan_revision_resume"
+V15_MIGRATION_NAME = "v15_replan_decisions"
 MAX_EVENT_PAYLOAD_BYTES = 1 * 1024 * 1024
 
 _TASK_STATUSES = frozenset({
@@ -395,6 +416,506 @@ _V5_MIGRATION_SOURCE = "\n".join(statement.strip() for statement in _BASE_SCHEMA
 V5_CHECKSUM = _sha256_text(_V5_MIGRATION_SOURCE)
 
 
+_V6_ADDITIONS = (
+    """
+    CREATE TABLE IF NOT EXISTS memories (
+        memory_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        kind TEXT NOT NULL,
+        content TEXT NOT NULL,
+        source_checkpoint_id INTEGER REFERENCES checkpoints(checkpoint_id),
+        evidence_hash TEXT,
+        created_at REAL NOT NULL,
+        expires_at REAL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS memory_links (
+        source_memory_id INTEGER NOT NULL REFERENCES memories(memory_id),
+        target_memory_id INTEGER NOT NULL REFERENCES memories(memory_id),
+        relation TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        PRIMARY KEY(source_memory_id, target_memory_id, relation)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS summaries (
+        summary_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        scope TEXT NOT NULL,
+        content TEXT NOT NULL,
+        source_turn_range TEXT,
+        evidence_hash TEXT,
+        model_call_id INTEGER REFERENCES model_calls(model_call_id),
+        created_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS plans (
+        plan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        status TEXT NOT NULL DEFAULT 'active',
+        dag_hash TEXT,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        CHECK (status IN ('active', 'superseded', 'completed', 'failed'))
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS plan_items (
+        plan_item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        plan_id INTEGER NOT NULL REFERENCES plans(plan_id),
+        subtask_id TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'pending',
+        blocked_by_json TEXT NOT NULL DEFAULT '[]',
+        completion_summary TEXT,
+        evidence_hash TEXT,
+        version INTEGER NOT NULL DEFAULT 0,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        UNIQUE (plan_id, subtask_id),
+        CHECK (status IN (
+            'pending', 'in_progress', 'verifying', 'completed', 'failed', 'retryable'
+        ))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_memories_task ON memories(task_id, kind, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_memories_expiry ON memories(task_id, expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_summaries_task ON summaries(task_id, scope, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_plans_task ON plans(task_id, status, plan_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_plans_active_task ON plans(task_id) WHERE status = 'active'",
+    "CREATE INDEX IF NOT EXISTS idx_plan_items_plan ON plan_items(plan_id, status, plan_item_id)",
+    "CREATE INDEX IF NOT EXISTS idx_plan_items_task_dep ON plan_items(plan_id, subtask_id)",
+)
+
+
+_V6_MIGRATION_SOURCE = "\n".join(
+    [statement.strip() for statement in _BASE_SCHEMA]
+    + [statement.strip() for statement in _V6_ADDITIONS]
+)
+V6_CHECKSUM = _sha256_text(_V6_MIGRATION_SOURCE)
+
+
+_V7_ADDITIONS = (
+    """
+    CREATE TABLE IF NOT EXISTS agent_jobs (
+        job_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        repo_root TEXT NOT NULL,
+        lane_id TEXT,
+        kind TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL DEFAULT 1,
+        available_at REAL NOT NULL,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        CHECK (status IN (
+            'pending', 'claimed', 'running', 'completed', 'failed', 'retryable', 'cancelled'
+        ))
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS job_runs (
+        run_id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL REFERENCES agent_jobs(job_id),
+        owner_id TEXT NOT NULL,
+        fencing_token INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        heartbeat_at REAL,
+        lease_expires_at REAL,
+        started_at REAL,
+        completed_at REAL,
+        error TEXT,
+        result_digest TEXT,
+        CHECK (status IN ('running', 'completed', 'failed', 'cancelled'))
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS cron_schedules (
+        schedule_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        expression TEXT NOT NULL,
+        job_kind TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        last_triggered_at REAL,
+        next_trigger_at REAL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_jobs_status ON agent_jobs(status, available_at, job_id)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_task ON agent_jobs(task_id, created_at, job_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_job_runs_active ON job_runs(job_id) WHERE status = 'running'",
+    "CREATE INDEX IF NOT EXISTS idx_job_runs_job ON job_runs(job_id, run_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cron_enabled ON cron_schedules(enabled, next_trigger_at)",
+)
+
+
+_V7_MIGRATION_SOURCE = "\n".join(
+    [statement.strip() for statement in _BASE_SCHEMA]
+    + [statement.strip() for statement in _V6_ADDITIONS]
+    + [statement.strip() for statement in _V7_ADDITIONS]
+)
+V7_CHECKSUM = _sha256_text(_V7_MIGRATION_SOURCE)
+
+
+_V8_ADDITIONS = (
+    """
+    CREATE TABLE IF NOT EXISTS tool_registrations (
+        registration_id TEXT PRIMARY KEY,
+        tool_name TEXT NOT NULL UNIQUE,
+        adapter_kind TEXT NOT NULL,
+        connection_id TEXT,
+        server_name TEXT,
+        source_tool_name TEXT,
+        description TEXT NOT NULL DEFAULT '',
+        schema_json TEXT NOT NULL,
+        effect_kind TEXT NOT NULL,
+        permission_json TEXT NOT NULL,
+        timeout_seconds REAL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        version INTEGER NOT NULL DEFAULT 1,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        CHECK (adapter_kind IN ('builtin', 'mcp')),
+        CHECK (effect_kind IN ('read_only', 'file_write', 'idempotent', 'unknown_write', 'opaque')),
+        CHECK (timeout_seconds IS NULL OR timeout_seconds > 0)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS mcp_connections (
+        connection_id TEXT PRIMARY KEY,
+        server_name TEXT NOT NULL UNIQUE,
+        transport TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        args_json TEXT NOT NULL DEFAULT '[]',
+        auth_profile_json TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL DEFAULT 'configured',
+        last_connected_at REAL,
+        last_error TEXT,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        CHECK (transport IN ('stdio')),
+        CHECK (status IN ('configured', 'connected', 'error', 'disabled'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_tool_registrations_adapter ON tool_registrations(adapter_kind, enabled)",
+    "CREATE INDEX IF NOT EXISTS idx_mcp_connections_status ON mcp_connections(status, server_name)",
+)
+
+
+_V8_MIGRATION_SOURCE = "\n".join(
+    [statement.strip() for statement in _BASE_SCHEMA]
+    + [statement.strip() for statement in _V6_ADDITIONS]
+    + [statement.strip() for statement in _V7_ADDITIONS]
+    + [statement.strip() for statement in _V8_ADDITIONS]
+)
+V8_CHECKSUM = _sha256_text(_V8_MIGRATION_SOURCE)
+
+
+_V9_ADDITIONS = (
+    """
+    CREATE TABLE IF NOT EXISTS subagent_runs (
+        subagent_run_id TEXT PRIMARY KEY,
+        parent_task_id TEXT,
+        child_task_id TEXT NOT NULL UNIQUE,
+        repo_root TEXT NOT NULL,
+        lane_id TEXT NOT NULL DEFAULT 'default',
+        role TEXT NOT NULL,
+        status TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        fencing_token TEXT,
+        version INTEGER NOT NULL DEFAULT 1,
+        messages_json TEXT NOT NULL,
+        result_summary TEXT,
+        error TEXT,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        CHECK (status IN ('pending', 'running', 'completed', 'failed', 'needs_review', 'cancelled'))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_subagent_runs_parent ON subagent_runs(parent_task_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_subagent_runs_child ON subagent_runs(child_task_id)",
+    """
+    CREATE TABLE IF NOT EXISTS mailboxes (
+        mailbox_id TEXT PRIMARY KEY,
+        owner_task_id TEXT NOT NULL UNIQUE,
+        owner_role TEXT NOT NULL,
+        version INTEGER NOT NULL DEFAULT 1,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS mailbox_messages (
+        message_id TEXT PRIMARY KEY,
+        mailbox_id TEXT NOT NULL,
+        sender_task_id TEXT NOT NULL,
+        recipient_task_id TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'delivered',
+        created_at REAL NOT NULL,
+        read_at REAL,
+        FOREIGN KEY (mailbox_id) REFERENCES mailboxes(mailbox_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_mailbox_messages_pending ON mailbox_messages(mailbox_id, status, created_at)",
+    """
+    CREATE TABLE IF NOT EXISTS plan_approvals (
+        approval_id TEXT PRIMARY KEY,
+        subagent_run_id TEXT NOT NULL,
+        plan_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        requested_by TEXT NOT NULL,
+        decided_by TEXT,
+        reason TEXT,
+        version INTEGER NOT NULL DEFAULT 1,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        CHECK (status IN ('requested', 'approved', 'rejected', 'superseded')),
+        FOREIGN KEY (subagent_run_id) REFERENCES subagent_runs(subagent_run_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_plan_approvals_run ON plan_approvals(subagent_run_id, status)",
+)
+
+
+_V9_MIGRATION_SOURCE = "\n".join(
+    [statement.strip() for statement in _BASE_SCHEMA]
+    + [statement.strip() for statement in _V6_ADDITIONS]
+    + [statement.strip() for statement in _V7_ADDITIONS]
+    + [statement.strip() for statement in _V8_ADDITIONS]
+    + [statement.strip() for statement in _V9_ADDITIONS]
+)
+V9_CHECKSUM = _sha256_text(_V9_MIGRATION_SOURCE)
+
+
+_V10_ADDITIONS = (
+    "ALTER TABLE plan_items ADD COLUMN verifier_bundle_hash TEXT",
+    """
+    CREATE TABLE IF NOT EXISTS verifier_runs (
+        verifier_run_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        plan_item_id INTEGER NOT NULL REFERENCES plan_items(plan_item_id),
+        subtask_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        completion_summary TEXT NOT NULL,
+        verifier_id TEXT NOT NULL,
+        verifier_version TEXT NOT NULL,
+        verification_rule TEXT NOT NULL,
+        verifier_bundle_hash TEXT NOT NULL,
+        verifier_implementation_hash TEXT NOT NULL,
+        evidence_manifest_json TEXT NOT NULL,
+        evidence_hash TEXT NOT NULL,
+        authoritative INTEGER NOT NULL DEFAULT 0,
+        execution_checkpoint_id INTEGER NOT NULL REFERENCES checkpoints(checkpoint_id),
+        created_at REAL NOT NULL,
+        CHECK (status IN ('pass', 'fail', 'uncertain')),
+        CHECK (authoritative IN (0, 1)),
+        CHECK (authoritative = 0 OR status = 'pass')
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS semantic_checkpoints (
+        semantic_checkpoint_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        plan_item_id INTEGER NOT NULL REFERENCES plan_items(plan_item_id),
+        subtask_id TEXT NOT NULL,
+        verifier_run_id TEXT NOT NULL UNIQUE REFERENCES verifier_runs(verifier_run_id),
+        execution_checkpoint_id INTEGER NOT NULL REFERENCES checkpoints(checkpoint_id),
+        completion_summary TEXT NOT NULL,
+        verifier_id TEXT NOT NULL,
+        verifier_version TEXT NOT NULL,
+        verification_rule TEXT NOT NULL,
+        verifier_bundle_hash TEXT NOT NULL,
+        verifier_implementation_hash TEXT NOT NULL,
+        evidence_manifest_json TEXT NOT NULL,
+        evidence_hash TEXT NOT NULL,
+        created_at REAL NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_verifier_runs_task ON verifier_runs(task_id, created_at, verifier_run_id)",
+    "CREATE INDEX IF NOT EXISTS idx_verifier_runs_plan_item ON verifier_runs(plan_item_id, created_at, verifier_run_id)",
+    "CREATE INDEX IF NOT EXISTS idx_semantic_checkpoints_task ON semantic_checkpoints(task_id, semantic_checkpoint_id)",
+    "CREATE INDEX IF NOT EXISTS idx_semantic_checkpoints_plan_item ON semantic_checkpoints(plan_item_id, semantic_checkpoint_id)",
+)
+
+_V10_MIGRATION_SOURCE = "\n".join(
+    [_V9_MIGRATION_SOURCE.strip()]
+    + [statement.strip() for statement in _V10_ADDITIONS]
+)
+V10_CHECKSUM = _sha256_text(_V10_MIGRATION_SOURCE)
+
+
+_V11_ADDITIONS = (
+    "ALTER TABLE plan_items ADD COLUMN max_turns INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE plan_items ADD COLUMN consumed_turns INTEGER NOT NULL DEFAULT 0",
+)
+
+_V11_MIGRATION_SOURCE = "\n".join(
+    [_V10_MIGRATION_SOURCE.strip()]
+    + [statement.strip() for statement in _V11_ADDITIONS]
+)
+V11_CHECKSUM = _sha256_text(_V11_MIGRATION_SOURCE)
+
+
+_V12_ADDITIONS = (
+    """
+    CREATE TABLE IF NOT EXISTS semantic_checkpoint_state_events (
+        state_event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        semantic_checkpoint_id INTEGER NOT NULL
+            REFERENCES semantic_checkpoints(semantic_checkpoint_id),
+        plan_item_id INTEGER NOT NULL REFERENCES plan_items(plan_item_id),
+        state TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        replacement_checkpoint_id INTEGER
+            REFERENCES semantic_checkpoints(semantic_checkpoint_id),
+        observed_manifest_json TEXT NOT NULL DEFAULT '[]',
+        observation_complete INTEGER NOT NULL DEFAULT 0,
+        created_at REAL NOT NULL,
+        CHECK (state IN ('valid', 'stale', 'superseded')),
+        CHECK (observation_complete IN (0, 1))
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_checkpoint_state_task ON "
+    "semantic_checkpoint_state_events(task_id, semantic_checkpoint_id, state_event_id)",
+    "CREATE INDEX IF NOT EXISTS idx_checkpoint_state_item ON "
+    "semantic_checkpoint_state_events(plan_item_id, state_event_id)",
+    """
+    CREATE TRIGGER IF NOT EXISTS immutable_verifier_runs
+    BEFORE UPDATE ON verifier_runs
+    BEGIN
+        SELECT RAISE(ABORT, 'verifier_runs are append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS immutable_verifier_runs_delete
+    BEFORE DELETE ON verifier_runs
+    BEGIN
+        SELECT RAISE(ABORT, 'verifier_runs are append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS immutable_semantic_checkpoints
+    BEFORE UPDATE ON semantic_checkpoints
+    BEGIN
+        SELECT RAISE(ABORT, 'semantic_checkpoints are append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS immutable_semantic_checkpoints_delete
+    BEFORE DELETE ON semantic_checkpoints
+    BEGIN
+        SELECT RAISE(ABORT, 'semantic_checkpoints are append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS immutable_checkpoint_state_events
+    BEFORE UPDATE ON semantic_checkpoint_state_events
+    BEGIN
+        SELECT RAISE(ABORT, 'semantic_checkpoint_state_events are append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS immutable_checkpoint_state_events_delete
+    BEFORE DELETE ON semantic_checkpoint_state_events
+    BEGIN
+        SELECT RAISE(ABORT, 'semantic_checkpoint_state_events are append-only');
+    END
+    """,
+)
+
+_V12_MIGRATION_SOURCE = "\n".join(
+    [_V11_MIGRATION_SOURCE.strip()]
+    + [statement.strip() for statement in _V12_ADDITIONS]
+)
+V12_CHECKSUM = _sha256_text(_V12_MIGRATION_SOURCE)
+
+
+_V13_ADDITIONS = (
+    "ALTER TABLE plans ADD COLUMN current_revision_id TEXT",
+    "ALTER TABLE plan_items ADD COLUMN tombstoned INTEGER NOT NULL DEFAULT 0",
+    """
+    CREATE TABLE IF NOT EXISTS plan_revisions (
+        revision_id TEXT PRIMARY KEY,
+        plan_id INTEGER NOT NULL REFERENCES plans(plan_id),
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        parent_revision_id TEXT REFERENCES plan_revisions(revision_id),
+        revision_number INTEGER NOT NULL,
+        dag_hash TEXT NOT NULL,
+        patch_hash TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        trigger TEXT NOT NULL,
+        evidence_refs_json TEXT NOT NULL DEFAULT '[]',
+        snapshot_json TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        UNIQUE(plan_id, revision_number)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_plan_revisions_plan ON "
+    "plan_revisions(plan_id, revision_number)",
+    "CREATE INDEX IF NOT EXISTS idx_plan_revisions_task ON "
+    "plan_revisions(task_id, revision_number)",
+    """
+    CREATE TRIGGER IF NOT EXISTS immutable_plan_revisions
+    BEFORE UPDATE ON plan_revisions
+    BEGIN
+        SELECT RAISE(ABORT, 'plan_revisions are append-only');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS immutable_plan_revisions_delete
+    BEFORE DELETE ON plan_revisions
+    BEGIN
+        SELECT RAISE(ABORT, 'plan_revisions are append-only');
+    END
+    """,
+)
+
+
+_V13_MIGRATION_SOURCE = "\n".join(
+    [_V12_MIGRATION_SOURCE.strip()]
+    + [statement.strip() for statement in _V13_ADDITIONS]
+)
+V13_CHECKSUM = _sha256_text(_V13_MIGRATION_SOURCE)
+
+_V14_ADDITIONS = (
+    "ALTER TABLE tasks ADD COLUMN execution_plan_revision_id TEXT REFERENCES plan_revisions(revision_id)",
+)
+V14_CHECKSUM = _sha256_text(
+    _V13_MIGRATION_SOURCE + "\n" + "\n".join(_V14_ADDITIONS)
+    + "\nbackfill latest plan revision 0; preserve unacknowledged patches"
+)
+
+_V15_ADDITIONS = (
+    "ALTER TABLE verifier_runs ADD COLUMN observed_plan_item_version INTEGER",
+    """CREATE TABLE IF NOT EXISTS replan_decisions (
+        decision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        signal_id TEXT NOT NULL,
+        signal_type TEXT NOT NULL,
+        plan_item_id INTEGER REFERENCES plan_items(plan_item_id),
+        base_revision_id TEXT NOT NULL REFERENCES plan_revisions(revision_id),
+        result_revision_id TEXT REFERENCES plan_revisions(revision_id),
+        decision_type TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK(outcome IN ('accepted', 'rejected')),
+        rejection_reason TEXT,
+        created_at REAL NOT NULL,
+        UNIQUE(task_id, signal_id, base_revision_id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_replan_decisions_task ON replan_decisions(task_id, decision_id)",
+)
+V15_CHECKSUM = _sha256_text(
+    _V13_MIGRATION_SOURCE + "\n" + "\n".join(_V14_ADDITIONS)
+    + "\n" + "\n".join(statement.strip() for statement in _V15_ADDITIONS)
+)
+
+
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in columns:
@@ -422,6 +943,24 @@ def _business_tables(table_names: set[str]) -> set[str]:
         "effect_reservations",
         "operations",
         "operation_outbox",
+        "memories",
+        "memory_links",
+        "summaries",
+        "plans",
+        "plan_items",
+        "plan_revisions",
+        "replan_decisions",
+        "agent_jobs",
+        "job_runs",
+        "cron_schedules",
+        "tool_registrations",
+        "mcp_connections",
+        "subagent_runs",
+        "mailboxes",
+        "mailbox_messages",
+        "plan_approvals",
+        "verifier_runs",
+        "semantic_checkpoints",
     }
 
 
@@ -463,6 +1002,7 @@ def _legacy_projection_violations(
     task_id: str | None = None,
     *,
     allow_prepared_operations: bool = False,
+    allow_workspace_cleanup: bool = False,
 ) -> list[str]:
     """Validate the v0.1 task/checkpoint/event/tool/reservation projection.
 
@@ -632,6 +1172,23 @@ def _legacy_projection_violations(
         if not reservation["owner_id"] or int(reservation["fencing_token"] or 0) < 1:
             violations.append(f"reservation {reservation_id}: invalid owner or fencing token")
         task = task_by_id.get(reservation_task_id)
+        if allow_workspace_cleanup and reservation["effect"] == "workspace_cleanup":
+            # This controller resource is released AFTER verification may have
+            # committed. It is not a model tool call or a second success state.
+            if task is None:
+                violations.append(f"reservation {reservation_id}: missing task")
+            try:
+                resource = json.loads(reservation["details_json"])["resource"]
+                valid = (resource["kind"] in {"docker_workspace", "docker_validator"}
+                         and all(isinstance(resource[k], str) and resource[k]
+                                 for k in ("source_id", "image", "session"))
+                         and (resource["kind"] != "docker_validator" or bool(resource.get("parent_source_id"))))
+            except (ValueError, KeyError, TypeError):
+                valid = False
+            if (not valid or not reservation["tool_use_id"].startswith("workspace-release-")
+                    or reservation["operation_id"] is not None):
+                violations.append(f"reservation {reservation_id}: invalid workspace cleanup binding")
+            continue
         if task is None:
             violations.append(f"reservation {reservation_id}: missing task")
         else:
@@ -923,9 +1480,204 @@ def _apply_v5_effect_ledger(conn: sqlite3.Connection, *, backfill: bool = True) 
         _backfill_v5(conn)
 
 
+def _apply_v6_durable_context(conn: sqlite3.Connection) -> None:
+    for column, definition in (
+        ("source_checkpoint_id", "INTEGER"),
+        ("projection_json", "TEXT"),
+    ):
+        _ensure_column(conn, "model_calls", column, definition)
+    _execute_all(conn, _V6_ADDITIONS)
+
+
+def _apply_v7_background_jobs(conn: sqlite3.Connection) -> None:
+    _execute_all(conn, _V7_ADDITIONS)
+
+
+def _apply_v8_tool_registry(conn: sqlite3.Connection) -> None:
+    _execute_all(conn, _V8_ADDITIONS)
+
+
+def _apply_v9_subagents_mailbox(conn: sqlite3.Connection) -> None:
+    _execute_all(conn, _V9_ADDITIONS)
+
+
+def _apply_v10_verified_subtask(conn: sqlite3.Connection) -> None:
+    _ensure_column(conn, "plan_items", "verifier_bundle_hash", "TEXT")
+    _execute_all(conn, _V10_ADDITIONS[1:])
+
+
+def _apply_v11_frozen_dag(conn: sqlite3.Connection) -> None:
+    _ensure_column(conn, "plan_items", "max_turns", "INTEGER NOT NULL DEFAULT 1")
+    _ensure_column(conn, "plan_items", "consumed_turns", "INTEGER NOT NULL DEFAULT 0")
+
+
+def _apply_v12_stale_evidence(conn: sqlite3.Connection) -> None:
+    _execute_all(conn, _V12_ADDITIONS)
+    rows = conn.execute(
+        "SELECT semantic_checkpoint_id, task_id, plan_item_id, evidence_manifest_json "
+        "FROM semantic_checkpoints ORDER BY semantic_checkpoint_id"
+    ).fetchall()
+    now = _now()
+    pending_by_item: dict[tuple[str, int], list[tuple[int, str, int, str]]] = {}
+    for row in rows:
+        semantic_checkpoint_id = int(row[0])
+        task_id = str(row[1])
+        plan_item_id = int(row[2])
+        evidence_manifest_json = str(row[3])
+        exists = conn.execute(
+            "SELECT 1 FROM semantic_checkpoint_state_events "
+            "WHERE semantic_checkpoint_id = ? LIMIT 1",
+            (semantic_checkpoint_id,),
+        ).fetchone()
+        if exists is not None:
+            continue
+        pending_by_item.setdefault((task_id, plan_item_id), []).append(
+            (semantic_checkpoint_id, task_id, plan_item_id, evidence_manifest_json)
+        )
+
+    for group in pending_by_item.values():
+        newest_checkpoint_id = group[-1][0]
+        for semantic_checkpoint_id, task_id, plan_item_id, evidence_manifest_json in group:
+            try:
+                manifest = _loads(evidence_manifest_json, [])
+                if not isinstance(manifest, list):
+                    raise ValueError("evidence manifest is not a list")
+                manifest = sorted(
+                    manifest,
+                    key=lambda entry: str(entry.get("path", ""))
+                    if isinstance(entry, dict) else "",
+                )
+                observed_manifest_json = _json(manifest)
+            except (TypeError, ValueError):
+                observed_manifest_json = "[]"
+            conn.execute(
+                "INSERT INTO semantic_checkpoint_state_events("
+                "task_id, semantic_checkpoint_id, plan_item_id, state, reason, "
+                "observed_manifest_json, observation_complete, created_at) "
+                "VALUES (?, ?, ?, 'valid', 'migration_backfill', ?, 1, ?)",
+                (
+                    task_id,
+                    semantic_checkpoint_id,
+                    plan_item_id,
+                    observed_manifest_json,
+                    now,
+                ),
+            )
+        for semantic_checkpoint_id, *_ in group[:-1]:
+            conn.execute(
+                "INSERT INTO semantic_checkpoint_state_events("
+                "task_id, semantic_checkpoint_id, plan_item_id, state, reason, "
+                "replacement_checkpoint_id, observed_manifest_json, observation_complete, created_at) "
+                "SELECT task_id, semantic_checkpoint_id, plan_item_id, 'superseded', "
+                "'migration_backfill', ?, observed_manifest_json, observation_complete, ? "
+                "FROM semantic_checkpoint_state_events "
+                "WHERE semantic_checkpoint_id = ? ORDER BY state_event_id DESC LIMIT 1",
+                (newest_checkpoint_id, now, semantic_checkpoint_id),
+            )
+
+
+def _apply_v13_plan_revisions(conn: sqlite3.Connection) -> None:
+    _ensure_column(conn, "plans", "current_revision_id", "TEXT")
+    _ensure_column(conn, "plan_items", "tombstoned", "INTEGER NOT NULL DEFAULT 0")
+    _execute_all(conn, _V13_ADDITIONS[2:])
+    plans = conn.execute(
+        "SELECT plan_id, task_id, current_revision_id, created_at FROM plans ORDER BY plan_id"
+    ).fetchall()
+    for plan in plans:
+        if plan["current_revision_id"] is not None:
+            continue
+        rows = conn.execute(
+            "SELECT subtask_id, description, blocked_by_json, verifier_bundle_hash, "
+            "max_turns, tombstoned FROM plan_items WHERE plan_id = ? ORDER BY plan_item_id",
+            (int(plan["plan_id"]),),
+        ).fetchall()
+        items = tuple(
+            PlanRevisionItem(
+                subtask_id=str(row["subtask_id"]),
+                description=str(row["description"]),
+                blocked_by=tuple(str(value) for value in json.loads(row["blocked_by_json"])),
+                verifier_bundle_hash=(
+                    str(row["verifier_bundle_hash"])
+                    if row["verifier_bundle_hash"] is not None
+                    else None
+                ),
+                max_turns=int(row["max_turns"]),
+                tombstoned=bool(row["tombstoned"]),
+            )
+            for row in rows
+        )
+        try:
+            _validate_plan_snapshot(items)
+        except ValueError as exc:
+            raise MigrationValidationError(
+                f"plan {int(plan['plan_id'])} cannot be backfilled as a PlanRevision: {exc}"
+            ) from exc
+        reason = "migration_backfill"
+        trigger = "migration"
+        patch_digest = _initial_plan_patch_hash(reason=reason, trigger=trigger)
+        dag_digest = _plan_dag_hash(items)
+        revision = _plan_revision_id(
+            task_id=str(plan["task_id"]),
+            plan_id=int(plan["plan_id"]),
+            parent_revision_id=None,
+            revision_number=0,
+            dag_digest=dag_digest,
+            patch_digest=patch_digest,
+        )
+        created_at = float(plan["created_at"])
+        conn.execute(
+            "INSERT INTO plan_revisions("
+            "revision_id, plan_id, task_id, parent_revision_id, revision_number, "
+            "dag_hash, patch_hash, reason, trigger, evidence_refs_json, snapshot_json, created_at"
+            ") VALUES (?, ?, ?, NULL, 0, ?, ?, ?, ?, '[]', ?, ?)",
+            (
+                revision,
+                int(plan["plan_id"]),
+                str(plan["task_id"]),
+                dag_digest,
+                patch_digest,
+                reason,
+                trigger,
+                _canonical_plan_json(_plan_revision_snapshot(items)),
+                created_at,
+            ),
+        )
+        conn.execute(
+            "UPDATE plans SET current_revision_id = ? WHERE plan_id = ?",
+            (revision, int(plan["plan_id"])),
+        )
+
+
+def _apply_v14_plan_revision_resume(conn: sqlite3.Connection) -> None:
+    _ensure_column(conn, "tasks", "execution_plan_revision_id",
+                   "TEXT REFERENCES plan_revisions(revision_id)")
+    # v13 never acknowledged revised execution. Binding to current would skip
+    # the caller's configuration validation on the first v14 resume.
+    conn.execute(
+        "UPDATE tasks SET execution_plan_revision_id = ("
+        "SELECT r.revision_id FROM plan_revisions r "
+        "WHERE r.plan_id = (SELECT MAX(p.plan_id) FROM plans p WHERE p.task_id = tasks.task_id) "
+        "AND r.revision_number = 0) WHERE execution_plan_revision_id IS NULL"
+    )
+
+
+def _apply_v15_replan_decisions(conn: sqlite3.Connection) -> None:
+    _execute_all(conn, _V15_ADDITIONS)
+
+
 def _create_latest_schema(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA foreign_keys=ON")
     _execute_all(conn, _BASE_SCHEMA)
+    _apply_v6_durable_context(conn)
+    _apply_v7_background_jobs(conn)
+    _apply_v8_tool_registry(conn)
+    _apply_v9_subagents_mailbox(conn)
+    _apply_v10_verified_subtask(conn)
+    _apply_v11_frozen_dag(conn)
+    _apply_v12_stale_evidence(conn)
+    _apply_v13_plan_revisions(conn)
+    _apply_v14_plan_revision_resume(conn)
+    _apply_v15_replan_decisions(conn)
     row = conn.execute("SELECT 1 FROM schema_migrations WHERE version = ?", (SCHEMA_VERSION,)).fetchone()
     if row is None:
         conn.execute(
@@ -934,15 +1686,21 @@ def _create_latest_schema(conn: sqlite3.Connection) -> None:
                 version, name, checksum, applied_at, duration_ms, backup_filename, backup_sha256
             ) VALUES (?, ?, ?, ?, ?, NULL, NULL)
             """,
-            (SCHEMA_VERSION, MIGRATION_NAME, V5_CHECKSUM, _now(), 0.0),
+            (SCHEMA_VERSION, MIGRATION_NAME, V15_CHECKSUM, _now(), 0.0),
         )
 
 
-def _migration_apply(conn: sqlite3.Connection) -> None:
-    _apply_v5_effect_ledger(conn)
-
-
-V5_MIGRATION = Migration(SCHEMA_VERSION, MIGRATION_NAME, V5_CHECKSUM, _migration_apply)
+V5_MIGRATION = Migration(5, V5_MIGRATION_NAME, V5_CHECKSUM, _apply_v5_effect_ledger)
+V6_MIGRATION = Migration(6, V6_MIGRATION_NAME, V6_CHECKSUM, _apply_v6_durable_context)
+V7_MIGRATION = Migration(7, V7_MIGRATION_NAME, V7_CHECKSUM, _apply_v7_background_jobs)
+V8_MIGRATION = Migration(8, V8_MIGRATION_NAME, V8_CHECKSUM, _apply_v8_tool_registry)
+V9_MIGRATION = Migration(9, V9_MIGRATION_NAME, V9_CHECKSUM, _apply_v9_subagents_mailbox)
+V10_MIGRATION = Migration(10, V10_MIGRATION_NAME, V10_CHECKSUM, _apply_v10_verified_subtask)
+V11_MIGRATION = Migration(11, V11_MIGRATION_NAME, V11_CHECKSUM, _apply_v11_frozen_dag)
+V12_MIGRATION = Migration(12, V12_MIGRATION_NAME, V12_CHECKSUM, _apply_v12_stale_evidence)
+V13_MIGRATION = Migration(13, V13_MIGRATION_NAME, V13_CHECKSUM, _apply_v13_plan_revisions)
+V14_MIGRATION = Migration(14, V14_MIGRATION_NAME, V14_CHECKSUM, _apply_v14_plan_revision_resume)
+V15_MIGRATION = Migration(15, V15_MIGRATION_NAME, V15_CHECKSUM, _apply_v15_replan_decisions)
 
 
 class SchemaManager:
@@ -969,7 +1727,19 @@ class SchemaManager:
 
     @property
     def migrations(self) -> tuple[Migration, ...]:
-        return (V5_MIGRATION,)
+        return (
+            V5_MIGRATION,
+            V6_MIGRATION,
+            V7_MIGRATION,
+            V8_MIGRATION,
+            V9_MIGRATION,
+            V10_MIGRATION,
+            V11_MIGRATION,
+            V12_MIGRATION,
+            V13_MIGRATION,
+            V14_MIGRATION,
+            V15_MIGRATION,
+        )
 
     def _connect(self, *, read_only: bool = False) -> sqlite3.Connection:
         if read_only:
@@ -1006,12 +1776,31 @@ class SchemaManager:
             raise MigrationValidationError(
                 f"database schema v{current} has no supported migration path to v{SCHEMA_VERSION}"
             )
+        known_migrations = {migration.version: migration for migration in self.migrations}
+        for row in rows:
+            version = int(row["version"])
+            migration = known_migrations.get(version)
+            if migration is None:
+                if version == 4:
+                    keys = set(row.keys())
+                    if "name" not in keys or "checksum" not in keys:
+                        continue
+                    if row["name"] is None and row["checksum"] is None:
+                        continue
+                    if str(row["name"]) == "legacy-v4" and str(row["checksum"]) == "legacy":
+                        continue
+                raise MigrationValidationError(f"unknown registered schema migration: v{version}")
+            if str(row["name"]) != migration.name or str(row["checksum"]) != migration.checksum:
+                raise MigrationChecksumMismatch(
+                    f"migration checksum mismatch for v{version}: "
+                    f"{row['name']!r}/{row['checksum']!r}"
+                )
         if current == SCHEMA_VERSION:
             columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(schema_migrations)").fetchall()}
             if not {"name", "checksum"} <= columns:
-                raise MigrationValidationError("v5 schema_migrations is missing migration audit columns")
+                raise MigrationValidationError("schema_migrations is missing migration audit columns")
             latest = next(row for row in rows if int(row["version"]) == SCHEMA_VERSION)
-            if str(latest["name"]) != MIGRATION_NAME or str(latest["checksum"]) != V5_CHECKSUM:
+            if str(latest["name"]) != MIGRATION_NAME or str(latest["checksum"]) != V15_CHECKSUM:
                 raise MigrationChecksumMismatch(
                     f"migration checksum mismatch for v{SCHEMA_VERSION}: "
                     f"{latest['name']!r}/{latest['checksum']!r}"
@@ -1019,6 +1808,14 @@ class SchemaManager:
             required = {
                 "tasks", "checkpoints", "model_calls", "tool_calls", "file_observations",
                 "events", "leases", "operations", "operation_outbox", "effect_reservations",
+                "memories", "memory_links", "summaries", "plans", "plan_items",
+                "agent_jobs", "job_runs", "cron_schedules",
+                "tool_registrations", "mcp_connections",
+                "subagent_runs", "mailboxes", "mailbox_messages", "plan_approvals",
+                "verifier_runs", "semantic_checkpoints",
+                "semantic_checkpoint_state_events",
+                "plan_revisions",
+                "replan_decisions",
             }
             missing = sorted(required - tables)
             if missing:
@@ -1026,9 +1823,15 @@ class SchemaManager:
                     f"v{SCHEMA_VERSION} database is missing required tables: {', '.join(missing)}"
                 )
             required_columns = {
+                "replan_decisions": {"decision_id", "task_id", "signal_id", "signal_type",
+                                     "plan_item_id", "base_revision_id", "result_revision_id",
+                                     "decision_type", "reason", "outcome", "rejection_reason", "created_at"},
+                "verifier_runs": {"observed_plan_item_version"},
+                "tasks": {"execution_plan_revision_id"},
                 "schema_migrations": {"version", "name", "checksum", "applied_at", "duration_ms", "backup_filename", "backup_sha256"},
                 "tool_calls": {"operation_id"},
                 "effect_reservations": {"operation_id"},
+                "model_calls": {"source_checkpoint_id", "projection_json"},
                 "operations": {
                     "operation_id", "task_id", "tool_use_id", "adapter", "semantics", "effect_scope",
                     "dedupe_key", "idempotency_key", "args_hash", "state", "request_json", "result_json",
@@ -1039,6 +1842,90 @@ class SchemaManager:
                     "operation_id", "state", "available_at", "claimed_by", "claimed_until",
                     "delivery_attempts", "last_error", "updated_at",
                 },
+                "memories": {
+                    "memory_id", "task_id", "kind", "content", "source_checkpoint_id",
+                    "evidence_hash", "created_at", "expires_at",
+                },
+                "memory_links": {"source_memory_id", "target_memory_id", "relation", "created_at"},
+                "summaries": {
+                    "summary_id", "task_id", "scope", "content", "source_turn_range",
+                    "evidence_hash", "model_call_id", "created_at",
+                },
+                "plans": {
+                    "plan_id", "task_id", "status", "dag_hash", "current_revision_id",
+                    "created_at", "updated_at",
+                },
+                "plan_items": {
+                    "plan_item_id", "plan_id", "subtask_id", "description", "status",
+                    "blocked_by_json", "completion_summary", "evidence_hash", "version",
+                    "created_at", "updated_at", "verifier_bundle_hash", "max_turns",
+                    "consumed_turns", "tombstoned",
+                },
+                "plan_revisions": {
+                    "revision_id", "plan_id", "task_id", "parent_revision_id",
+                    "revision_number", "dag_hash", "patch_hash", "reason", "trigger",
+                    "evidence_refs_json", "snapshot_json", "created_at",
+                },
+                "agent_jobs": {
+                    "job_id", "task_id", "repo_root", "lane_id", "kind", "payload_json",
+                    "status", "attempts", "max_attempts", "available_at", "created_at", "updated_at",
+                },
+                "job_runs": {
+                    "run_id", "job_id", "owner_id", "fencing_token", "status", "heartbeat_at",
+                    "lease_expires_at", "started_at", "completed_at", "error", "result_digest",
+                },
+                "cron_schedules": {
+                    "schedule_id", "task_id", "expression", "job_kind", "payload_json",
+                    "enabled", "last_triggered_at", "next_trigger_at",
+                },
+                "tool_registrations": {
+                    "registration_id", "tool_name", "adapter_kind", "description", "schema_json",
+                    "effect_kind", "permission_json", "timeout_seconds", "enabled", "version",
+                    "created_at", "updated_at",
+                },
+                "mcp_connections": {
+                    "connection_id", "server_name", "transport", "endpoint", "args_json",
+                    "auth_profile_json", "status", "last_connected_at", "last_error",
+                    "created_at", "updated_at",
+                },
+                "subagent_runs": {
+                    "subagent_run_id", "parent_task_id", "child_task_id", "repo_root",
+                    "lane_id", "role", "status", "owner_id", "fencing_token", "version",
+                    "messages_json", "result_summary", "error", "created_at", "updated_at",
+                },
+                "mailboxes": {
+                    "mailbox_id", "owner_task_id", "owner_role", "version",
+                    "created_at", "updated_at",
+                },
+                "mailbox_messages": {
+                    "message_id", "mailbox_id", "sender_task_id", "recipient_task_id",
+                    "payload_json", "status", "created_at", "read_at",
+                },
+                "plan_approvals": {
+                    "approval_id", "subagent_run_id", "plan_hash", "status",
+                    "requested_by", "decided_by", "reason", "version",
+                    "created_at", "updated_at",
+                },
+                "verifier_runs": {
+                    "verifier_run_id", "task_id", "plan_item_id", "subtask_id", "status",
+                "summary", "completion_summary", "verifier_id", "verifier_version",
+                    "verification_rule", "verifier_bundle_hash", "verifier_implementation_hash",
+                    "evidence_manifest_json",
+                    "evidence_hash", "authoritative", "execution_checkpoint_id", "created_at",
+                },
+                "semantic_checkpoints": {
+                    "semantic_checkpoint_id", "task_id", "plan_item_id", "subtask_id",
+                    "verifier_run_id", "execution_checkpoint_id", "completion_summary",
+                    "verifier_id", "verifier_version", "verification_rule",
+                    "verifier_bundle_hash", "verifier_implementation_hash", "evidence_manifest_json",
+                    "evidence_hash",
+                    "created_at",
+                },
+                "semantic_checkpoint_state_events": {
+                    "state_event_id", "task_id", "semantic_checkpoint_id", "plan_item_id",
+                    "state", "reason", "replacement_checkpoint_id", "observed_manifest_json",
+                    "observation_complete", "created_at",
+                },
             }
             for table, columns in required_columns.items():
                 actual = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -1047,6 +1934,17 @@ class SchemaManager:
                     raise MigrationValidationError(
                         f"v{SCHEMA_VERSION} table {table} is missing columns: {', '.join(missing_columns)}"
                     )
+        elif current == V5_MIGRATION.version:
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(schema_migrations)").fetchall()}
+            if not {"name", "checksum"} <= columns:
+                raise MigrationValidationError("v5 schema_migrations is missing migration audit columns")
+            latest = next((row for row in rows if int(row["version"]) == current), None)
+            if latest is None or str(latest["name"]) != V5_MIGRATION_NAME or str(latest["checksum"]) != V5_CHECKSUM:
+                raise MigrationChecksumMismatch(
+                    f"migration checksum mismatch for v5: "
+                    f"{latest['name'] if latest else None!r}/"
+                    f"{latest['checksum'] if latest else None!r}"
+                )
         return current, tables, bool(_business_tables(tables))
 
     def inspect(self) -> SchemaStatus:
@@ -1057,6 +1955,9 @@ class SchemaManager:
         except sqlite3.DatabaseError as exc:
             raise SchemaError(f"cannot open Runtime database: {self.database}") from exc
         try:
+            # Pin table inventory, migration rows and integrity checks to one
+            # SQLite snapshot while another process may commit a migration.
+            conn.execute("BEGIN")
             try:
                 current, tables, has_business = self._read_metadata(conn)
                 integrity = tuple(_integrity(conn))
@@ -1078,6 +1979,7 @@ class SchemaManager:
                 active_leases,
             )
         finally:
+            conn.rollback()
             conn.close()
 
     def plan(self) -> list[Migration]:
@@ -1158,7 +2060,7 @@ class SchemaManager:
             self.fault_injector(point, **context)
 
     def ensure_latest(self) -> None:
-        """Create a fresh database directly at v5; never upgrade an old database."""
+        """Create a fresh database directly at the latest schema; never upgrade an old database."""
         if self.database.exists():
             try:
                 status = self.inspect()
@@ -1239,8 +2141,11 @@ class SchemaManager:
             )
         if status.current_version == 0 and not status.has_business_tables:
             return self._migrate_fresh(dry_run, preflight)
-        if status.current_version != 4 or [m.version for m in status.pending_migrations] != [5]:
+        pending = status.pending_migrations
+        expected_versions = list(range(status.current_version + 1, SCHEMA_VERSION + 1))
+        if [m.version for m in pending] != expected_versions:
             raise SchemaUpgradeRequired(self.database, status.current_version)
+        pending_names = tuple(m.name for m in pending)
         if dry_run:
             checks = list(preflight)
             checks.append({
@@ -1256,7 +2161,7 @@ class SchemaManager:
                 not status.integrity_check and status.active_leases == 0,
                 status.current_version,
                 SCHEMA_VERSION,
-                (MIGRATION_NAME,),
+                pending_names,
                 None,
                 "not-run",
                 True,
@@ -1288,55 +2193,89 @@ class SchemaManager:
             if current == SCHEMA_VERSION:
                 conn.commit()
                 committed = True
-                return MigrationReport(True, 5, 5, (), None, "ok", False, preflight)
-            if current != 4 or not has_business:
+                return MigrationReport(True, SCHEMA_VERSION, SCHEMA_VERSION, (), None, "ok", False, preflight)
+            pending_versions = [m.version for m in self.migrations if m.version > current]
+            if (
+                current != status.current_version
+                or pending_versions != expected_versions
+                or not has_business
+            ):
                 raise SchemaUpgradeRequired(self.database, current)
             checks = self._preflight(conn)
             if any(item["status"] == "fail" for item in checks):
                 raise MigrationBlocked(f"Migration preflight failed: {checks}")
 
-            # Validate the complete legacy projection before changing any v4
-            # rows or applying v5 DDL. The backfill repeats this shared check
-            # after the stale-running conversion, but no invalid history may
-            # reach that phase.
-            _validate_legacy_rows(conn)
-            now = _now()
-            conn.execute(
-                "UPDATE effect_reservations SET state = 'unknown', finished_at = ?, details_json = ? "
-                "WHERE state = 'running'",
-                (now, _json({"reason": "migration_stale_running"})),
-            )
-            _apply_v5_effect_ledger(conn, backfill=False)
-            self._inject("after_migration_ddl", from_version=4, to_version=5)
-            _backfill_v5(conn)
-            self._inject("after_migration_backfill", from_version=4, to_version=5)
+            if status.current_version == 4:
+                # Validate the complete legacy projection before changing any
+                # v4 rows or applying v5 DDL. The backfill repeats this shared
+                # check after the stale-running conversion.
+                _validate_legacy_rows(conn)
+                now = _now()
+                conn.execute(
+                    "UPDATE effect_reservations SET state = 'unknown', finished_at = ?, details_json = ? "
+                    "WHERE state = 'running'",
+                    (now, _json({"reason": "migration_stale_running"})),
+                )
+                _apply_v5_effect_ledger(conn, backfill=False)
+                self._inject("after_migration_ddl", from_version=4, to_version=5)
+                _backfill_v5(conn)
+                self._inject("after_migration_backfill", from_version=4, to_version=5)
+                conn.execute(
+                    "UPDATE schema_migrations SET name = ?, checksum = ? WHERE version = 4",
+                    ("legacy-v4", "legacy"),
+                )
+            if 6 in expected_versions:
+                _apply_v6_durable_context(conn)
+            if 7 in expected_versions:
+                _apply_v7_background_jobs(conn)
+            if 8 in expected_versions:
+                _apply_v8_tool_registry(conn)
+            if 9 in expected_versions:
+                _apply_v9_subagents_mailbox(conn)
+            if 10 in expected_versions:
+                _apply_v10_verified_subtask(conn)
+            if 11 in expected_versions:
+                _apply_v11_frozen_dag(conn)
+            if 12 in expected_versions:
+                _apply_v12_stale_evidence(conn)
+            if 13 in expected_versions:
+                _apply_v13_plan_revisions(conn)
+            if 14 in expected_versions:
+                _apply_v14_plan_revision_resume(conn)
+            if 15 in expected_versions:
+                _apply_v15_replan_decisions(conn)
 
             duration_ms = (time.perf_counter() - started) * 1000.0
-            conn.execute(
-                "UPDATE schema_migrations SET name = ?, checksum = ? WHERE version = 4",
-                ("legacy-v4", "legacy"),
+            for migration in pending:
+                conn.execute(
+                    """
+                    INSERT INTO schema_migrations(
+                        version, name, checksum, applied_at, duration_ms,
+                        backup_filename, backup_sha256
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        migration.version,
+                        migration.name,
+                        migration.checksum,
+                        _now(),
+                        duration_ms,
+                        backup.filename if backup else None,
+                        backup.sha256 if backup else None,
+                    ),
+                )
+            self._inject(
+                "before_migration_commit",
+                from_version=status.current_version,
+                to_version=SCHEMA_VERSION,
             )
-            conn.execute(
-                """
-                INSERT INTO schema_migrations(
-                    version, name, checksum, applied_at, duration_ms,
-                    backup_filename, backup_sha256
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    5,
-                    MIGRATION_NAME,
-                    V5_CHECKSUM,
-                    _now(),
-                    duration_ms,
-                    backup.filename if backup else None,
-                    backup.sha256 if backup else None,
-                ),
-            )
-            self._inject("before_migration_commit", from_version=4, to_version=5)
             conn.commit()
             committed = True
-            self._inject("after_migration_commit", from_version=4, to_version=5)
+            self._inject(
+                "after_migration_commit",
+                from_version=status.current_version,
+                to_version=SCHEMA_VERSION,
+            )
         except Exception:
             if not committed:
                 conn.rollback()
@@ -1356,9 +2295,9 @@ class SchemaManager:
             raise SchemaError(f"post-migration integrity check failed: {final_integrity}")
         return MigrationReport(
             True,
-            4,
-            5,
-            (MIGRATION_NAME,),
+            status.current_version,
+            SCHEMA_VERSION,
+            pending_names,
             backup,
             final_integrity,
             False,
@@ -1381,4 +2320,14 @@ __all__ = [
     "SCHEMA_VERSION",
     "UnsupportedSchemaVersion",
     "V5_CHECKSUM",
+    "V6_CHECKSUM",
+    "V7_CHECKSUM",
+    "V8_CHECKSUM",
+    "V9_CHECKSUM",
+    "V10_CHECKSUM",
+    "V11_CHECKSUM",
+    "V12_CHECKSUM",
+    "V13_CHECKSUM",
+    "V14_CHECKSUM",
+    "V15_CHECKSUM",
 ]

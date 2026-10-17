@@ -18,6 +18,7 @@ class TraceReporter:
         models = self.store.list_model_calls(task_id)
         tools = self.store.list_tool_calls(task_id)
         operations = self.store.list_operations(task_id)
+        decisions = self.store.list_replan_decisions(task_id)
         permission_counts = {"allow": 0, "ask": 0, "deny": 0}
         for event in events:
             if event["type"] == "permission_decision":
@@ -45,6 +46,60 @@ class TraceReporter:
         operation_deduplications = sum(
             event["type"] == "operation_deduplicated" for event in events
         )
+        projection_metrics = self._projection_metrics(models)
+        scoped_overflow_events = [
+            event for event in events
+            if event["type"] == "verified_scoped_context_overflow"
+        ]
+        scoped_overflow_token_estimates = [
+            int(event["payload"]["token_estimate"])
+            for event in scoped_overflow_events
+            if isinstance(event.get("payload", {}).get("token_estimate"), (int, float))
+        ]
+        scoped_overflow_budgets = [
+            int(event["payload"]["scoped_context_budget"])
+            for event in scoped_overflow_events
+            if isinstance(event.get("payload", {}).get("scoped_context_budget"), (int, float))
+        ]
+        scoped_overflow_units = [
+            str(event["payload"]["resume_unit_id"])
+            for event in scoped_overflow_events
+            if event.get("payload", {}).get("resume_unit_id") is not None
+        ]
+        scoped_overflow_dependencies = [
+            int(event["payload"]["dependency_count"])
+            for event in scoped_overflow_events
+            if isinstance(event.get("payload", {}).get("dependency_count"), (int, float))
+        ]
+        scoped_overflow_paths = [
+            int(event["payload"]["relevant_path_count"])
+            for event in scoped_overflow_events
+            if isinstance(event.get("payload", {}).get("relevant_path_count"), (int, float))
+        ]
+        scoped_token_estimates = (
+            projection_metrics["scoped_token_estimates"] + scoped_overflow_token_estimates
+        )
+        scoped_budgets = projection_metrics["scoped_budgets"] + scoped_overflow_budgets
+        scoped_resume_unit_ids = (
+            projection_metrics["scoped_resume_unit_ids"] + scoped_overflow_units
+        )
+        scoped_dependency_counts = (
+            projection_metrics["scoped_dependency_counts"] + scoped_overflow_dependencies
+        )
+        scoped_relevant_path_counts = (
+            projection_metrics["scoped_relevant_path_counts"] + scoped_overflow_paths
+        )
+        projection_basis = list(projection_metrics["basis"])
+        if scoped_overflow_events and "verified_scoped" not in projection_basis:
+            projection_basis.append("verified_scoped")
+        plan_metrics = self._plan_metrics(task_id)
+        verified_metrics = self._verified_metrics(task_id)
+        jobs = self.store.list_jobs(task_id)
+        job_status_counts: dict[str, int] = {}
+        job_run_count = 0
+        for job in jobs:
+            job_status_counts[str(job["status"])] = job_status_counts.get(str(job["status"]), 0) + 1
+            job_run_count += len(self.store.list_job_runs(str(job["job_id"])))
         return {
             "task_id": task_id,
             "status": task["status"],
@@ -81,6 +136,196 @@ class TraceReporter:
             ),
             "blocked_outbox_count": sum(
                 operation.get("outbox_state") == "blocked" for operation in operations
+            ),
+            "projection_basis": projection_basis,
+            "projection_used_count": projection_metrics["used_count"],
+            "projection_token_estimates": projection_metrics["token_estimates"],
+            "verified_scoped_resume_count": projection_metrics["scoped_resume_count"],
+            "verified_scoped_token_estimates": scoped_token_estimates,
+            "verified_scoped_budgets": scoped_budgets,
+            "verified_scoped_resume_unit_ids": scoped_resume_unit_ids,
+            "verified_scoped_dependency_counts": scoped_dependency_counts,
+            "verified_scoped_relevant_path_counts": scoped_relevant_path_counts,
+            "verified_scoped_overflow_count": (
+                projection_metrics["scoped_overflow_count"]
+                + len(scoped_overflow_events)
+            ),
+            "verified_scoped_context_failure_count": sum(
+                event["type"] == "verified_scoped_context_failed" for event in events
+            ),
+            # Keep concise scoped names alongside the verified-prefixed
+            # fields for trace consumers that group projection modes.
+            "scoped_resume_count": projection_metrics["scoped_resume_count"],
+            "scoped_token_estimates": scoped_token_estimates,
+            "scoped_context_budgets": scoped_budgets,
+            "scoped_resume_unit_ids": scoped_resume_unit_ids,
+            "scoped_dependency_counts": scoped_dependency_counts,
+            "scoped_relevant_path_counts": scoped_relevant_path_counts,
+            "scoped_context_overflow_count": (
+                projection_metrics["scoped_overflow_count"]
+                + len(scoped_overflow_events)
+            ),
+            "scoped_context_overflow_outcomes": [
+                str(event["payload"].get("outcome") or "overflow")
+                for event in scoped_overflow_events
+            ],
+            "memory_count": projection_metrics["memory_count"],
+            "summary_count": projection_metrics["summary_count"],
+            "plan_item_count": sum(
+                len(item.get("items", [])) for item in plan_metrics["plans"]
+            ),
+            "plan_events": plan_metrics["events"],
+            "plan_revision_count": len(plan_metrics["revisions"]),
+            "current_plan_revision_id": plan_metrics["current_revision_id"],
+            "execution_plan_revision_id": self.store.get_task(task_id)["execution_plan_revision_id"],
+            "plan_revision_activation_count": plan_metrics["events"].count("plan_revision_activated"),
+            "replan_decision_count": len(decisions),
+            "replan_decision_types": [item["decision_type"] for item in decisions],
+            "replan_accepted_count": sum(item["outcome"] == "accepted" for item in decisions),
+            "replan_rejected_count": sum(item["outcome"] == "rejected" for item in decisions),
+            "replan_unnecessary_revision_count": sum(
+                item["decision_type"] in {"KEEP", "RETRY", "FAIL"}
+                and item["result_revision_id"] is not None for item in decisions
+            ),
+            "replan_missing_revision_count": sum(
+                item["outcome"] == "accepted" and item["decision_type"] in {
+                    "SPLIT", "ADD_ITEM", "CHANGE_DEPENDENCY", "TOMBSTONE_PENDING"
+                } and item["result_revision_id"] is None for item in decisions
+            ),
+            "current_plan_revision_dag_hash": plan_metrics["current_revision_dag_hash"],
+            "verifier_run_count": verified_metrics["verifier_run_count"],
+            "authoritative_verifier_run_count": verified_metrics["authoritative_verifier_run_count"],
+            "non_authoritative_verifier_run_count": verified_metrics["non_authoritative_verifier_run_count"],
+            "verified_subtask_checkpoint_count": verified_metrics["verified_subtask_checkpoint_count"],
+            "verified_subtask_bundle_count": verified_metrics["verified_subtask_bundle_count"],
+            "verified_subtask_valid_checkpoint_count": verified_metrics["valid_checkpoint_count"],
+            "verified_subtask_stale_checkpoint_count": verified_metrics["stale_checkpoint_count"],
+            "verified_subtask_superseded_checkpoint_count": verified_metrics["superseded_checkpoint_count"],
+            "verified_subtask_refresh_count": verified_metrics["refresh_count"],
+            "verified_subtask_f4_fail_count": verified_metrics["f4_fail_count"],
+            "verified_subtask_f4_uncertain_count": verified_metrics["f4_uncertain_count"],
+            "background_job_count": len(jobs),
+            "background_job_runs": job_run_count,
+            "background_job_statuses": job_status_counts,
+            "recovered_job_count": sum(event["type"] == "job_recovered" for event in events),
+            "cron_trigger_count": sum(event["type"] == "cron_triggered" for event in events),
+            "cron_schedule_count": len(self.store.list_cron_schedules()),
+        }
+
+    @staticmethod
+    def _projection_metrics(models: list[dict[str, Any]]) -> dict[str, Any]:
+        used_count = 0
+        bases: set[str] = set()
+        token_estimates: list[int] = []
+        memory_count = 0
+        summary_count = 0
+        scoped_resume_count = 0
+        scoped_token_estimates: list[int] = []
+        scoped_budgets: list[int] = []
+        scoped_resume_unit_ids: list[str] = []
+        scoped_dependency_counts: list[int] = []
+        scoped_relevant_path_counts: list[int] = []
+        scoped_overflow_count = 0
+        for call in models:
+            projection = call.get("projection") or {}
+            basis = projection.get("basis")
+            if projection.get("projection_used"):
+                used_count += 1
+            if basis:
+                bases.add(basis)
+            estimate = projection.get("token_estimate")
+            if isinstance(estimate, (int, float)):
+                token_estimates.append(int(estimate))
+            memory_count = max(memory_count, int(projection.get("memory_count") or 0))
+            summary_count = max(summary_count, int(projection.get("summary_count") or 0))
+            if projection.get("basis") == "verified_scoped" or projection.get("scoped_resume"):
+                scoped_resume_count += 1
+                if isinstance(estimate, (int, float)):
+                    scoped_token_estimates.append(int(estimate))
+                budget = projection.get("scoped_context_budget")
+                if isinstance(budget, (int, float)):
+                    scoped_budgets.append(int(budget))
+                resume_unit_id = projection.get("resume_unit_id")
+                if resume_unit_id is not None:
+                    scoped_resume_unit_ids.append(str(resume_unit_id))
+                scoped_dependency_counts.append(int(projection.get("dependency_count") or 0))
+                scoped_relevant_path_counts.append(int(projection.get("relevant_path_count") or 0))
+                if projection.get("overflow") or projection.get("overflow_outcome") == "overflow":
+                    scoped_overflow_count += 1
+        return {
+            "basis": sorted(bases),
+            "used_count": used_count,
+            "token_estimates": token_estimates,
+            "memory_count": memory_count,
+            "summary_count": summary_count,
+            "scoped_resume_count": scoped_resume_count,
+            "scoped_token_estimates": scoped_token_estimates,
+            "scoped_budgets": scoped_budgets,
+            "scoped_resume_unit_ids": scoped_resume_unit_ids,
+            "scoped_dependency_counts": scoped_dependency_counts,
+            "scoped_relevant_path_counts": scoped_relevant_path_counts,
+            "scoped_overflow_count": scoped_overflow_count,
+        }
+
+    def _plan_metrics(self, task_id: str) -> dict[str, Any]:
+        plans = self.store.list_plans(task_id)
+        result = []
+        for plan in plans:
+            item = dict(plan)
+            item["items"] = self.store.list_plan_items(int(plan["plan_id"]))
+            result.append(item)
+        events = [
+            event["type"]
+            for event in self.store.list_events(task_id)
+            if event["type"].startswith("plan_item_")
+            or event["type"].startswith("plan_revision_")
+        ]
+        revisions = self.store.list_plan_revisions(task_id)
+        current = revisions[-1] if revisions else None
+        return {
+            "plans": result,
+            "events": events,
+            "revisions": revisions,
+            "current_revision_id": current.revision_id if current else None,
+            "current_revision_dag_hash": current.dag_hash if current else None,
+        }
+
+    def _verified_metrics(self, task_id: str) -> dict[str, int]:
+        runs = self.store.list_verifier_runs(task_id)
+        checkpoints = self.store.list_verified_subtask_checkpoints(task_id)
+        current_counts = {
+            state: sum(
+                checkpoint.get("lifecycle_state") == state
+                for checkpoint in checkpoints
+            )
+            for state in ("valid", "stale", "superseded")
+        }
+        events = self.store.list_events(task_id)
+        bundle_hashes = {
+            str(run["verifier_bundle_hash"])
+            for run in runs
+            if run["authoritative"]
+        }
+        return {
+            "verifier_run_count": len(runs),
+            "authoritative_verifier_run_count": sum(run["authoritative"] for run in runs),
+            "non_authoritative_verifier_run_count": sum(not run["authoritative"] for run in runs),
+            "verified_subtask_checkpoint_count": len(checkpoints),
+            "verified_subtask_bundle_count": len(bundle_hashes),
+            "valid_checkpoint_count": current_counts["valid"],
+            "stale_checkpoint_count": current_counts["stale"],
+            "superseded_checkpoint_count": current_counts["superseded"],
+            "refresh_count": sum(
+                event["type"] == "verified_subtask_evidence_refreshed"
+                for event in events
+            ),
+            "f4_fail_count": sum(
+                event["type"] == "verified_subtask_evidence_refresh_fail"
+                for event in events
+            ),
+            "f4_uncertain_count": sum(
+                event["type"] == "verified_subtask_evidence_refresh_uncertain"
+                for event in events
             ),
         }
 
@@ -131,6 +376,91 @@ class TraceReporter:
                 )
             for checkpoint in self.store.list_checkpoints(task_id):
                 handle.write(json.dumps(_redact({"record_type": "checkpoint", **checkpoint}), ensure_ascii=False, sort_keys=True) + "\n")
+            for plan in self.store.list_plans(task_id):
+                plan_copy = dict(plan)
+                items = self.store.list_plan_items(int(plan["plan_id"]))
+                plan_copy["items"] = items
+                handle.write(
+                    json.dumps(
+                        _redact({"record_type": "plan", **plan_copy}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+            for revision in self.store.list_plan_revisions(task_id):
+                handle.write(
+                    json.dumps(
+                        _redact({"record_type": "plan_revision", **revision.as_dict()}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+            for decision in self.store.list_replan_decisions(task_id):
+                handle.write(json.dumps(
+                    _redact({"record_type": "replan_decision", **decision}),
+                    ensure_ascii=False, sort_keys=True,
+                ) + "\n")
+            for verifier_run in self.store.list_verifier_runs(task_id):
+                handle.write(
+                    json.dumps(
+                        _redact({"record_type": "verifier_run", **verifier_run}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+            for checkpoint in self.store.list_verified_subtask_checkpoints(task_id):
+                handle.write(
+                    json.dumps(
+                        _redact({"record_type": "verified_subtask_checkpoint", **checkpoint}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+            for state_event in self.store.list_checkpoint_state_events(task_id):
+                handle.write(
+                    json.dumps(
+                        _redact({"record_type": "verified_subtask_checkpoint_state_event", **state_event}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+            for job in self.store.list_jobs(task_id):
+                safe_job = {
+                    key: job.get(key)
+                    for key in (
+                        "job_id", "task_id", "lane_id", "kind", "status", "attempts",
+                        "max_attempts", "created_at", "updated_at", "available_at",
+                    )
+                }
+                handle.write(
+                    json.dumps(
+                        _redact({"record_type": "job", **safe_job}),
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+                for run in self.store.list_job_runs(str(job["job_id"])):
+                    safe_run = {
+                        key: run.get(key)
+                        for key in (
+                            "run_id", "job_id", "status", "heartbeat_at", "lease_expires_at",
+                            "started_at", "completed_at", "result_digest",
+                        )
+                    }
+                    handle.write(
+                        json.dumps(
+                            _redact({"record_type": "job_run", **safe_run}),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                        + "\n"
+                    )
         return len(events)
 
 

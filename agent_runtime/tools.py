@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import fnmatch
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -79,6 +80,14 @@ class ShellResult:
 
 class FileConflict(RuntimeError):
     """Raised when a file changes between precondition and final write check."""
+
+
+class ReadFileResult(str):
+    """String-compatible output bound to the full bytes read from one handle."""
+    def __new__(cls, text: str, observed_state: dict[str, Any]):
+        value = super().__new__(cls, text)
+        value.observed_state = observed_state
+        return value
 
 
 def sha256_file(path: Path) -> str:
@@ -168,13 +177,40 @@ class ToolExecutor:
             return {"path": str(file_path), "exists": False, "sha256": None, "identity": None}
         if not file_path.is_file():
             raise ValueError(f"Not a regular file: {raw_path}")
-        stat_result = file_path.stat()
-        return {
+        _, state = self._read_snapshot(file_path, capture=False)
+        return state
+
+    def _read_snapshot(self, file_path: Path, *, capture: bool) -> tuple[bytes, dict[str, Any]]:
+        def signature(value):
+            return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+        digest = hashlib.sha256()
+        chunks = []
+        size = 0
+        with file_path.open("rb") as handle:
+            before = os.fstat(handle.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError(f"Not a regular file: {file_path}")
+            for chunk in iter(lambda: handle.read(65536), b""):
+                size += len(chunk)
+                if capture and size > MAX_READ_BYTES:
+                    raise ValueError(f"File size exceeds {MAX_READ_BYTES} byte read limit: {file_path}")
+                digest.update(chunk)
+                if capture:
+                    chunks.append(chunk)
+            after = os.fstat(handle.fileno())
+            try:
+                linked = file_path.stat()
+            except FileNotFoundError as exc:
+                raise FileConflict(f"File disappeared while reading: {file_path}") from exc
+            if signature(before) != signature(after) or signature(after) != signature(linked):
+                raise FileConflict(f"File changed while reading: {file_path}")
+        state = {
             "path": str(file_path),
             "exists": True,
-            "sha256": sha256_file(file_path),
-            "identity": {"st_dev": int(stat_result.st_dev), "st_ino": int(stat_result.st_ino)},
+            "sha256": digest.hexdigest(),
+            "identity": {"st_dev": int(after.st_dev), "st_ino": int(after.st_ino)},
         }
+        return b"".join(chunks), state
 
     def prepare_file_write(self, name: str, args: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         """Return before/after hashes without changing the file."""
@@ -218,16 +254,14 @@ class ToolExecutor:
 
     def run_read_file(self, path: str, limit: int | None = None) -> str:
         file_path = self.safe_path(path)
-        raw = file_path.read_bytes()
-        if len(raw) > MAX_READ_BYTES:
-            raise ValueError(f"File size exceeds {MAX_READ_BYTES} byte read limit: {path}")
+        raw, observed_state = self._read_snapshot(file_path, capture=True)
         text = raw.decode("utf-8", errors="replace")
         if limit is not None:
             lines = text.splitlines(keepends=True)
             if limit < len(lines):
                 lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
-            return "".join(lines)
-        return text
+            return ReadFileResult("".join(lines), observed_state)
+        return ReadFileResult(text, observed_state)
 
     def run_glob(self, pattern: str) -> str:
         normalized = (pattern or "").replace("\\", "/")

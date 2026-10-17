@@ -75,7 +75,9 @@ def test_sensitive_matching_does_not_block_ordinary_source_names(tmp_path: Path)
     assert engine.evaluate("read_file", {"path": "src/credentials_client.py"}).effect == "allow"
     shell_decision = engine.evaluate("bash", {"command": "rg credentials src"})
     assert shell_decision.effect != "deny"
-    assert shell_decision.risk == "read_only"
+    # Authorization is separate from replay safety: even read-looking Shell
+    # commands are opaque effects under the accepted Phase 2 contract.
+    assert shell_decision.risk == "unknown_write"
     assert "secrets_manager.py" in ToolExecutor(tmp_path).run_glob("src/*.py")
 
 
