@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import traceback
 
 from agent_runtime.experiments.bc_tasks import TASKS, check, make_dag, prompt
 from agent_runtime.models import ModelResponse, ToolCall
@@ -125,7 +126,6 @@ def worker(args) -> int:
     workspace = Path(args.workspace)
     directory = Path(args.directory)
     prior = requests(directory.parent / "prefix") if args.phase != "prefix" else []
-    model = MeasuredModel(args, directory, prior)
 
     def fault(point, **context):
         if args.phase == "prefix" and point == "verified_subtask_f3":
@@ -133,19 +133,23 @@ def worker(args) -> int:
                                           "pid": os.getpid(), "time": time.time()})
             os._exit(F3_EXIT)
 
-    runtime = Runtime(workspace, model, verified_subtask_dag=make_dag(args.task),
-                      scoped_context_budget=SCOPED_BUDGET if args.phase == "C" else None,
-                      tool_scope=ALLOWED, fault_injector=fault,
-                      approval_callback=lambda name, *_: name in ALLOWED,
-                      # A one-second lease measures host I/O jitter rather than
-                      # this protocol on Windows CI. Keep fencing unchanged and
-                      # still wait for natural expiry after the real F3 exit.
-                      lease_ttl=100 if args.mode == "live" else 5)
-    runtime.projector = FullHistory()
     started = time.monotonic()
+    stage = "model_init"
     try:
+        model = MeasuredModel(args, directory, prior)
+        stage = "runtime_init"
+        runtime = Runtime(workspace, model, verified_subtask_dag=make_dag(args.task),
+                          scoped_context_budget=SCOPED_BUDGET if args.phase == "C" else None,
+                          tool_scope=ALLOWED, fault_injector=fault,
+                          approval_callback=lambda name, *_: name in ALLOWED,
+                          # Keep the experiment's established lease and natural
+                          # expiry protocol unchanged while improving diagnostics.
+                          lease_ttl=100 if args.mode == "live" else 5)
+        runtime.projector = FullHistory()
+        stage = "run" if args.phase == "prefix" else "resume"
         result = (runtime.run(prompt(args.task)) if args.phase == "prefix"
                   else runtime.resume(runtime.store.list_tasks()[0]["task_id"]))
+        stage = "report"
         task_id = result.task_id
         trace = TraceReporter(runtime.store)
         trace.export_jsonl(task_id, directory / "trace.jsonl")
@@ -154,8 +158,39 @@ def worker(args) -> int:
               "final_check": check(args.task, workspace)})
         return 0
     except Exception as exc:
-        save(directory / "error.json", {"type": type(exc).__name__, "message": str(exc)[:1000]})
+        error = {"type": type(exc).__name__, "message": str(exc)[:1000],
+                 "stage": stage, "task": args.task, "phase": args.phase, "mode": args.mode}
+        if args.mode == "scripted":
+            error["traceback"] = traceback.format_exc()[-8192:]
+        save(directory / "error.json", error)
         return 2
+
+
+def process_diagnostic(directory, *, task, phase, mode, exit_code):
+    """Bounded scripted-fixture details; live provider errors stay in local files."""
+    result = {"task": task, "phase": phase, "mode": mode, "exit_code": exit_code}
+    if mode != "scripted":
+        return result
+    error_path = directory / "error.json"
+    try:
+        if error_path.exists():
+            with error_path.open("rb") as stream:
+                data = stream.read(65537)
+            if len(data) > 65536:
+                raise ValueError("Worker error artifact exceeds diagnostic limit")
+            result["worker_error"] = json.loads(data.decode("utf-8"))
+    except (OSError, ValueError) as exc:
+        result["error_artifact_failure"] = type(exc).__name__
+    log_path = directory / "process.log"
+    try:
+        if log_path.exists():
+            with log_path.open("rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                stream.seek(max(0, stream.tell()-8192))
+                result["process_log_tail"] = stream.read(8192).decode("utf-8", errors="replace")
+    except OSError as exc:
+        result["log_artifact_failure"] = type(exc).__name__
+    return result
 
 
 def launch(args, task, phase, workspace, directory):
@@ -174,6 +209,9 @@ def launch(args, task, phase, workspace, directory):
         except subprocess.TimeoutExpired:
             code = -1
     save(directory / "process.json", {"exit_code": code, "seconds": time.monotonic()-started})
+    if code not in {0, F3_EXIT}:
+        save(directory / "diagnostic.json", process_diagnostic(directory, task=task, phase=phase,
+                                                               mode=args.mode, exit_code=code))
     return code
 
 
@@ -273,8 +311,13 @@ def supervise(args):
             print(f"{task}: running common prefix", flush=True)
             code = launch(args, task, "prefix", workspace, case / "prefix")
             if code != F3_EXIT or not (case / "prefix" / "fault.json").exists():
-                rows.append({"task": task, "status": "prefix_failed_or_fault_not_reached", "exit_code": code})
+                row = {"task": task, "status": "prefix_failed_or_fault_not_reached", "exit_code": code}
+                if args.mode == "scripted":
+                    row["worker_diagnostic"] = process_diagnostic(case / "prefix", task=task,
+                        phase="prefix", mode=args.mode, exit_code=code)
+                rows.append(row)
                 save(root / "results.json", rows)
+                print(json.dumps(row, ensure_ascii=False), flush=True)
                 continue
             # The child is dead. Recover SQLite WAL through its own API, then snapshot.
             with sqlite3.connect(db) as conn:
@@ -320,6 +363,9 @@ def supervise(args):
                    "completed_parser_unchanged": before[TASKS[task]["steps"][0][2][0]] == digest(workspace / TASKS[task]["steps"][0][2][0]),
                    "invariant_violations": result.get("trace", {}).get("invariant_violation_count"),
                    "scope": "synthetic fixed-plan pilot, not SWE-bench; one paired continuation per task"}
+            if code != 0 and args.mode == "scripted":
+                row["worker_diagnostic"] = process_diagnostic(case / arm, task=task,
+                    phase=arm, mode=args.mode, exit_code=code)
             rows.append(row)
             save(root / "results.json", rows)
             workspace.rename(case / f"{arm}-workspace")

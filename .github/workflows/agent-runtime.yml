@@ -44,6 +44,8 @@ jobs:
         run: python -m compileall -q agent_runtime
 
       - name: Run Runtime tests
+        env:
+          LCC_BC_TEST_ARTIFACTS: .agent_runtime_ci/bc-process
         run: python -m pytest agent_runtime/tests -q --tb=short -p no:cacheprovider
 
       - name: Stress fencing regression on Windows

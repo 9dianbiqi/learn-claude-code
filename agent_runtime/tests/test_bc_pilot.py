@@ -1,7 +1,9 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import uuid
 
 from agent_runtime.experiments.bc_tasks import TASKS, check
 from agent_runtime.experiments.bc_pilot import SOLUTIONS
@@ -20,6 +22,12 @@ def test_private_checks_reject_stubs_and_accept_reference_contracts(tmp_path):
 
 
 def test_real_process_exit_and_paired_snapshot_protocol(tmp_path):
+    # CI opts this scripted fixture into the existing always-uploaded evidence
+    # directory. Unique lanes avoid replacing previous/concurrent attempt data.
+    evidence = os.environ.get("LCC_BC_TEST_ARTIFACTS")
+    if evidence:
+        tmp_path = Path(evidence).resolve() / uuid.uuid4().hex
+        tmp_path.mkdir(parents=True, exist_ok=False)
     root = tmp_path / "pilot"
     run = subprocess.run([sys.executable, "-m", "agent_runtime.experiments.bc_pilot",
                           "--output", str(root)], capture_output=True, text=True, timeout=60)
