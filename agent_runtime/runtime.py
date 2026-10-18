@@ -130,7 +130,7 @@ class Runtime:
                  scoped_context_budget: int | None = None,
                  replan_policy: Callable[..., Any] | None = None,
                  completion_contract: CompletionContract | None = None,
-                 recovery_advisor: RecoveryAdvisor | None = None):
+                 recovery_advisor: RecoveryAdvisor | None = None, tool_setup=None):
         if verified_subtask is not None and verified_subtask_dag is not None:
             raise ValueError("verified_subtask and verified_subtask_dag are mutually exclusive")
         self.repo_root = Path(repo_root).resolve()
@@ -208,6 +208,15 @@ class Runtime:
         self.tool_registry = ToolRegistry(self.repo_root, executor=self.tools, store=self.store)
         self.tool_registry.install_builtins()
         self.tool_registry.load_from_store()
+        if tool_setup is not None:
+            if not callable(tool_setup):
+                raise TypeError("tool_setup must be a trusted controller callable")
+            tool_setup(self.tool_registry)
+            self.tool_registry.sync_to_store()
+        controller_tools = {entry.tool_name for entry in self.tool_registry.list_tools()
+                            if entry.enabled and entry.permission_requirements.get("controller_binding")}
+        if controller_tools and (not self.tool_scope or not self.tool_scope <= controller_tools):
+            raise ValueError("Controller read tools require an explicit container-only tool_scope")
         self.permissions = PermissionEngine(
             self.repo_root,
             policy_path=policy_path,
@@ -260,7 +269,18 @@ class Runtime:
         return self.verified_subtask is not None or self.verified_subtask_dag is not None
 
     def _runtime_profile(self):
-        return profile_manifest(self.completion_contract, self.verified_subtask_dag, self.recovery_advisor)
+        profile = profile_manifest(self.completion_contract, self.verified_subtask_dag, self.recovery_advisor)
+        entries = [entry for entry in self.tool_registry.list_tools()
+                   if entry.enabled and entry.permission_requirements.get("controller_binding")]
+        if entries:
+            value = {"completion_profile": profile,
+                "controller_tools": [{"name": entry.tool_name, "binding": entry.permission_requirements,
+                                      "schema": entry.schema, "bound": entry.adapter is not None}
+                                     for entry in sorted(entries, key=lambda item: item.tool_name)],
+                "tool_scope": sorted(self.tool_scope)}
+            value["sha256"] = hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+            return value
+        return profile
 
     def _assert_runtime_profile(self, task_id):
         checkpoints = self.store.list_checkpoints(task_id)

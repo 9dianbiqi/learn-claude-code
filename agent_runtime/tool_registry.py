@@ -125,6 +125,18 @@ class ToolRegistry:
         self._entries[qualified] = entry
         return entry
 
+    def register_controller_read_tool(self, name, description, schema, *, binding, adapter, timeout_seconds):
+        """Trusted in-process read adapter; persisted metadata never restores code."""
+        if (not re.fullmatch(r"container_[a-z_]{1,48}", name) or not callable(adapter)
+                or not binding or not 0 < timeout_seconds <= 30):
+            raise ValueError("Named, bounded controller read adapter and frozen binding required")
+        now = time.time()
+        entry = ToolRegistration("controller_"+name, name, "builtin", None, None, None,
+            description, dict(schema), "read_only", {"controller_binding": dict(binding)},
+            timeout_seconds, True, 1, now, now, adapter)
+        self._entries[name] = entry
+        return entry
+
     def discover_mcp(self, connection_id: str) -> list[ToolRegistration]:
         """Discover tools from a stored stdio MCP connection and make them callable."""
         if self.store is None:
@@ -199,7 +211,7 @@ class ToolRegistry:
             return
         for item in self.store.list_tool_registrations(enabled_only=True):
             adapter = None
-            if item["adapter_kind"] == "builtin":
+            if item["adapter_kind"] == "builtin" and not item.get("permission_requirements", {}).get("controller_binding"):
                 adapter = lambda args, _name=item["tool_name"], _executor=self.executor: getattr(
                     _executor, "execute"
                 )(_name, args)

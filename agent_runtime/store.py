@@ -4733,6 +4733,9 @@ class EventStore:
     ) -> dict[str, Any]:
         if adapter_kind not in {"builtin", "mcp"}:
             raise ValueError(f"Invalid adapter kind: {adapter_kind!r}")
+        if (permission_requirements or {}).get("controller_binding") and (
+                adapter_kind != "builtin" or effect_kind != "read_only"):
+            raise ValueError("Controller read adapters cannot declare side effects")
         if effect_kind not in {"read_only", "file_write", "idempotent", "unknown_write", "opaque"}:
             raise ValueError(f"Invalid effect kind: {effect_kind!r}")
         if timeout_seconds is not None and float(timeout_seconds) <= 0:
