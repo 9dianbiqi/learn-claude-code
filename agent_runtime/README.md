@@ -26,6 +26,12 @@ Agent task success and gold-control environment results. Run its example in a
 fresh output directory with `python -m agent_runtime.evaluation
 agent_runtime/evals/evaluation-v1.json NEW_OUTPUT_DIRECTORY`.
 
+An optional [Inspect AI offline adapter](docs/inspect-offline-adapter.md) verifies
+externally pinned bundles and imports projected outcomes into separate Inspect
+Tasks and logs, retaining unknowns and the source denominators. It performs no
+model generation or official evaluation. Install its separate pinned requirements
+to enable the adapter and its dedicated interoperability tests.
+
 ## Why this exists
 
 A basic coding-agent loop is easy to express:
