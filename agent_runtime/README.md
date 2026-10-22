@@ -19,6 +19,13 @@ The v0.3 development line remains intentionally local and single-repository.
 It is not a distributed workflow engine and does not claim generic exactly-once
 execution.
 
+The [offline evaluation system v1](docs/evaluation-system-v1.md) adds a separate
+executable evidence pipeline for new bounded scripted cases and pinned historical
+Agent/official archives. It preserves unknowns and separates Runtime checks,
+Agent task success and gold-control environment results. Run its example in a
+fresh output directory with `python -m agent_runtime.evaluation
+agent_runtime/evals/evaluation-v1.json NEW_OUTPUT_DIRECTORY`.
+
 ## Why this exists
 
 A basic coding-agent loop is easy to express:

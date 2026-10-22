@@ -1,0 +1,38 @@
+{
+  "schema_version": "evaluation-plan-v1",
+  "run_id": "evaluation-v1-example",
+  "cases": [
+    {
+      "id": "local-edit",
+      "mode": "scripted_runtime",
+      "files": {"sample.txt": "before"},
+      "model": [
+        {"tool": "read_file", "id": "read", "input": {"path": "sample.txt"}},
+        {"tool": "edit_file", "id": "edit", "input": {"path": "sample.txt", "old_text": "before", "new_text": "after"}},
+        {"text": "finished"}
+      ],
+      "checks": {"status": "completed", "files": {"sample.txt": "after"}}
+    },
+    {
+      "id": "write-safety",
+      "mode": "scripted_runtime",
+      "files": {"protected.txt": "original"},
+      "model": [
+        {"tool": "write_file", "id": "unread-write", "input": {"path": "protected.txt", "content": "unsafe"}}
+      ],
+      "checks": {"status": "needs_review", "files": {"protected.txt": "original"}}
+    },
+    {
+      "id": "persisted-response-recovery",
+      "mode": "scripted_runtime",
+      "files": {"sample.txt": "before"},
+      "fault_point": "after_model_response",
+      "model": [{"tool": "read_file", "id": "read", "input": {"path": "sample.txt"}}],
+      "recovery_model": [
+        {"tool": "edit_file", "id": "edit", "input": {"path": "sample.txt", "old_text": "before", "new_text": "after"}},
+        {"text": "recovered"}
+      ],
+      "checks": {"status": "completed", "files": {"sample.txt": "after"}}
+    }
+  ]
+}
