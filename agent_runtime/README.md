@@ -32,6 +32,11 @@ Tasks and logs, retaining unknowns and the source denominators. It performs no
 model generation or official evaluation. Install its separate pinned requirements
 to enable the adapter and its dedicated interoperability tests.
 
+The successor [controlled Runtime-as-Solver](docs/inspect-runtime-solver.md)
+executes real Runtime tool loops through Inspect's local mock model, retaining
+the existing completion Verifier and durable turn limits. Its focused regression
+and separate bound-container probe validate integration, not model repair ability.
+
 ## Why this exists
 
 A basic coding-agent loop is easy to express:

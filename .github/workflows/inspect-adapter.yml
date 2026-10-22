@@ -5,18 +5,28 @@ on:
     paths:
       - "agent_runtime/evaluation_bundle.py"
       - "agent_runtime/inspect_adapter.py"
+      - "agent_runtime/inspect_model_bridge.py"
+      - "agent_runtime/inspect_runtime_solver.py"
       - "agent_runtime/requirements-inspect.txt"
       - "agent_runtime/tests/test_evaluation_bundle.py"
       - "agent_runtime/tests/test_inspect_adapter.py"
+      - "agent_runtime/tests/test_inspect_model_bridge.py"
+      - "agent_runtime/tests/test_inspect_runtime_solver.py"
+      - "agent_runtime/evals/inspect-runtime-v1.json"
       - ".github/workflows/inspect-adapter.yml"
   pull_request:
     branches: [main]
     paths:
       - "agent_runtime/evaluation_bundle.py"
       - "agent_runtime/inspect_adapter.py"
+      - "agent_runtime/inspect_model_bridge.py"
+      - "agent_runtime/inspect_runtime_solver.py"
       - "agent_runtime/requirements-inspect.txt"
       - "agent_runtime/tests/test_evaluation_bundle.py"
       - "agent_runtime/tests/test_inspect_adapter.py"
+      - "agent_runtime/tests/test_inspect_model_bridge.py"
+      - "agent_runtime/tests/test_inspect_runtime_solver.py"
+      - "agent_runtime/evals/inspect-runtime-v1.json"
       - ".github/workflows/inspect-adapter.yml"
   workflow_dispatch:
 
@@ -43,11 +53,16 @@ jobs:
           cache-dependency-path: agent_runtime/requirements-inspect.txt
       - name: Install pinned optional adapter dependency
         run: python -m pip install -r agent_runtime/requirements-inspect.txt pytest pyyaml
-      - name: Validate real Inspect offline interoperability
+      - name: Initialize test evidence directory
+        # pytest --basetemp creates its leaf, not a missing parent directory.
+        run: python -c "from pathlib import Path; Path('.inspect_ci').mkdir(exist_ok=True)"
+      - name: Run Inspect import and Runtime solver suites
         run: >-
           python -m pytest
           agent_runtime/tests/test_evaluation_bundle.py
           agent_runtime/tests/test_inspect_adapter.py
+          agent_runtime/tests/test_inspect_model_bridge.py
+          agent_runtime/tests/test_inspect_runtime_solver.py
           -q --tb=short -p no:cacheprovider
           --basetemp=.inspect_ci/cases
           --junitxml=.inspect_ci/junit.xml

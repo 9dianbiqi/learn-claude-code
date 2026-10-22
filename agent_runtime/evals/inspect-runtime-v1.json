@@ -1,0 +1,102 @@
+{
+  "schema_version": "inspect-runtime-plan-v1",
+  "run_id": "inspect-runtime-controlled-v1",
+  "cases": [
+    {
+      "id": "edit-feedback",
+      "prompt": "Read answer.txt and replace before with after, then finish.",
+      "files": {"answer.txt": "before\n"},
+      "goal_files": {"answer.txt": "after\n"},
+      "max_turns": 4,
+      "model": [
+        {"tool": "read_file", "id": "read", "input": {"path": "answer.txt"}},
+        {"tool": "edit_file", "id": "edit", "input": {"path": "answer.txt", "old_text": "before", "new_text": "after"}, "expect_feedback": "before"},
+        {"text": "The fixture has been updated.", "expect_feedback": "Edited"}
+      ],
+      "checks": {"status": "completed", "files": {"answer.txt": "after\n"}}
+    },
+    {
+      "id": "early-stop",
+      "prompt": "Update answer.txt from before to after.",
+      "files": {"answer.txt": "before\n"},
+      "goal_files": {"answer.txt": "after\n"},
+      "max_turns": 2,
+      "model": [{"text": "Done without changing anything."}],
+      "checks": {"status": "failed", "files": {"answer.txt": "before\n"}}
+    },
+    {
+      "id": "declined",
+      "prompt": "Update answer.txt from before to after.",
+      "files": {"answer.txt": "before\n"},
+      "goal_files": {"answer.txt": "after\n"},
+      "max_turns": 2,
+      "model": [{"text": "TASK_GAVE_UP"}],
+      "checks": {"status": "failed", "files": {"answer.txt": "before\n"}}
+    },
+    {
+      "id": "turn-budget",
+      "prompt": "Update answer.txt from before to after.",
+      "files": {"answer.txt": "before\n"},
+      "goal_files": {"answer.txt": "after\n"},
+      "max_turns": 1,
+      "model": [
+        {"tool": "read_file", "id": "read", "input": {"path": "answer.txt"}},
+        {"text": "This response must not be requested."}
+      ],
+      "checks": {"status": "failed", "files": {"answer.txt": "before\n"}}
+    },
+    {
+      "id": "write-review",
+      "prompt": "Update answer.txt from before to after.",
+      "files": {"answer.txt": "before\n"},
+      "goal_files": {"answer.txt": "after\n"},
+      "max_turns": 2,
+      "model": [{"tool": "write_file", "id": "unread", "input": {"path": "answer.txt", "content": "after\n"}}],
+      "checks": {"status": "needs_review", "files": {"answer.txt": "before\n"}}
+    },
+    {
+      "id": "error-feedback",
+      "prompt": "Locate answer.txt and replace before with after.",
+      "files": {"answer.txt": "before\n"},
+      "goal_files": {"answer.txt": "after\n"},
+      "max_turns": 5,
+      "model": [
+        {"tool": "read_file", "id": "missing", "input": {"path": "guess.txt"}},
+        {"tool": "read_file", "id": "read", "input": {"path": "answer.txt"}, "expect_feedback": "PATH_NOT_FOUND"},
+        {"tool": "edit_file", "id": "edit", "input": {"path": "answer.txt", "old_text": "before", "new_text": "after"}},
+        {"text": "Updated after reading tool feedback."}
+      ],
+      "checks": {"status": "completed", "files": {"answer.txt": "after\n"}}
+    },
+    {
+      "id": "lost-response",
+      "prompt": "Read answer.txt and replace before with after.",
+      "files": {"answer.txt": "before\n"},
+      "goal_files": {"answer.txt": "after\n"},
+      "max_turns": 5,
+      "fault_point": "after_model_response_before_persist",
+      "model": [
+        {"tool": "read_file", "id": "lost-read", "input": {"path": "answer.txt"}},
+        {"tool": "read_file", "id": "retry-read", "input": {"path": "answer.txt"}},
+        {"tool": "edit_file", "id": "edit", "input": {"path": "answer.txt", "old_text": "before", "new_text": "after"}},
+        {"text": "Recovered and updated."}
+      ],
+      "checks": {"status": "completed", "files": {"answer.txt": "after\n"}}
+    },
+    {
+      "id": "persisted-write",
+      "prompt": "Read answer.txt and replace before with after.",
+      "files": {"answer.txt": "before\n"},
+      "goal_files": {"answer.txt": "after\n"},
+      "max_turns": 4,
+      "fault_point": "after_tool_persist",
+      "fault_tool_id": "edit",
+      "model": [
+        {"tool": "read_file", "id": "read", "input": {"path": "answer.txt"}},
+        {"tool": "edit_file", "id": "edit", "input": {"path": "answer.txt", "old_text": "before", "new_text": "after"}},
+        {"text": "Recovered a persisted write."}
+      ],
+      "checks": {"status": "completed", "files": {"answer.txt": "after\n"}}
+    }
+  ]
+}
