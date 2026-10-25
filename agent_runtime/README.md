@@ -1,5 +1,7 @@
 # Durable Agent Runtime
 
+Current development entry, branch ownership and release gates: [2026-10-23 closeout](docs/project-closeout-20261023.md).
+
 `agent_runtime` is a local execution layer for durable coding-agent tasks. It
 starts from the minimal agent-loop ideas taught by learn-claude-code, then adds
 the engineering mechanisms needed to recover, constrain, and audit a long-running
@@ -7,9 +9,35 @@ task: SQLite checkpoints, an append-only event log, tool-call deduplication,
 effect reservations, repository leases, permission policies, file conflict
 detection, traces, and deterministic regression evaluation.
 
-The v0.2 development line remains intentionally local and single-repository.
+An opt-in [completion contract and recovery advice prototype](docs/completion-recovery-contract.md)
+reuses existing Verifier authority for typed tasks. It is a successor experiment,
+not a modification or renewed acceptance of the frozen Phase 2 baseline.
+
+The [clean release snapshot and local checks](docs/release-readiness-20261017.md)
+describe the Runtime-only publication scope, cross-platform results, historical
+evidence identities and optional Docker fixture setup.
+
+The v0.3 development line remains intentionally local and single-repository.
 It is not a distributed workflow engine and does not claim generic exactly-once
 execution.
+
+The [offline evaluation system v1](docs/evaluation-system-v1.md) adds a separate
+executable evidence pipeline for new bounded scripted cases and pinned historical
+Agent/official archives. It preserves unknowns and separates Runtime checks,
+Agent task success and gold-control environment results. Run its example in a
+fresh output directory with `python -m agent_runtime.evaluation
+agent_runtime/evals/evaluation-v1.json NEW_OUTPUT_DIRECTORY`.
+
+An optional [Inspect AI offline adapter](docs/inspect-offline-adapter.md) verifies
+externally pinned bundles and imports projected outcomes into separate Inspect
+Tasks and logs, retaining unknowns and the source denominators. It performs no
+model generation or official evaluation. Install its separate pinned requirements
+to enable the adapter and its dedicated interoperability tests.
+
+The successor [controlled Runtime-as-Solver](docs/inspect-runtime-solver.md)
+executes real Runtime tool loops through Inspect's local mock model, retaining
+the existing completion Verifier and durable turn limits. Its focused regression
+and separate bound-container probe validate integration, not model repair ability.
 
 ## Why this exists
 
@@ -117,13 +145,150 @@ Non-read-only calls are represented by an Effect Ledger operation:
 read_file and glob remain replay-safe tool-call records without operations.
 File writes are reconcilable; Shell is opaque. A committed operation is
 deduplicated from its durable result. An unknown opaque operation is blocked
-until an operator uses resolve-call; arbitrary Shell commands are not claimed
-to be exactly-once.
+ until an operator uses resolve-call; arbitrary Shell commands are not claimed
+ to be exactly-once.
+
+## v0.3 Phase 1: Durable Memory, Context Projector, Plan Store
+
+Phase 1 (v0.3) upgrades the schema to v6 and adds durable long-horizon state:
+
+    memories, memory_links, summaries, plans, plan_items
+
+Before each model call, the runtime runs a read-only `ContextProjector` that
+builds a compact model view from the active plan item, memories, summaries, and
+recent review/failure evidence. The projection is never written back into
+`checkpoints.messages_json`; full conversation history remains the
+authoritative execution checkpoint, so recovery and tool/effect deduplication
+are unchanged.
+
+Plan items move through a lifecycle of
+
+    pending -> in_progress -> verifying -> completed
+                        \-> failed -> retryable
+
+and an item only becomes `completed` after a verifier supplies evidence. Trace
+summaries and JSONL exports now include projection token estimates and plan
+transition metrics.
+
+## v0.3 Phase 4: Tool Registry + MCP
+
+Phase 4 replaces the static tool map with a durable `ToolRegistry` and adds a
+real stdio MCP client. Built-in tools are registry entries, and discovered MCP
+tools are exposed as `mcp__<server>__<tool>` with schemas fed into model
+context and permission evaluation. Tool and connection metadata lives in
+`tool_registrations` and `mcp_connections`; MCP tokens are referenced by
+environment variable and never persisted.
+
+Manage connections:
+
+```powershell
+python -m agent_runtime mcp add `
+  --repo $sandbox `
+  --server github `
+  --endpoint docker `
+  --arg "run" --arg "-i" --arg "--rm" `
+  --arg "ghcr.io/github/github-mcp-server" `
+  --auth-token-env GITHUB_PERSONAL_ACCESS_TOKEN
+
+python -m agent_runtime mcp refresh --repo $sandbox
+python -m agent_runtime mcp list --repo $sandbox
+```
+
+`mcp refresh` launches each configured stdio server, registers its tools, and
+records `connected` or `error` status. GitHub uses the official
+`ghcr.io/github/github-mcp-server` image with a
+`GITHUB_PERSONAL_ACCESS_TOKEN` that has `repo`, `read:packages`, and `read:org`
+scopes. Add matching `allow` policy rules before the model may call MCP tools.
+
+## v0.3 frozen Exec-Full baseline
+
+The v0.3.0.dev4 baseline combines the durable memory/context, background
+jobs/Cron, subagent/mailbox/plan-approval, and ToolRegistry/stdio MCP phases.
+Execution checkpoints and full-history resume remain authoritative. The
+first-class verified-subtask ledger and semantic checkpointing layer are not
+implemented in this baseline and remain deferred to later work.
+
+The fixed review point for Ticket #6 is commit `a16f90e`; the Ticket #6
+implementation commit is the handoff point for subsequent work. See the
+[v0.3 execution docs](docs/v0.3/README.md) for the phase boundaries and
+verification commands.
+
+## v0.3 Recovery Baseline
+
+The accepted Recovery Baseline extends the frozen Exec-Full runtime with
+verifier-gated subtask completion, frozen-DAG recovery, stale-evidence refresh,
+and fixed-budget Verified-Scoped resume. It uses package version
+`0.3.0.dev8` and schema version `v12`.
+
+The accepted code point is commit `bc886fc`, recorded by the annotated tag
+`agent-runtime-recovery-code-accepted-2026-09-05`. The tag is the immutable
+research comparison point; product development continues from the separate
+`codex/long-horizon-agent-v1-bootstrap` line.
+
+The Recovery Baseline deliberately keeps the DAG frozen. Dynamic plan
+revision, automatic decomposition, recovery routing, workspace recovery, stuck
+detection, model routing, and human escalation belong to the Long-Horizon
+Agent product line rather than this baseline.
+
+## Long-Horizon Agent C1a: Immutable Plan Revisions
+
+Product development after the frozen Recovery Baseline uses package version
+`0.3.0.dev9` and schema version `v13`. A Plan keeps a stable identity and a
+current PlanRevision pointer; every accepted PlanPatch appends an immutable DAG
+snapshot and switches that pointer with compare-and-swap in the same
+transaction. Completing a dependency satisfies its edge without deleting it.
+
+The public mutation seam is `Runtime.apply_plan_patch(task_id,
+expected_revision_id, patch)`. Initial typed operations add a pending PlanItem,
+split a failed or retryable PlanItem, update dependencies among non-completed
+PlanItems, and tombstone an eligible pending PlanItem. Automatic patch
+generation and resume across revised plans remain outside C1a.
+
+## Long-Horizon Agent C1b: Durable Plan Revision Resume
+
+C1b uses package version `0.3.0.dev10` and schema v14. Independent Standards/Spec
+review passed with no C1b blockers. `plans.current_revision_id` remains the latest
+accepted structure; `tasks.execution_plan_revision_id` records the revision
+acknowledged by execution. A PlanPatch changes only the former.
+
+To resume a revised verified DAG, construct `Runtime` with the exact current
+`VerifiedSubtaskDAGConfig`, including active item order, dependencies, budgets,
+and verifier bundles, then call `resume(task_id)`. Missing or stale configuration
+fails closed. Matching configuration advances the execution pointer in one
+leased transaction with an activation event and any eligible failed-plan
+reopening. Completed items and tombstoned history remain intact.
+
+Existing databases require explicit `db-migrate`. The migration binds revision
+0 of the latest Plan, including when later revisions already exist: migration
+does not acknowledge those revisions on the caller's behalf. Ordinary frozen
+DAG recovery and existing stale-evidence/effect-ledger rules still apply.
+
+See [C1b contract and validation](docs/c1b-durable-plan-revision-resume.md).
+
+## Long-Horizon Agent C1c: Recovery / Plan Revision Controller
+
+C1c uses package version `0.3.0.dev11` and schema v15. Independent Standards/Spec
+review passed; product integration and acceptance tagging remain pending.
+A deterministic controller consumes a task-owned durable
+failure signal and records exactly one decision. KEEP, RETRY and FAIL preserve
+the PlanRevision; SPLIT, ADD_ITEM, CHANGE_DEPENDENCY and TOMBSTONE_PENDING use
+the existing typed PlanPatch operations. A structural decision and its revision
+commit in one transaction. Exact verifier capabilities are required for the
+proposed active DAG; C1b remains responsible for activation, recovery and
+execution selection.
+
+The fixed C1c evaluation suite is `evals/c1c-replanning.yaml`:
+
+```powershell
+python -m agent_runtime eval --suite evals/c1c-replanning.yaml --runs $env:TEMP\c1c-eval
+```
+
+See [C1c scope and acceptance contract](docs/c1c-adaptive-replanning-controller.md).
 
 ## Requirements
 
 - Python 3.11+
-- `anthropic`, `python-dotenv`, and `PyYAML`
+- `anthropic`, `mcp`, `python-dotenv`, and `PyYAML`
 - `pytest` for the test suite
 
 Install dependencies from the repository root:
@@ -294,11 +459,13 @@ Release-oriented changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## Scope boundaries
 
-Deferred beyond Phase 1:
+The v0.3 Recovery Baseline remains local and single-repository. First-class
+verified-subtask checkpoints and semantic ledger state, which the earlier
+frozen Exec-Full v0.3.0.dev4 baseline deferred, are included in v0.3.0.dev8.
+The following remain deferred beyond the Recovery Baseline:
 
-- worktree-based parallel execution;
-- background scheduling and Cron;
-- MCP and sub-agent orchestration;
+- lane-aware worktree-based parallel execution;
+- retention/GC and the v0.3 release-gate hardening phase;
 - distributed or multi-machine coordination;
 - a full OS-level Shell sandbox;
 - OpenTelemetry and visual dashboards;
@@ -317,7 +484,10 @@ system sandbox.
 agent_runtime/
   runtime.py       durable loop and recovery
   store.py         SQLite projections, transactions, leases, and ledger API
-  migrations.py    explicit v4-to-v5 schema migration and backup framework
+  migrations.py    explicit v4-to-v15 schema migrations and backup framework
+  projector.py     read-only context projector (memories, summaries, plans)
+  mcp_client.py    stdio MCP discovery, invocation, timeout, and auth reference
+  tool_registry.py durable built-in + MCP tool registry
   effects.py       EffectSemantics and operation specifications
   permissions.py   allow/ask/deny evaluation
   tools.py         repository tools and file safety

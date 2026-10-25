@@ -6,12 +6,27 @@ import os
 import re
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from .effects import EffectSemantics, OperationSpec, ReconcileEvidence, sha256_json
 from .migrations import SCHEMA_VERSION, SchemaManager, _legacy_projection_violations
+from .models import PlanPatch, PlanRevision, PlanRevisionItem, is_valid_sha256
+from .read_budget import ControllerReadBudget, ControllerReadBudgetExhausted
+from .plan_revisions import (
+    PlanPatchError,
+    apply_patch as derive_plan_revision,
+    canonical_json as canonical_plan_json,
+    dag_hash as plan_dag_hash,
+    decode_snapshot,
+    initial_patch_hash,
+    patch_hash as plan_patch_hash,
+    revision_id as make_plan_revision_id,
+    revision_snapshot,
+    validate_snapshot,
+)
 
 
 MAX_CHECKPOINT_BYTES = 4 * 1024 * 1024
@@ -51,6 +66,40 @@ def _safe_reason(value: str) -> str:
         lambda match: f"{match.group(1)}=[REDACTED]",
         str(value)[:256],
     )
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _cron_interval_seconds(expression: str) -> int:
+    """Return a periodic boundary for supported 5-field cron expressions.
+
+    Timezone, calendar, day-of-month, and day-of-week expansion is out of
+    scope for Phase 2; only the coarsest recurring unit is honored so a
+    schedule can be triggered at a stable, durable boundary.
+    """
+    fields = str(expression).split()
+    if len(fields) != 5:
+        return 60
+
+    def step(field: str) -> int | None:
+        if field == "*":
+            return 1
+        if field.startswith("*/"):
+            try:
+                return max(1, int(field[2:]))
+            except ValueError:
+                return None
+        return None
+
+    minute_step = step(fields[0])
+    if minute_step is not None:
+        return 60 * minute_step
+    hour_step = step(fields[1])
+    if hour_step is not None:
+        return 3600 * hour_step
+    return 60
 
 
 class LeaseLost(RuntimeError):
@@ -149,6 +198,21 @@ class EventStore:
         try:
             conn.execute("BEGIN")
             self._assert_lease_conn(conn)
+        finally:
+            conn.rollback()
+            conn.close()
+
+    def current_lease_identity(self) -> dict[str, Any]:
+        """Read the bound, live lease identity for a trusted external verifier."""
+        if self._lease_context is None:
+            raise LeaseLost("No bound verification lease")
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            self._assert_lease_conn(conn)
+            row = conn.execute("SELECT repo_root, task_id, owner_id, fencing_token FROM leases "
+                               "WHERE repo_root = ?", (self._lease_context[0],)).fetchone()
+            return dict(row)
         finally:
             conn.rollback()
             conn.close()
@@ -339,7 +403,7 @@ class EventStore:
         metadata["reason"] = safe_reason
         with self.transaction() as conn:
             task = conn.execute(
-                "SELECT status, version FROM tasks WHERE task_id = ?", (task_id,)
+                "SELECT status, version, checkpoint_id FROM tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
             call = conn.execute(
                 "SELECT status, version FROM tool_calls WHERE task_id = ? AND tool_use_id = ?",
@@ -351,6 +415,12 @@ class EventStore:
             ).fetchone()
             if task is None or call is None:
                 raise KeyError(f"Review item not found: {tool_use_id}")
+            if "active_subtask_id" not in cursor:
+                previous = conn.execute("SELECT cursor_json FROM checkpoints WHERE checkpoint_id=? AND task_id=?",
+                                        (task['checkpoint_id'], task_id)).fetchone()
+                owner = _loads(previous['cursor_json'], {}).get('active_subtask_id') if previous else None
+                if owner:
+                    cursor_json = _checked_json({**cursor, 'active_subtask_id': owner}, MAX_CHECKPOINT_BYTES, 'checkpoint cursor')
             if task["status"] in {"completed", "failed", "aborted"}:
                 raise StaleState(f"Task is terminal during review transition: {task_id}")
             if call["status"] in {"succeeded", "denied", "failed", "aborted"}:
@@ -525,7 +595,7 @@ class EventStore:
         messages_json = _checked_json(messages, MAX_CHECKPOINT_BYTES, "checkpoint messages")
         cursor_json = _checked_json(cursor, MAX_CHECKPOINT_BYTES, "checkpoint cursor")
         with self.transaction() as conn:
-            task = conn.execute("SELECT status FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+            task = conn.execute("SELECT status, version FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
             if task is None:
                 raise KeyError(f"Task not found: {task_id}")
             if task["status"] in {"completed", "failed", "aborted"}:
@@ -546,12 +616,179 @@ class EventStore:
             )
             conn.execute(
                 "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'task_failed', ?, ?)",
-                (task_id, _checked_json({"error": error}, MAX_EVENT_PAYLOAD_BYTES, "event payload"), now),
+                (task_id, _checked_json(
+                    self._task_failure_payload_conn(conn, task_id, error, int(task["version"]) + 1),
+                    MAX_EVENT_PAYLOAD_BYTES, "event payload",
+                ), now),
             )
             conn.execute(
                 "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'checkpoint_saved', ?, ?)",
                 (task_id, _checked_json({"checkpoint_id": checkpoint_id, "phase": "failed"}, MAX_EVENT_PAYLOAD_BYTES, "event payload"), now),
             )
+        return checkpoint_id
+
+    @staticmethod
+    def _task_failure_payload_conn(
+        conn: sqlite3.Connection, task_id: str, error: str, observed_version: int
+    ) -> dict[str, Any]:
+        plan = conn.execute(
+            "SELECT current_revision_id FROM plans WHERE task_id = ? "
+            "ORDER BY plan_id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        return {
+            "error": error,
+            "observed_revision_id": plan["current_revision_id"] if plan else None,
+            "observed_task_version": observed_version,
+        }
+
+    def _fail_task_conn(self, conn: sqlite3.Connection, task_id: str, error: str) -> int:
+        """Use the existing failure shape within a controller-owned transaction."""
+        task = conn.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+        if task is None:
+            raise KeyError(f"Task not found: {task_id}")
+        if task["status"] in {"completed", "aborted"}:
+            raise InvariantViolation(f"Cannot fail terminal task: {task_id}")
+        if task["status"] == "failed":
+            return int(task["checkpoint_id"])
+        previous = conn.execute(
+            "SELECT * FROM checkpoints WHERE checkpoint_id = ? AND task_id = ?",
+            (task["checkpoint_id"], task_id),
+        ).fetchone()
+        if previous is None:
+            raise InvariantViolation(f"Missing task checkpoint: {task_id}")
+        now = _now()
+        conn.execute(
+            "UPDATE tool_calls SET status = 'failed', error = ?, finished_at = ?, version = version + 1 "
+            "WHERE task_id = ? AND status = 'running'", (error, now, task_id),
+        )
+        saved = conn.execute(
+            "INSERT INTO checkpoints(task_id, phase, messages_json, cursor_json, created_at) "
+            "VALUES (?, 'failed', ?, ?, ?)",
+            (task_id, previous["messages_json"], previous["cursor_json"], now),
+        )
+        checkpoint_id = int(saved.lastrowid)
+        updated = conn.execute(
+            "UPDATE tasks SET status = 'failed', checkpoint_id = ?, last_error = ?, "
+            "updated_at = ?, version = version + 1 WHERE task_id = ? AND version = ?",
+            (checkpoint_id, error, now, task_id, task["version"]),
+        )
+        if updated.rowcount != 1:
+            raise StaleState(f"Task changed during failure decision: {task_id}")
+        self._emit_conn(conn, task_id, "task_failed", self._task_failure_payload_conn(
+            conn, task_id, error, int(task["version"]) + 1,
+        ))
+        self._emit_conn(conn, task_id, "checkpoint_saved",
+                        {"checkpoint_id": checkpoint_id, "phase": "failed"})
+        return checkpoint_id
+
+    def list_replan_decisions(self, task_id: str) -> list[dict[str, Any]]:
+        return [dict(row) for row in self._fetchall(
+            "SELECT * FROM replan_decisions WHERE task_id = ? ORDER BY decision_id", (task_id,),
+        )]
+
+    def fail_plan_item_and_task(
+        self,
+        task_id: str,
+        plan_item_id: int,
+        messages: list[dict],
+        cursor: dict[str, Any],
+        error: str,
+        *,
+        budget_exhausted: bool = True,
+        fault_injector: Callable[..., None] | None = None,
+    ) -> int:
+        """Atomically fail a DAG item and its task after a durable budget boundary."""
+        now = _now()
+        messages_json = _checked_json(messages, MAX_CHECKPOINT_BYTES, "checkpoint messages")
+        cursor_json = _checked_json(cursor, MAX_CHECKPOINT_BYTES, "checkpoint cursor")
+        with self.transaction() as conn:
+            task = conn.execute(
+                "SELECT status, version, checkpoint_id FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise KeyError(f"Task not found: {task_id}")
+            if task["status"] in {"completed", "failed", "aborted"}:
+                return int(task["checkpoint_id"])
+            item = self._plan_call(conn, plan_item_id)
+            if str(item["task_id"]) != task_id:
+                raise InvariantViolation(f"Plan item {plan_item_id} does not belong to task {task_id}")
+            if item["status"] == "completed":
+                raise StaleState(f"Plan item completed before budget failure: {plan_item_id}")
+            conn.execute(
+                "UPDATE tool_calls SET status = 'failed', error = ?, finished_at = ?, version = version + 1 "
+                "WHERE task_id = ? AND status = 'running'",
+                (error, now, task_id),
+            )
+            item_updated = conn.execute(
+                "UPDATE plan_items SET status = 'failed', evidence_hash = NULL, "
+                "version = version + 1, updated_at = ? "
+                "WHERE plan_item_id = ? AND version = ? AND status != 'completed'",
+                (now, plan_item_id, int(item["version"])),
+            )
+            if item_updated.rowcount != 1:
+                raise StaleState(f"Plan item changed during budget failure: {plan_item_id}")
+            if fault_injector:
+                fault_injector("contract_failure_after_item", task_id=task_id)
+            conn.execute(
+                "UPDATE plans SET status = 'failed', updated_at = ? WHERE plan_id = ?",
+                (now, item["plan_id"]),
+            )
+            checkpoint = conn.execute(
+                "INSERT INTO checkpoints(task_id, phase, messages_json, cursor_json, created_at) "
+                "VALUES (?, 'failed', ?, ?, ?)",
+                (task_id, messages_json, cursor_json, now),
+            )
+            checkpoint_id = int(checkpoint.lastrowid)
+            if fault_injector:
+                fault_injector("contract_failure_after_checkpoint", task_id=task_id)
+            task_updated = conn.execute(
+                "UPDATE tasks SET status = 'failed', checkpoint_id = ?, last_error = ?, "
+                "updated_at = ?, version = version + 1 WHERE task_id = ? AND version = ?",
+                (checkpoint_id, error, now, task_id, int(task["version"])),
+            )
+            if task_updated.rowcount != 1:
+                raise StaleState(f"Task changed during budget failure: {task_id}")
+            conn.execute(
+                "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'plan_item_failed', ?, ?)",
+                (
+                    task_id,
+                    _checked_json(
+                        {
+                            "plan_item_id": plan_item_id,
+                            "subtask_id": item["subtask_id"],
+                            "from": item["status"],
+                            "reason": error,
+                            "budget_exhausted": budget_exhausted,
+                            "observed_revision_id": conn.execute(
+                                "SELECT current_revision_id FROM plans WHERE plan_id = ?",
+                                (item["plan_id"],),
+                            ).fetchone()[0],
+                            "observed_item_version": int(item["version"]) + 1,
+                        },
+                        MAX_EVENT_PAYLOAD_BYTES,
+                        "event payload",
+                    ),
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'task_failed', ?, ?)",
+                (task_id, _checked_json(
+                    self._task_failure_payload_conn(conn, task_id, error, int(task["version"]) + 1),
+                    MAX_EVENT_PAYLOAD_BYTES, "event payload",
+                ), now),
+            )
+            conn.execute(
+                "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, 'checkpoint_saved', ?, ?)",
+                (
+                    task_id,
+                    _checked_json({"checkpoint_id": checkpoint_id, "phase": "failed"}, MAX_EVENT_PAYLOAD_BYTES, "event payload"),
+                    now,
+                ),
+            )
+            if fault_injector:
+                fault_injector("contract_failure_before_commit", task_id=task_id)
         return checkpoint_id
 
     def recover_model_checkpoint(self, task_id: str) -> dict[str, Any] | None:
@@ -576,11 +813,19 @@ class EventStore:
             response = _loads(latest["response_json"], {})
             content = list(response.get("content") or [])
             messages = _loads(current["messages_json"], [])
-            if messages and messages[-1].get("role") == "assistant":
+            request = _loads(latest["request_json"], {})
+            if (
+                messages
+                and messages[-1].get("role") == "assistant"
+                and request.get("messages") != messages
+            ):
                 return None
             messages.append({"role": "assistant", "content": content})
             cursor = _loads(current["cursor_json"], {})
             cursor["turn"] = int(latest["turn"])
+            active_subtask_id = request.get("active_subtask_id")
+            if active_subtask_id:
+                cursor["active_subtask_id"] = str(active_subtask_id)
             messages_json = _checked_json(messages, MAX_CHECKPOINT_BYTES, "checkpoint messages")
             cursor_json = _checked_json(cursor, MAX_CHECKPOINT_BYTES, "checkpoint cursor")
             now = _now()
@@ -865,12 +1110,20 @@ class EventStore:
             result.append(item)
         return result
 
-    def create_model_call(self, task_id: str, turn: int, request: dict[str, Any]) -> int:
+    def create_model_call(self, task_id: str, turn: int, request: dict[str, Any],
+                          source_checkpoint_id: int | None = None,
+                          projection: dict[str, Any] | None = None) -> int:
         request_json = _checked_json(request, MAX_CHECKPOINT_BYTES, "model request")
+        projection_json = (
+            _checked_json(projection, MAX_CHECKPOINT_BYTES, "model projection")
+            if projection is not None else None
+        )
         with self.transaction() as conn:
             cursor = conn.execute(
-                "INSERT INTO model_calls(task_id, turn, status, request_json, started_at) VALUES (?, ?, 'started', ?, ?)",
-                (task_id, turn, request_json, _now()),
+                "INSERT INTO model_calls(task_id, turn, status, request_json, "
+                "source_checkpoint_id, projection_json, started_at) "
+                "VALUES (?, ?, 'started', ?, ?, ?, ?)",
+                (task_id, turn, request_json, source_checkpoint_id, projection_json, _now()),
             )
             return int(cursor.lastrowid)
 
@@ -916,6 +1169,7 @@ class EventStore:
         item = dict(row)
         item["request"] = _loads(item.pop("request_json"), {})
         item["response"] = _loads(item.pop("response_json"), None)
+        item["projection"] = _loads(item.pop("projection_json"), None)
         return item
 
     def list_model_calls(self, task_id: str) -> list[dict[str, Any]]:
@@ -925,8 +1179,1726 @@ class EventStore:
             item = dict(row)
             item["request"] = _loads(item.pop("request_json"), {})
             item["response"] = _loads(item.pop("response_json"), None)
+            item["projection"] = _loads(item.pop("projection_json"), None)
             result.append(item)
         return result
+
+    def add_memory(self, task_id: str, kind: str, content: str,
+                   source_checkpoint_id: int | None = None,
+                   evidence_hash: str | None = None,
+                   expires_at: float | None = None) -> int:
+        now = _now()
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "INSERT INTO memories(task_id, kind, content, source_checkpoint_id, "
+                "evidence_hash, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (task_id, kind, content, source_checkpoint_id, evidence_hash, now, expires_at),
+            )
+            return int(cursor.lastrowid)
+
+    def list_memories(self, task_id: str | None = None, kind: str | None = None,
+                      include_expired: bool = False) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if not include_expired:
+            clauses.append("(expires_at IS NULL OR expires_at > ?)")
+            params.append(_now())
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._fetchall(
+            f"SELECT * FROM memories{where} ORDER BY created_at, memory_id",
+            tuple(params),
+        )
+        return [dict(row) for row in rows]
+
+    def link_memories(self, source_memory_id: int, target_memory_id: int, relation: str) -> None:
+        if source_memory_id == target_memory_id:
+            raise ValueError("memory cannot link to itself")
+        with self.transaction() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO memory_links(source_memory_id, target_memory_id, "
+                "relation, created_at) VALUES (?, ?, ?, ?)",
+                (source_memory_id, target_memory_id, relation, _now()),
+            )
+
+    def list_memory_links(self, memory_id: int | None = None) -> list[dict[str, Any]]:
+        if memory_id is None:
+            rows = self._fetchall("SELECT * FROM memory_links ORDER BY source_memory_id, target_memory_id, relation")
+        else:
+            rows = self._fetchall(
+                "SELECT * FROM memory_links WHERE source_memory_id = ? OR target_memory_id = ? "
+                "ORDER BY source_memory_id, target_memory_id, relation",
+                (memory_id, memory_id),
+            )
+        return [dict(row) for row in rows]
+
+    def add_summary(self, task_id: str, scope: str, content: str,
+                    source_turn_range: tuple[int, int] | None = None,
+                    evidence_hash: str | None = None,
+                    model_call_id: int | None = None) -> int:
+        now = _now()
+        turn_json = _checked_json(
+            {"start": source_turn_range[0], "end": source_turn_range[1]}
+            if source_turn_range is not None else None,
+            MAX_CHECKPOINT_BYTES,
+            "summary turn range",
+        )
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "INSERT INTO summaries(task_id, scope, content, source_turn_range, "
+                "evidence_hash, model_call_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (task_id, scope, content, turn_json, evidence_hash, model_call_id, now),
+            )
+            return int(cursor.lastrowid)
+
+    def list_summaries(self, task_id: str | None = None,
+                       scope: str | None = None) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if scope is not None:
+            clauses.append("scope = ?")
+            params.append(scope)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._fetchall(
+            f"SELECT * FROM summaries{where} ORDER BY created_at, summary_id",
+            tuple(params),
+        )
+        result = []
+        for row in rows:
+            item = dict(row)
+            turn_range = _loads(item.pop("source_turn_range"), None)
+            item["source_turn_range"] = (
+                (turn_range.get("start"), turn_range.get("end"))
+                if isinstance(turn_range, dict) else None
+            )
+            result.append(item)
+        return result
+
+    def create_plan(self, task_id: str, subtasks: list[dict[str, Any]],
+                    dag_hash: str | None = None, status: str = "active") -> int:
+        now = _now()
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "INSERT INTO plans(task_id, status, dag_hash, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (task_id, status, dag_hash, now, now),
+            )
+            plan_id = int(cursor.lastrowid)
+            for subtask in subtasks:
+                blocked_by = _checked_json(
+                    subtask.get("blocked_by", []),
+                    MAX_CHECKPOINT_BYTES,
+                    "plan blocked_by",
+                )
+                max_turns = subtask.get("max_turns", 1)
+                if isinstance(max_turns, bool) or not isinstance(max_turns, int) or max_turns < 1:
+                    raise ValueError("plan item max_turns must be a positive integer")
+                conn.execute(
+                    "INSERT INTO plan_items(plan_id, subtask_id, description, status, "
+                    "blocked_by_json, verifier_bundle_hash, max_turns, consumed_turns, "
+                    "version, created_at, updated_at) "
+                    "VALUES (?, ?, ?, 'pending', ?, ?, ?, 0, 0, ?, ?)",
+                    (
+                        plan_id,
+                        subtask["subtask_id"],
+                        subtask.get("description", ""),
+                        blocked_by,
+                        subtask.get("verifier_bundle_hash"),
+                        max_turns,
+                        now,
+                        now,
+                    ),
+                )
+            revision = self._create_initial_plan_revision_conn(
+                conn,
+                plan_id=plan_id,
+                task_id=task_id,
+                reason="initial_plan",
+                trigger="runtime",
+                created_at=now,
+            )
+            conn.execute(
+                "UPDATE tasks SET execution_plan_revision_id = ?, "
+                "version = version + 1, updated_at = ? WHERE task_id = ?",
+                (revision.revision_id, now, task_id),
+            )
+            return plan_id
+
+    @staticmethod
+    def _plan_revision_items_from_rows(rows: list[sqlite3.Row]) -> tuple[PlanRevisionItem, ...]:
+        return tuple(
+            PlanRevisionItem(
+                subtask_id=str(row["subtask_id"]),
+                description=str(row["description"]),
+                blocked_by=tuple(str(value) for value in _loads(row["blocked_by_json"], [])),
+                verifier_bundle_hash=(
+                    str(row["verifier_bundle_hash"])
+                    if row["verifier_bundle_hash"] is not None
+                    else None
+                ),
+                max_turns=int(row["max_turns"]),
+                tombstoned=bool(row["tombstoned"]),
+            )
+            for row in rows
+        )
+
+    def _create_initial_plan_revision_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        plan_id: int,
+        task_id: str,
+        reason: str,
+        trigger: str,
+        created_at: float,
+    ) -> PlanRevision:
+        rows = conn.execute(
+            "SELECT subtask_id, description, blocked_by_json, verifier_bundle_hash, "
+            "max_turns, tombstoned FROM plan_items WHERE plan_id = ? ORDER BY plan_item_id",
+            (plan_id,),
+        ).fetchall()
+        items = self._plan_revision_items_from_rows(rows)
+        validate_snapshot(items)
+        patch_digest = initial_patch_hash(reason=reason, trigger=trigger)
+        dag_digest = plan_dag_hash(items)
+        revision = make_plan_revision_id(
+            task_id=task_id,
+            plan_id=plan_id,
+            parent_revision_id=None,
+            revision_number=0,
+            dag_digest=dag_digest,
+            patch_digest=patch_digest,
+        )
+        conn.execute(
+            "INSERT INTO plan_revisions("
+            "revision_id, plan_id, task_id, parent_revision_id, revision_number, "
+            "dag_hash, patch_hash, reason, trigger, evidence_refs_json, snapshot_json, created_at"
+            ") VALUES (?, ?, ?, NULL, 0, ?, ?, ?, ?, '[]', ?, ?)",
+            (
+                revision,
+                plan_id,
+                task_id,
+                dag_digest,
+                patch_digest,
+                reason,
+                trigger,
+                _checked_json(revision_snapshot(items), MAX_CHECKPOINT_BYTES, "plan revision snapshot"),
+                created_at,
+            ),
+        )
+        updated = conn.execute(
+            "UPDATE plans SET current_revision_id = ?, updated_at = ? "
+            "WHERE plan_id = ? AND current_revision_id IS NULL",
+            (revision, created_at, plan_id),
+        )
+        if updated.rowcount != 1:
+            raise StaleState(f"Plan already has a current revision: {plan_id}")
+        return PlanRevision(
+            revision_id=revision,
+            plan_id=plan_id,
+            task_id=task_id,
+            parent_revision_id=None,
+            revision_number=0,
+            dag_hash=dag_digest,
+            patch_hash=patch_digest,
+            reason=reason,
+            trigger=trigger,
+            evidence_refs=(),
+            items=items,
+            created_at=created_at,
+        )
+
+    @staticmethod
+    def _decode_plan_revision(row: sqlite3.Row | None) -> PlanRevision | None:
+        if row is None:
+            return None
+        return PlanRevision(
+            revision_id=str(row["revision_id"]),
+            plan_id=int(row["plan_id"]),
+            task_id=str(row["task_id"]),
+            parent_revision_id=(
+                str(row["parent_revision_id"])
+                if row["parent_revision_id"] is not None
+                else None
+            ),
+            revision_number=int(row["revision_number"]),
+            dag_hash=str(row["dag_hash"]),
+            patch_hash=str(row["patch_hash"]),
+            reason=str(row["reason"]),
+            trigger=str(row["trigger"]),
+            evidence_refs=tuple(str(value) for value in _loads(row["evidence_refs_json"], [])),
+            items=decode_snapshot(str(row["snapshot_json"])),
+            created_at=float(row["created_at"]),
+        )
+
+    def get_current_plan_revision(self, task_id: str) -> PlanRevision:
+        row = self._fetchone(
+            "SELECT r.* FROM plans p JOIN plan_revisions r "
+            "ON r.revision_id = p.current_revision_id "
+            "WHERE p.task_id = ? ORDER BY p.plan_id DESC LIMIT 1",
+            (task_id,),
+        )
+        revision = self._decode_plan_revision(row)
+        if revision is None:
+            raise KeyError(f"Task has no current PlanRevision: {task_id}")
+        return revision
+
+    def list_plan_revisions(self, task_id: str) -> list[PlanRevision]:
+        rows = self._fetchall(
+            "SELECT * FROM plan_revisions WHERE task_id = ? "
+            "ORDER BY plan_id, revision_number",
+            (task_id,),
+        )
+        return [revision for row in rows if (revision := self._decode_plan_revision(row)) is not None]
+
+    def apply_plan_patch(
+        self,
+        task_id: str,
+        expected_revision_id: str,
+        patch: PlanPatch,
+        *,
+        fault_injector: Callable[..., None] | None = None,
+    ) -> PlanRevision:
+        if not isinstance(patch, PlanPatch):
+            raise TypeError("patch must be a PlanPatch")
+        with self.transaction() as conn:
+            result = self._apply_plan_patch_conn(
+                conn, task_id, expected_revision_id, patch, fault_injector=fault_injector,
+            )
+        if fault_injector:
+            fault_injector(
+                "plan_patch_after_commit", task_id=task_id,
+                revision_id=result.revision_id,
+            )
+        return result
+
+    def _apply_plan_patch_conn(
+        self,
+        conn: sqlite3.Connection,
+        task_id: str,
+        expected_revision_id: str,
+        patch: PlanPatch,
+        *,
+        fault_injector: Callable[..., None] | None = None,
+    ) -> PlanRevision:
+        """Apply the existing C1a PlanPatch inside a caller-owned transaction."""
+        if not isinstance(patch, PlanPatch):
+            raise TypeError("patch must be a PlanPatch")
+        now = _now()
+        plan = conn.execute(
+            "SELECT * FROM plans WHERE task_id = ? ORDER BY plan_id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if plan is None:
+            raise KeyError(f"Task has no Plan: {task_id}")
+        if plan["status"] in {"completed", "superseded"}:
+            raise PlanPatchError(f"Plan cannot be patched from status {plan['status']}")
+        current_revision_id = plan["current_revision_id"]
+        if current_revision_id != expected_revision_id:
+            raise StaleState(
+                f"Plan revision changed: expected {expected_revision_id}, "
+                f"current {current_revision_id}"
+            )
+        current_row = conn.execute(
+            "SELECT * FROM plan_revisions WHERE revision_id = ? AND plan_id = ?",
+            (expected_revision_id, int(plan["plan_id"])),
+        ).fetchone()
+        current_revision = self._decode_plan_revision(current_row)
+        if current_revision is None:
+            raise InvariantViolation(f"Current PlanRevision is missing: {expected_revision_id}")
+        item_rows = conn.execute(
+            "SELECT * FROM plan_items WHERE plan_id = ? ORDER BY plan_item_id",
+            (int(plan["plan_id"]),),
+        ).fetchall()
+        statuses = {str(row["subtask_id"]): str(row["status"]) for row in item_rows}
+        next_items = derive_plan_revision(current_revision.items, statuses, patch)
+        patch_digest = plan_patch_hash(patch)
+        dag_digest = plan_dag_hash(next_items)
+        revision_number = current_revision.revision_number + 1
+        next_revision_id = make_plan_revision_id(
+            task_id=task_id,
+            plan_id=int(plan["plan_id"]),
+            parent_revision_id=current_revision.revision_id,
+            revision_number=revision_number,
+            dag_digest=dag_digest,
+            patch_digest=patch_digest,
+        )
+
+        before = {item.subtask_id: item for item in current_revision.items}
+        for item in next_items:
+            previous = before.get(item.subtask_id)
+            if previous is None:
+                conn.execute(
+                    "INSERT INTO plan_items("
+                    "plan_id, subtask_id, description, status, blocked_by_json, "
+                    "verifier_bundle_hash, max_turns, consumed_turns, tombstoned, "
+                    "version, created_at, updated_at"
+                    ") VALUES (?, ?, ?, 'pending', ?, ?, ?, 0, 0, 0, ?, ?)",
+                    (
+                        int(plan["plan_id"]),
+                        item.subtask_id,
+                        item.description,
+                        _checked_json(list(item.blocked_by), MAX_CHECKPOINT_BYTES, "plan blocked_by"),
+                        item.verifier_bundle_hash,
+                        item.max_turns,
+                        now,
+                        now,
+                    ),
+                )
+                continue
+            if previous.blocked_by != item.blocked_by or previous.tombstoned != item.tombstoned:
+                updated_item = conn.execute(
+                    "UPDATE plan_items SET blocked_by_json = ?, tombstoned = ?, "
+                    "version = version + 1, updated_at = ? "
+                    "WHERE plan_id = ? AND subtask_id = ? AND version = ?",
+                    (
+                        _checked_json(list(item.blocked_by), MAX_CHECKPOINT_BYTES, "plan blocked_by"),
+                        int(item.tombstoned),
+                        now,
+                        int(plan["plan_id"]),
+                        item.subtask_id,
+                        int(next(row["version"] for row in item_rows if row["subtask_id"] == item.subtask_id)),
+                    ),
+                )
+                if updated_item.rowcount != 1:
+                    raise StaleState(f"PlanItem changed during PlanPatch: {item.subtask_id}")
+
+        conn.execute(
+            "INSERT INTO plan_revisions("
+            "revision_id, plan_id, task_id, parent_revision_id, revision_number, "
+            "dag_hash, patch_hash, reason, trigger, evidence_refs_json, snapshot_json, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                next_revision_id,
+                int(plan["plan_id"]),
+                task_id,
+                current_revision.revision_id,
+                revision_number,
+                dag_digest,
+                patch_digest,
+                patch.reason,
+                patch.trigger,
+                _checked_json(list(patch.evidence_refs), MAX_CHECKPOINT_BYTES, "plan evidence refs"),
+                _checked_json(revision_snapshot(next_items), MAX_CHECKPOINT_BYTES, "plan revision snapshot"),
+                now,
+            ),
+        )
+        switched = conn.execute(
+            "UPDATE plans SET current_revision_id = ?, updated_at = ? "
+            "WHERE plan_id = ? AND current_revision_id = ?",
+            (next_revision_id, now, int(plan["plan_id"]), expected_revision_id),
+        )
+        if switched.rowcount != 1:
+            raise StaleState(f"Plan revision changed before CAS switch: {task_id}")
+        payload = {
+            "plan_id": int(plan["plan_id"]),
+            "revision_id": next_revision_id,
+            "parent_revision_id": current_revision.revision_id,
+            "revision_number": revision_number,
+            "dag_hash": dag_digest,
+            "patch_hash": patch_digest,
+            "reason": patch.reason,
+            "trigger": patch.trigger,
+            "evidence_refs": list(patch.evidence_refs),
+            "operations": [type(operation).__name__ for operation in patch.operations],
+        }
+        conn.execute(
+            "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+            (task_id, "plan_revision_created", _checked_json(payload, MAX_EVENT_PAYLOAD_BYTES, "event payload"), now),
+        )
+        if fault_injector:
+            fault_injector(
+                "plan_patch_before_commit",
+                task_id=task_id,
+                revision_id=next_revision_id,
+            )
+
+        result = PlanRevision(
+            revision_id=next_revision_id,
+            plan_id=int(plan["plan_id"]),
+            task_id=task_id,
+            parent_revision_id=current_revision.revision_id,
+            revision_number=revision_number,
+            dag_hash=dag_digest,
+            patch_hash=patch_digest,
+            reason=patch.reason,
+            trigger=patch.trigger,
+            evidence_refs=patch.evidence_refs,
+            items=next_items,
+            created_at=now,
+        )
+        return result
+
+    def activate_plan_revision(
+        self,
+        task_id: str,
+        expected_revision_id: str,
+        dag_hash: str,
+        *,
+        fault_injector: Callable[..., None] | None = None,
+    ) -> bool:
+        """Acknowledge validated structure without rewriting execution history."""
+        now = _now()
+        with self.transaction() as conn:
+            plan = conn.execute(
+                "SELECT * FROM plans WHERE task_id = ? ORDER BY plan_id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if plan is None or plan["current_revision_id"] != expected_revision_id:
+                raise StaleState(f"Plan revision changed before activation: {task_id}")
+            revision = conn.execute(
+                "SELECT * FROM plan_revisions WHERE revision_id = ?",
+                (expected_revision_id,),
+            ).fetchone()
+            if plan["dag_hash"] is None or revision is None or revision["dag_hash"] != dag_hash:
+                raise RuntimeError(f"DAG hash mismatch for task {task_id}")
+            violations: list[str] = []
+            self._scan_plan_revision_invariants(conn, task_id, violations)
+            if violations:
+                raise InvariantViolation("; ".join(violations))
+            task = conn.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+            previous = task["execution_plan_revision_id"]
+            if previous == expected_revision_id:
+                return False
+            if task["status"] in {"completed", "aborted"} or plan["status"] not in {"active", "failed"}:
+                raise RuntimeError(f"Task {task_id} cannot activate a revision from {task['status']}")
+            checkpoint_id = task["checkpoint_id"]
+            reopened = task["status"] == "failed"
+            if reopened or plan["status"] == "failed":
+                items = conn.execute(
+                    "SELECT * FROM plan_items WHERE plan_id = ? AND tombstoned = 0 ORDER BY plan_item_id",
+                    (plan["plan_id"],),
+                ).fetchall()
+                completed = {row["subtask_id"] for row in items if row["status"] == "completed"}
+                runnable = any(
+                    row["status"] in {"pending", "retryable", "in_progress", "verifying"}
+                    and int(row["consumed_turns"]) < int(row["max_turns"])
+                    and set(_loads(row["blocked_by_json"], [])) <= completed
+                    for row in items
+                )
+                checkpoint = conn.execute(
+                    "SELECT * FROM checkpoints WHERE checkpoint_id = ? AND task_id = ?",
+                    (checkpoint_id, task_id),
+                ).fetchone()
+                if (not reopened or plan["status"] != "failed" or not runnable
+                        or any(row["status"] == "failed" for row in items)
+                        or checkpoint is None or checkpoint["phase"] != "failed"):
+                    raise RuntimeError(f"Task {task_id} is not eligible for failed plan revision resume")
+                # Preserve the failed checkpoint and messages. Only the new
+                # continuation boundary drops the obsolete active-item cursor.
+                cursor = _loads(checkpoint["cursor_json"], {})
+                cursor.pop("active_subtask_id", None)
+                saved = conn.execute(
+                    "INSERT INTO checkpoints(task_id, phase, messages_json, cursor_json, created_at) "
+                    "VALUES (?, 'input_ready', ?, ?, ?)",
+                    (task_id, checkpoint["messages_json"], _json(cursor), now),
+                )
+                checkpoint_id = int(saved.lastrowid)
+                self._emit_conn(conn, task_id, "checkpoint_saved",
+                                {"checkpoint_id": checkpoint_id, "phase": "input_ready"})
+                conn.execute("UPDATE plans SET status = 'active', updated_at = ? WHERE plan_id = ?",
+                             (now, plan["plan_id"]))
+            updated = conn.execute(
+                "UPDATE tasks SET execution_plan_revision_id = ?, checkpoint_id = ?, "
+                "status = ?, last_error = ?, updated_at = ?, version = version + 1 "
+                "WHERE task_id = ? AND version = ? AND execution_plan_revision_id = ?",
+                (expected_revision_id, checkpoint_id, "running" if reopened else task["status"],
+                 None if reopened else task["last_error"], now, task_id, task["version"], previous),
+            )
+            if updated.rowcount != 1:
+                raise StaleState(f"Execution revision changed before activation: {task_id}")
+            self._emit_conn(conn, task_id, "plan_revision_activated", {
+                "plan_id": int(plan["plan_id"]), "revision_id": expected_revision_id,
+                "previous_execution_revision_id": previous, "dag_hash": dag_hash,
+                "checkpoint_id": checkpoint_id, "reopened": reopened,
+            })
+            if fault_injector:
+                fault_injector("plan_revision_activation_before_commit", task_id=task_id,
+                               revision_id=expected_revision_id)
+        if fault_injector:
+            fault_injector("plan_revision_activation_after_commit", task_id=task_id,
+                           revision_id=expected_revision_id)
+        return True
+
+    def get_active_plan(self, task_id: str) -> dict[str, Any] | None:
+        row = self._fetchone(
+            "SELECT * FROM plans WHERE task_id = ? AND status = 'active' ORDER BY plan_id DESC LIMIT 1",
+            (task_id,),
+        )
+        return self._decode_plan(row)
+
+    def _decode_plan(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        plan = dict(row)
+        items = self._fetchall(
+            "SELECT * FROM plan_items WHERE plan_id = ? AND tombstoned = 0 "
+            "ORDER BY plan_item_id",
+            (plan["plan_id"],),
+        )
+        plan["items"] = [self._decode_plan_item(item) for item in items]
+        return plan
+
+    @staticmethod
+    def _decode_plan_item(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["blocked_by"] = _loads(item.pop("blocked_by_json"), [])
+        item["tombstoned"] = bool(item.get("tombstoned", 0))
+        return item
+
+    def get_latest_plan(self, task_id: str) -> dict[str, Any] | None:
+        row = self._fetchone(
+            "SELECT * FROM plans WHERE task_id = ? ORDER BY plan_id DESC LIMIT 1",
+            (task_id,),
+        )
+        return self._decode_plan(row)
+
+    def list_plans(self, task_id: str | None = None) -> list[dict[str, Any]]:
+        if task_id is None:
+            rows = self._fetchall("SELECT * FROM plans ORDER BY created_at, plan_id")
+        else:
+            rows = self._fetchall("SELECT * FROM plans WHERE task_id = ? ORDER BY created_at, plan_id", (task_id,))
+        return [dict(row) for row in rows]
+
+    def list_plan_items(self, plan_id: int) -> list[dict[str, Any]]:
+        rows = self._fetchall(
+            "SELECT * FROM plan_items WHERE plan_id = ? ORDER BY plan_item_id",
+            (plan_id,),
+        )
+        return [self._decode_plan_item(row) for row in rows]
+
+    def _plan_call(self, conn: sqlite3.Connection, plan_item_id: int) -> sqlite3.Row:
+        row = conn.execute(
+            "SELECT i.*, p.task_id, p.plan_id FROM plan_items i "
+            "JOIN plans p ON p.plan_id = i.plan_id WHERE i.plan_item_id = ?",
+            (plan_item_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Plan item not found: {plan_item_id}")
+        return row
+
+    def _set_plan_item_state(self, conn: sqlite3.Connection, plan_item_id: int,
+                             row: sqlite3.Row, new_status: str,
+                             completion_summary: str | None = None,
+                             evidence_hash: str | None = None,
+                             event_type: str | None = None,
+                             event_payload: dict[str, Any] | None = None,
+                             expected_version: int | None = None) -> None:
+        where = "plan_item_id = ?"
+        params: list[Any] = [
+            new_status,
+            completion_summary,
+            evidence_hash,
+            _now(),
+            plan_item_id,
+        ]
+        if expected_version is not None:
+            where += " AND version = ?"
+            params.append(int(expected_version))
+        updated = conn.execute(
+            "UPDATE plan_items SET status = ?, completion_summary = ?, evidence_hash = ?, "
+            f"version = version + 1, updated_at = ? WHERE {where}",
+            params,
+        )
+        if expected_version is not None and updated.rowcount != 1:
+            raise StaleState(f"Plan item state changed before {new_status}: {plan_item_id}")
+        conn.execute(
+            "UPDATE plans SET updated_at = ? WHERE plan_id = ?",
+            (_now(), row["plan_id"]),
+        )
+        if event_type is not None:
+            payload = {"plan_item_id": plan_item_id, **(event_payload or {})}
+            if event_type == "plan_item_failed":
+                payload["observed_revision_id"] = conn.execute(
+                    "SELECT current_revision_id FROM plans WHERE plan_id = ?",
+                    (row["plan_id"],),
+                ).fetchone()[0]
+                payload["observed_item_version"] = int(row["version"]) + 1
+            conn.execute(
+                "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    row["task_id"],
+                    event_type,
+                    _checked_json(
+                        payload,
+                        MAX_EVENT_PAYLOAD_BYTES,
+                        "event payload",
+                    ),
+                    _now(),
+                ),
+            )
+
+    def start_plan_item(self, plan_item_id: int, *, check_dependencies: bool = True) -> None:
+        with self.transaction() as conn:
+            row = self._plan_call(conn, plan_item_id)
+            if bool(row["tombstoned"]):
+                raise InvariantViolation(f"plan item {plan_item_id} is tombstoned")
+            if row["status"] not in {"pending", "retryable"}:
+                raise InvariantViolation(
+                    f"plan item {plan_item_id} cannot start from {row['status']}"
+                )
+            if check_dependencies:
+                blockers = _loads(row["blocked_by_json"], [])
+                for blocker in blockers:
+                    blocked = conn.execute(
+                        "SELECT status, tombstoned FROM plan_items "
+                        "WHERE plan_id = ? AND subtask_id = ?",
+                        (row["plan_id"], blocker),
+                    ).fetchone()
+                    if (
+                        blocked is None
+                        or bool(blocked["tombstoned"])
+                        or blocked["status"] != "completed"
+                    ):
+                        raise InvariantViolation(
+                            f"plan item {plan_item_id} blocked by uncompleted {blocker}"
+                        )
+            self._set_plan_item_state(
+                conn, plan_item_id, row, "in_progress",
+                event_type="plan_item_started", event_payload={"from": row["status"]},
+                expected_version=int(row["version"]),
+            )
+
+    def plan_item_dependencies_complete(self, plan_item_id: int) -> bool:
+        row = self._fetchone(
+            "SELECT plan_id, blocked_by_json, tombstoned FROM plan_items "
+            "WHERE plan_item_id = ?",
+            (plan_item_id,),
+        )
+        if row is None:
+            raise KeyError(f"Plan item not found: {plan_item_id}")
+        if bool(row["tombstoned"]):
+            return False
+        blockers = _loads(row["blocked_by_json"], [])
+        for blocker in blockers:
+            dependency = self._fetchone(
+                "SELECT status, tombstoned FROM plan_items "
+                "WHERE plan_id = ? AND subtask_id = ?",
+                (row["plan_id"], blocker),
+            )
+            if (
+                dependency is None
+                or bool(dependency["tombstoned"])
+                or dependency["status"] != "completed"
+            ):
+                return False
+        return True
+
+    def reserve_plan_item_turn(self, plan_item_id: int) -> int | None:
+        """Durably reserve one model-call attempt without ever resetting its budget."""
+        with self.transaction() as conn:
+            row = self._plan_call(conn, plan_item_id)
+            if row["status"] != "in_progress":
+                raise InvariantViolation(
+                    f"plan item {plan_item_id} cannot reserve a turn from {row['status']}"
+                )
+            max_turns = int(row["max_turns"])
+            consumed_turns = int(row["consumed_turns"])
+            if consumed_turns >= max_turns:
+                return None
+            next_consumed = consumed_turns + 1
+            now = _now()
+            updated = conn.execute(
+                "UPDATE plan_items SET consumed_turns = ?, version = version + 1, updated_at = ? "
+                "WHERE plan_item_id = ? AND status = 'in_progress' AND consumed_turns = ? AND version = ?",
+                (next_consumed, now, plan_item_id, consumed_turns, int(row["version"])),
+            )
+            if updated.rowcount != 1:
+                raise StaleState(f"Plan item changed during turn reservation: {plan_item_id}")
+            conn.execute(
+                "UPDATE plans SET updated_at = ? WHERE plan_id = ?",
+                (now, row["plan_id"]),
+            )
+            conn.execute(
+                "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    row["task_id"],
+                    "plan_item_turn_reserved",
+                    _checked_json(
+                        {
+                            "plan_item_id": plan_item_id,
+                            "subtask_id": row["subtask_id"],
+                            "consumed_turns": next_consumed,
+                            "max_turns": max_turns,
+                        },
+                        MAX_EVENT_PAYLOAD_BYTES,
+                        "event payload",
+                    ),
+                    now,
+                ),
+            )
+            return next_consumed
+
+    def return_plan_item_to_progress(self, plan_item_id: int) -> None:
+        """Release a verifier-pending item when its dependencies are no longer ready."""
+        with self.transaction() as conn:
+            row = self._plan_call(conn, plan_item_id)
+            if row["status"] != "verifying":
+                raise InvariantViolation(
+                    f"plan item {plan_item_id} cannot return to progress from {row['status']}"
+                )
+            self._set_plan_item_state(
+                conn,
+                plan_item_id,
+                row,
+                "in_progress",
+                completion_summary=row["completion_summary"],
+                evidence_hash=None,
+                event_type="plan_item_dependency_blocked",
+                event_payload={"from": "verifying"},
+                expected_version=int(row["version"]),
+            )
+
+    def submit_plan_item_for_verification(self, plan_item_id: int,
+                                          completion_summary: str | None = None,
+                                          evidence_hash: str | None = None) -> None:
+        with self.transaction() as conn:
+            row = self._plan_call(conn, plan_item_id)
+            if row["status"] != "in_progress":
+                raise InvariantViolation(
+                    f"plan item {plan_item_id} cannot verify from {row['status']}"
+                )
+            self._set_plan_item_state(
+                conn, plan_item_id, row, "verifying",
+                completion_summary=completion_summary,
+                evidence_hash=evidence_hash,
+                event_type="plan_item_verifying", event_payload={"from": "in_progress"},
+                expected_version=int(row["version"]),
+            )
+
+    def verify_plan_item(self, plan_item_id: int, evidence_hash: str | None = None) -> None:
+        if not evidence_hash:
+            raise InvariantViolation(
+                f"plan item {plan_item_id} cannot complete without evidence"
+            )
+        with self.transaction() as conn:
+            row = self._plan_call(conn, plan_item_id)
+            if row["verifier_bundle_hash"] is not None:
+                raise InvariantViolation(
+                    f"verified plan item {plan_item_id} requires a passing verifier bundle"
+                )
+            if row["status"] != "verifying":
+                raise InvariantViolation(
+                    f"plan item {plan_item_id} cannot complete from {row['status']}"
+                )
+            self._set_plan_item_state(
+                conn, plan_item_id, row, "completed",
+                completion_summary=row["completion_summary"],
+                evidence_hash=evidence_hash,
+                event_type="plan_item_verified",
+                event_payload={"from": "verifying"},
+            )
+
+    def fail_plan_item(self, plan_item_id: int, reason: str | None = None) -> None:
+        with self.transaction() as conn:
+            row = self._plan_call(conn, plan_item_id)
+            if row["status"] not in {"in_progress", "verifying"}:
+                raise InvariantViolation(
+                    f"plan item {plan_item_id} cannot fail from {row['status']}"
+                )
+            self._set_plan_item_state(
+                conn, plan_item_id, row, "failed",
+                event_type="plan_item_failed",
+                event_payload={"from": row["status"], "reason": reason},
+                expected_version=int(row["version"]),
+            )
+
+    def mark_plan_item_retryable(self, plan_item_id: int) -> None:
+        with self.transaction() as conn:
+            row = self._plan_call(conn, plan_item_id)
+            if row["status"] != "failed":
+                raise InvariantViolation(
+                    f"plan item {plan_item_id} cannot be retryable from {row['status']}"
+                )
+            self._set_plan_item_state(
+                conn, plan_item_id, row, "retryable",
+                event_type="plan_item_retryable",
+                event_payload={"from": "failed"},
+                expected_version=int(row["version"]),
+            )
+
+    def get_plan_item(self, task_id: str, subtask_id: str) -> dict[str, Any] | None:
+        row = self._fetchone(
+            "SELECT i.*, p.task_id FROM plan_items i "
+            "JOIN plans p ON p.plan_id = i.plan_id "
+            "WHERE p.task_id = ? AND p.status IN ('active', 'completed', 'failed') AND i.subtask_id = ? "
+            "ORDER BY i.plan_item_id DESC LIMIT 1",
+            (task_id, subtask_id),
+        )
+        if row is None:
+            return None
+        return self._decode_plan_item(row)
+
+    def has_verified_subtask(self, task_id: str) -> bool:
+        row = self._fetchone(
+            "SELECT 1 FROM plan_items i JOIN plans p ON p.plan_id = i.plan_id "
+            "WHERE p.task_id = ? AND i.verifier_bundle_hash IS NOT NULL LIMIT 1",
+            (task_id,),
+        )
+        return row is not None
+
+    def has_frozen_dag(self, task_id: str) -> bool:
+        row = self._fetchone(
+            "SELECT 1 FROM plans WHERE task_id = ? AND dag_hash IS NOT NULL LIMIT 1",
+            (task_id,),
+        )
+        return row is not None
+
+    @staticmethod
+    def _decode_verifier_run(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["evidence_manifest"] = _loads(item.pop("evidence_manifest_json"), [])
+        item["authoritative"] = bool(item["authoritative"])
+        return item
+
+    @staticmethod
+    def _decode_semantic_checkpoint(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["evidence_manifest"] = _loads(item.pop("evidence_manifest_json"), [])
+        item["verified_subtask_checkpoint_id"] = item.pop("semantic_checkpoint_id")
+        if "observed_manifest_json" in item:
+            item["observed_manifest"] = _loads(item.pop("observed_manifest_json"), [])
+        if "lifecycle_state" not in item:
+            item["lifecycle_state"] = None
+        if "observation_complete" in item:
+            item["observation_complete"] = bool(item["observation_complete"])
+        return item
+
+    def list_verifier_runs(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self._fetchall(
+            "SELECT * FROM verifier_runs WHERE task_id = ? "
+            "ORDER BY created_at, verifier_run_id",
+            (task_id,),
+        )
+        return [self._decode_verifier_run(row) for row in rows]
+
+    def get_verifier_run(self, verifier_run_id: str) -> dict[str, Any] | None:
+        row = self._fetchone(
+            "SELECT * FROM verifier_runs WHERE verifier_run_id = ?",
+            (verifier_run_id,),
+        )
+        return self._decode_verifier_run(row) if row is not None else None
+
+    def list_verified_subtask_checkpoints(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self._fetchall(
+            "SELECT s.*, state.state AS lifecycle_state, state.reason AS lifecycle_reason, "
+            "state.replacement_checkpoint_id, state.observed_manifest_json, "
+            "state.observation_complete "
+            "FROM semantic_checkpoints s "
+            "LEFT JOIN semantic_checkpoint_state_events state ON state.state_event_id = ("
+            "SELECT MAX(state_event_id) FROM semantic_checkpoint_state_events "
+            "WHERE semantic_checkpoint_id = s.semantic_checkpoint_id) "
+            "WHERE s.task_id = ? ORDER BY s.semantic_checkpoint_id",
+            (task_id,),
+        )
+        return [self._decode_semantic_checkpoint(row) for row in rows]
+
+    def get_verified_subtask_checkpoint(
+        self, verified_subtask_checkpoint_id: int
+    ) -> dict[str, Any] | None:
+        row = self._fetchone(
+            "SELECT s.*, state.state AS lifecycle_state, state.reason AS lifecycle_reason, "
+            "state.replacement_checkpoint_id, state.observed_manifest_json, "
+            "state.observation_complete "
+            "FROM semantic_checkpoints s "
+            "LEFT JOIN semantic_checkpoint_state_events state ON state.state_event_id = ("
+            "SELECT MAX(state_event_id) FROM semantic_checkpoint_state_events "
+            "WHERE semantic_checkpoint_id = s.semantic_checkpoint_id) "
+            "WHERE s.semantic_checkpoint_id = ?",
+            (verified_subtask_checkpoint_id,),
+        )
+        return self._decode_semantic_checkpoint(row) if row is not None else None
+
+    def get_current_verified_subtask_checkpoint(
+        self, task_id: str, plan_item_id: int
+    ) -> dict[str, Any] | None:
+        row = self._fetchone(
+            "SELECT s.*, state.state AS lifecycle_state, state.reason AS lifecycle_reason, "
+            "state.replacement_checkpoint_id, state.observed_manifest_json, "
+            "state.observation_complete "
+            "FROM semantic_checkpoints s "
+            "JOIN semantic_checkpoint_state_events state ON state.state_event_id = ("
+            "SELECT MAX(state_event_id) FROM semantic_checkpoint_state_events "
+            "WHERE semantic_checkpoint_id = s.semantic_checkpoint_id) "
+            "WHERE s.task_id = ? AND s.plan_item_id = ? AND state.state = 'valid'",
+            (task_id, plan_item_id),
+        )
+        return self._decode_semantic_checkpoint(row) if row is not None else None
+
+    def list_checkpoint_state_events(
+        self, task_id: str, checkpoint_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        clauses = ["task_id = ?"]
+        params: list[Any] = [task_id]
+        if checkpoint_id is not None:
+            clauses.append("semantic_checkpoint_id = ?")
+            params.append(int(checkpoint_id))
+        rows = self._fetchall(
+            "SELECT * FROM semantic_checkpoint_state_events WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY state_event_id",
+            tuple(params),
+        )
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["observed_manifest"] = _loads(item.pop("observed_manifest_json"), [])
+            item["observation_complete"] = bool(item["observation_complete"])
+            result.append(item)
+        return result
+
+    def get_completed_result(self, task_id: str) -> dict[str, Any]:
+        task = self.get_task(task_id)
+        if task["status"] != "completed":
+            raise InvariantViolation(f"Task {task_id} is not completed")
+        final_text = ""
+        for event in reversed(self.list_events(task_id)):
+            if event["type"] == "task_completed":
+                final_text = str(event["payload"].get("final_text") or "")
+                break
+        return {
+            "task_id": task_id,
+            "status": "completed",
+            "final_text": final_text,
+            "checkpoint_id": task["checkpoint_id"],
+        }
+
+    def record_non_authoritative_verifier_run(
+        self,
+        task_id: str,
+        plan_item_id: int,
+        subtask_id: str,
+        status: str,
+        summary: str,
+        completion_summary: str,
+        evidence_manifest: list[dict[str, str]],
+        verifier_id: str,
+        verifier_version: str,
+        verification_rule: str,
+        verifier_bundle_hash: str,
+        verifier_implementation_hash: str,
+        execution_checkpoint_id: int,
+    ) -> str:
+        if status not in {"fail", "uncertain"}:
+            raise ValueError("non-authoritative verifier runs must be fail or uncertain")
+        verifier_run_id = f"verifier_{uuid.uuid4().hex}"
+        evidence_json = _checked_json(evidence_manifest, MAX_CHECKPOINT_BYTES, "evidence manifest")
+        evidence_hash = sha256_json(evidence_manifest)
+        now = _now()
+        with self.transaction() as conn:
+            item = self._plan_call(conn, plan_item_id)
+            if str(item["task_id"]) != task_id or str(item["subtask_id"]) != subtask_id:
+                raise InvariantViolation(f"Plan item {plan_item_id} does not belong to task/subtask")
+            if item["status"] != "verifying":
+                raise InvariantViolation(
+                    f"plan item {plan_item_id} cannot record verification from {item['status']}"
+                )
+            if item["verifier_bundle_hash"] != verifier_bundle_hash:
+                raise InvariantViolation(f"Verifier bundle hash mismatch for plan item {plan_item_id}")
+            checkpoint = conn.execute(
+                "SELECT 1 FROM checkpoints WHERE checkpoint_id = ? AND task_id = ?",
+                (execution_checkpoint_id, task_id),
+            ).fetchone()
+            if checkpoint is None:
+                raise InvariantViolation(f"Execution checkpoint is not owned by task {task_id}")
+            conn.execute(
+                "INSERT INTO verifier_runs("
+                "verifier_run_id, task_id, plan_item_id, subtask_id, status, summary, "
+                "completion_summary, verifier_id, verifier_version, verification_rule, "
+                "verifier_bundle_hash, verifier_implementation_hash, evidence_manifest_json, "
+                "evidence_hash, authoritative, "
+                "execution_checkpoint_id, created_at, observed_plan_item_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                (
+                    verifier_run_id,
+                    task_id,
+                    plan_item_id,
+                    subtask_id,
+                    status,
+                    summary,
+                    completion_summary,
+                    verifier_id,
+                    verifier_version,
+                    verification_rule,
+                    verifier_bundle_hash,
+                    verifier_implementation_hash,
+                    evidence_json,
+                    evidence_hash,
+                    execution_checkpoint_id,
+                    now,
+                    int(item["version"]) + 1,
+                ),
+            )
+            updated = conn.execute(
+                "UPDATE plan_items SET status = 'retryable', completion_summary = ?, "
+                "evidence_hash = NULL, version = version + 1, updated_at = ? "
+                "WHERE plan_item_id = ? AND status = 'verifying' AND version = ?",
+                (completion_summary, now, plan_item_id, int(item["version"])),
+            )
+            if updated.rowcount != 1:
+                raise StaleState(f"Plan item changed during verifier recording: {plan_item_id}")
+            conn.execute(
+                "UPDATE plans SET updated_at = ? WHERE plan_id = ?",
+                (now, item["plan_id"]),
+            )
+            payload = {
+                "plan_item_id": plan_item_id,
+                "subtask_id": subtask_id,
+                "verifier_run_id": verifier_run_id,
+                "status": status,
+                "authoritative": False,
+                "verifier_bundle_hash": verifier_bundle_hash,
+                "evidence_hash": evidence_hash,
+                "summary": summary,
+            }
+            conn.execute(
+                "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                (task_id, "verifier_run_recorded", _checked_json(payload, MAX_EVENT_PAYLOAD_BYTES, "event payload"), now),
+            )
+            conn.execute(
+                "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    task_id,
+                    "plan_item_retryable",
+                    _checked_json({"plan_item_id": plan_item_id, "from": "verifying", "verifier_run_id": verifier_run_id}, MAX_EVENT_PAYLOAD_BYTES, "event payload"),
+                    now,
+                ),
+            )
+        return verifier_run_id
+
+    def commit_verified_subtask(
+        self,
+        task_id: str,
+        plan_item_id: int,
+        subtask_id: str,
+        completion_summary: str,
+        verifier_summary: str,
+        evidence_manifest: list[dict[str, str]],
+        verifier_id: str,
+        verifier_version: str,
+        verification_rule: str,
+        verifier_bundle_hash: str,
+        verifier_implementation_hash: str,
+        execution_checkpoint_id: int,
+        fault_injector: Callable[..., None] | None = None,
+        complete_task: bool = True,
+        observed_manifest: list[dict[str, str]] | None = None,
+        observation_complete: bool = False,
+    ) -> dict[str, Any]:
+        invalid_paths = [
+            entry["path"]
+            for entry in evidence_manifest
+            if not is_valid_sha256(entry.get("sha256", ""))
+        ]
+        if invalid_paths:
+            raise InvariantViolation(
+                "verified-subtask evidence requires lowercase 64-hex SHA-256 values: "
+                + ", ".join(invalid_paths)
+            )
+        evidence_json = _checked_json(evidence_manifest, MAX_CHECKPOINT_BYTES, "evidence manifest")
+        evidence_hash = sha256_json(evidence_manifest)
+        observed_json = _checked_json(
+            observed_manifest or [], MAX_CHECKPOINT_BYTES, "observed evidence manifest"
+        )
+        now = _now()
+        verifier_run_id = f"verifier_{uuid.uuid4().hex}"
+        with self.transaction() as conn:
+            item = self._plan_call(conn, plan_item_id)
+            if str(item["task_id"]) != task_id or str(item["subtask_id"]) != subtask_id:
+                raise InvariantViolation(f"Plan item {plan_item_id} does not belong to task/subtask")
+            if item["verifier_bundle_hash"] != verifier_bundle_hash:
+                raise InvariantViolation(f"Verifier bundle hash mismatch for plan item {plan_item_id}")
+            task = conn.execute(
+                "SELECT status, version FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if task is None:
+                raise KeyError(f"Task not found: {task_id}")
+            if task["status"] in {"completed", "failed", "aborted"}:
+                raise StaleState(f"Task is terminal during verified completion: {task_id}")
+            if item["status"] != "verifying":
+                raise InvariantViolation(
+                    f"plan item {plan_item_id} cannot complete from {item['status']}"
+                )
+            checkpoint = conn.execute(
+                "SELECT phase FROM checkpoints WHERE checkpoint_id = ? AND task_id = ?",
+                (execution_checkpoint_id, task_id),
+            ).fetchone()
+            if checkpoint is None:
+                raise InvariantViolation(f"Execution checkpoint is not owned by task {task_id}")
+
+            conn.execute(
+                "INSERT INTO verifier_runs("
+                "verifier_run_id, task_id, plan_item_id, subtask_id, status, summary, "
+                "completion_summary, verifier_id, verifier_version, verification_rule, "
+                "verifier_bundle_hash, verifier_implementation_hash, evidence_manifest_json, "
+                "evidence_hash, authoritative, execution_checkpoint_id, created_at) "
+                "VALUES (?, ?, ?, ?, 'pass', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                (
+                    verifier_run_id,
+                    task_id,
+                    plan_item_id,
+                    subtask_id,
+                    verifier_summary,
+                    completion_summary,
+                    verifier_id,
+                    verifier_version,
+                    verification_rule,
+                    verifier_bundle_hash,
+                    verifier_implementation_hash,
+                    evidence_json,
+                    evidence_hash,
+                    execution_checkpoint_id,
+                    now,
+                ),
+            )
+            semantic = conn.execute(
+                "INSERT INTO semantic_checkpoints("
+                "task_id, plan_item_id, subtask_id, verifier_run_id, execution_checkpoint_id, "
+                "completion_summary, verifier_id, verifier_version, verification_rule, "
+                "verifier_bundle_hash, verifier_implementation_hash, evidence_manifest_json, "
+                "evidence_hash, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    plan_item_id,
+                    subtask_id,
+                    verifier_run_id,
+                    execution_checkpoint_id,
+                    completion_summary,
+                    verifier_id,
+                    verifier_version,
+                    verification_rule,
+                    verifier_bundle_hash,
+                    verifier_implementation_hash,
+                    evidence_json,
+                    evidence_hash,
+                    now,
+                ),
+            )
+            verified_subtask_checkpoint_id = int(semantic.lastrowid)
+            conn.execute(
+                "INSERT INTO semantic_checkpoint_state_events("
+                "task_id, semantic_checkpoint_id, plan_item_id, state, reason, "
+                "observed_manifest_json, observation_complete, created_at) "
+                "VALUES (?, ?, ?, 'valid', 'checkpoint_created', ?, ?, ?)",
+                (
+                    task_id,
+                    verified_subtask_checkpoint_id,
+                    plan_item_id,
+                    observed_json,
+                    int(bool(observation_complete)),
+                    now,
+                ),
+            )
+            updated_item = conn.execute(
+                "UPDATE plan_items SET status = 'completed', completion_summary = ?, "
+                "evidence_hash = ?, version = version + 1, updated_at = ? "
+                "WHERE plan_item_id = ? AND status = 'verifying' AND version = ?",
+                (completion_summary, evidence_hash, now, plan_item_id, int(item["version"])),
+            )
+            if updated_item.rowcount != 1:
+                raise StaleState(f"Plan item changed during verified completion: {plan_item_id}")
+            remaining = conn.execute(
+                "SELECT COUNT(*) FROM plan_items WHERE plan_id = ? "
+                "AND tombstoned = 0 AND status != 'completed'",
+                (item["plan_id"],),
+            ).fetchone()[0]
+            if complete_task:
+                if remaining != 0:
+                    raise InvariantViolation(
+                        f"Task completion requested with {remaining} plan item(s) remaining"
+                    )
+                conn.execute(
+                    "UPDATE plans SET status = 'completed', updated_at = ? WHERE plan_id = ?",
+                    (now, item["plan_id"]),
+                )
+                updated_checkpoint = conn.execute(
+                    "UPDATE checkpoints SET phase = 'completed' "
+                    "WHERE checkpoint_id = ? AND task_id = ?",
+                    (execution_checkpoint_id, task_id),
+                )
+                if updated_checkpoint.rowcount != 1:
+                    raise StaleState(
+                        f"Execution checkpoint changed during verified completion: {execution_checkpoint_id}"
+                    )
+                updated_task = conn.execute(
+                    "UPDATE tasks SET status = 'completed', checkpoint_id = ?, last_error = NULL, "
+                    "updated_at = ?, version = version + 1 WHERE task_id = ? AND version = ?",
+                    (execution_checkpoint_id, now, task_id, int(task["version"])),
+                )
+                if updated_task.rowcount != 1:
+                    raise StaleState(f"Task changed during verified completion: {task_id}")
+            else:
+                if remaining == 0:
+                    raise InvariantViolation(
+                        "Intermediate verified completion cannot finish the plan"
+                    )
+                conn.execute(
+                    "UPDATE plans SET status = 'active', updated_at = ? WHERE plan_id = ?",
+                    (now, item["plan_id"]),
+                )
+
+            run_payload = {
+                "plan_item_id": plan_item_id,
+                "subtask_id": subtask_id,
+                "verifier_run_id": verifier_run_id,
+                "verified_subtask_checkpoint_id": verified_subtask_checkpoint_id,
+                "status": "pass",
+                "authoritative": True,
+                "verifier_bundle_hash": verifier_bundle_hash,
+                "evidence_hash": evidence_hash,
+            }
+            event_rows = (
+                (
+                    "verifier_run_recorded",
+                    run_payload,
+                ),
+                (
+                    "plan_item_verified",
+                    {
+                        "plan_item_id": plan_item_id,
+                        "from": "verifying",
+                        "verifier_run_id": verifier_run_id,
+                    },
+                ),
+                (
+                    "verified_subtask_checkpoint_created",
+                    {
+                        "verified_subtask_checkpoint_id": verified_subtask_checkpoint_id,
+                        "verifier_run_id": verifier_run_id,
+                        "execution_checkpoint_id": execution_checkpoint_id,
+                    },
+                ),
+            )
+            if complete_task:
+                event_rows += (
+                    ("task_completed", {"final_text": completion_summary}),
+                    ("verified_subtask_committed", run_payload),
+                    (
+                        "checkpoint_saved",
+                        {
+                            "checkpoint_id": execution_checkpoint_id,
+                            "phase": "completed",
+                        },
+                    ),
+                )
+            else:
+                event_rows += (("verified_subtask_committed", run_payload),)
+            for event_type, payload in event_rows:
+                conn.execute(
+                    "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                    (
+                        task_id,
+                        event_type,
+                        _checked_json(payload, MAX_EVENT_PAYLOAD_BYTES, "event payload"),
+                        now,
+                    ),
+                )
+            if fault_injector:
+                fault_injector(
+                    "verified_subtask_f2_mid",
+                    task_id=task_id,
+                    plan_item_id=plan_item_id,
+                    verifier_run_id=verifier_run_id,
+                    verified_subtask_checkpoint_id=verified_subtask_checkpoint_id,
+                )
+        result = {
+            "verifier_run_id": verifier_run_id,
+            "verified_subtask_checkpoint_id": verified_subtask_checkpoint_id,
+            "execution_checkpoint_id": execution_checkpoint_id,
+        }
+        if fault_injector:
+            fault_injector(
+                "verified_subtask_f3",
+                task_id=task_id,
+                plan_item_id=plan_item_id,
+                verifier_run_id=verifier_run_id,
+                verified_subtask_checkpoint_id=verified_subtask_checkpoint_id,
+            )
+        return result
+
+    def refresh_verified_subtask(
+        self,
+        task_id: str,
+        plan_item_id: int,
+        subtask_id: str,
+        old_checkpoint_id: int,
+        completion_summary: str,
+        verifier_summary: str,
+        evidence_manifest: list[dict[str, str]],
+        verifier_id: str,
+        verifier_version: str,
+        verification_rule: str,
+        verifier_bundle_hash: str,
+        verifier_implementation_hash: str,
+        execution_checkpoint_id: int,
+        observed_manifest: list[dict[str, str]],
+        observation_complete: bool,
+    ) -> dict[str, Any]:
+        """Atomically append a refreshed authority and supersede old evidence."""
+        invalid_paths = [
+            entry.get("path", "")
+            for entry in evidence_manifest
+            if not is_valid_sha256(entry.get("sha256", ""))
+        ]
+        if invalid_paths:
+            raise InvariantViolation(
+                "verified-subtask evidence requires lowercase 64-hex SHA-256 values: "
+                + ", ".join(invalid_paths)
+            )
+        evidence_json = _checked_json(evidence_manifest, MAX_CHECKPOINT_BYTES, "evidence manifest")
+        evidence_hash = sha256_json(evidence_manifest)
+        observed_json = _checked_json(
+            observed_manifest, MAX_CHECKPOINT_BYTES, "observed evidence manifest"
+        )
+        verifier_run_id = f"verifier_{uuid.uuid4().hex}"
+        now = _now()
+        with self.transaction() as conn:
+            item = self._plan_call(conn, plan_item_id)
+            if str(item["task_id"]) != task_id or str(item["subtask_id"]) != subtask_id:
+                raise InvariantViolation(f"Plan item {plan_item_id} does not belong to task/subtask")
+            if item["verifier_bundle_hash"] != verifier_bundle_hash:
+                raise InvariantViolation(f"Verifier bundle hash mismatch for plan item {plan_item_id}")
+            if item["status"] != "completed":
+                raise InvariantViolation(
+                    f"plan item {plan_item_id} cannot refresh from {item['status']}"
+                )
+            old = conn.execute(
+                "SELECT s.*, state.state AS lifecycle_state, state.observed_manifest_json, "
+                "state.observation_complete "
+                "FROM semantic_checkpoints s JOIN semantic_checkpoint_state_events state "
+                "ON state.state_event_id = (SELECT MAX(state_event_id) "
+                "FROM semantic_checkpoint_state_events WHERE semantic_checkpoint_id = s.semantic_checkpoint_id) "
+                "WHERE s.semantic_checkpoint_id = ? AND s.task_id = ? AND s.plan_item_id = ? "
+                "AND state.state = 'valid'",
+                (old_checkpoint_id, task_id, plan_item_id),
+            ).fetchone()
+            if old is None:
+                raise StaleState(f"Verified evidence checkpoint is no longer valid: {old_checkpoint_id}")
+            if any(
+                str(old[field]) != str(expected)
+                for field, expected in (
+                    ("subtask_id", subtask_id),
+                    ("verifier_id", verifier_id),
+                    ("verifier_version", verifier_version),
+                    ("verification_rule", verification_rule),
+                    ("verifier_bundle_hash", verifier_bundle_hash),
+                    ("verifier_implementation_hash", verifier_implementation_hash),
+                )
+            ):
+                raise InvariantViolation(
+                    f"Frozen verifier bundle changed for plan item {plan_item_id}"
+                )
+            checkpoint = conn.execute(
+                "SELECT 1 FROM checkpoints WHERE checkpoint_id = ? AND task_id = ?",
+                (execution_checkpoint_id, task_id),
+            ).fetchone()
+            if checkpoint is None:
+                raise InvariantViolation(f"Execution checkpoint is not owned by task {task_id}")
+            conn.execute(
+                "INSERT INTO verifier_runs("
+                "verifier_run_id, task_id, plan_item_id, subtask_id, status, summary, "
+                "completion_summary, verifier_id, verifier_version, verification_rule, "
+                "verifier_bundle_hash, verifier_implementation_hash, evidence_manifest_json, "
+                "evidence_hash, authoritative, execution_checkpoint_id, created_at) "
+                "VALUES (?, ?, ?, ?, 'pass', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                (
+                    verifier_run_id, task_id, plan_item_id, subtask_id, verifier_summary,
+                    completion_summary, verifier_id, verifier_version, verification_rule,
+                    verifier_bundle_hash, verifier_implementation_hash, evidence_json,
+                    evidence_hash, execution_checkpoint_id, now,
+                ),
+            )
+            semantic = conn.execute(
+                "INSERT INTO semantic_checkpoints("
+                "task_id, plan_item_id, subtask_id, verifier_run_id, execution_checkpoint_id, "
+                "completion_summary, verifier_id, verifier_version, verification_rule, "
+                "verifier_bundle_hash, verifier_implementation_hash, evidence_manifest_json, "
+                "evidence_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    task_id, plan_item_id, subtask_id, verifier_run_id, execution_checkpoint_id,
+                    completion_summary, verifier_id, verifier_version, verification_rule,
+                    verifier_bundle_hash, verifier_implementation_hash, evidence_json,
+                    evidence_hash, now,
+                ),
+            )
+            new_checkpoint_id = int(semantic.lastrowid)
+            conn.execute(
+                "INSERT INTO semantic_checkpoint_state_events("
+                "task_id, semantic_checkpoint_id, plan_item_id, state, reason, "
+                "observed_manifest_json, observation_complete, created_at) "
+                "VALUES (?, ?, ?, 'valid', 'evidence_refreshed', ?, ?, ?)",
+                (
+                    task_id, new_checkpoint_id, plan_item_id, observed_json,
+                    int(bool(observation_complete)), now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO semantic_checkpoint_state_events("
+                "task_id, semantic_checkpoint_id, plan_item_id, state, reason, "
+                "replacement_checkpoint_id, observed_manifest_json, observation_complete, created_at) "
+                "VALUES (?, ?, ?, 'superseded', 'evidence_refreshed', ?, ?, ?, ?)",
+                (
+                    task_id, old_checkpoint_id, plan_item_id, new_checkpoint_id,
+                    old["observed_manifest_json"], old["observation_complete"], now,
+                ),
+            )
+            updated = conn.execute(
+                "UPDATE plan_items SET evidence_hash = ?, version = version + 1, updated_at = ? "
+                "WHERE plan_item_id = ? AND status = 'completed' AND version = ?",
+                (evidence_hash, now, plan_item_id, int(item["version"])),
+            )
+            if updated.rowcount != 1:
+                raise StaleState(f"Plan item changed during evidence refresh: {plan_item_id}")
+            conn.execute("UPDATE plans SET updated_at = ? WHERE plan_id = ?", (now, item["plan_id"]))
+            payload = {
+                "plan_item_id": plan_item_id,
+                "subtask_id": subtask_id,
+                "verifier_run_id": verifier_run_id,
+                "old_checkpoint_id": old_checkpoint_id,
+                "verified_subtask_checkpoint_id": new_checkpoint_id,
+                "replacement_checkpoint_id": new_checkpoint_id,
+                "status": "pass",
+                "authoritative": True,
+                "verifier_bundle_hash": verifier_bundle_hash,
+                "evidence_hash": evidence_hash,
+            }
+            for event_type, event_payload in (
+                ("verifier_run_recorded", payload),
+                ("verified_subtask_checkpoint_created", payload),
+                ("verified_subtask_checkpoint_superseded", {
+                    "plan_item_id": plan_item_id,
+                    "old_checkpoint_id": old_checkpoint_id,
+                    "replacement_checkpoint_id": new_checkpoint_id,
+                }),
+                ("verified_subtask_evidence_refreshed", payload),
+            ):
+                conn.execute(
+                    "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                    (task_id, event_type, _checked_json(event_payload, MAX_EVENT_PAYLOAD_BYTES, "event payload"), now),
+                )
+        return {
+            "verifier_run_id": verifier_run_id,
+            "verified_subtask_checkpoint_id": new_checkpoint_id,
+            "old_checkpoint_id": old_checkpoint_id,
+            "execution_checkpoint_id": execution_checkpoint_id,
+        }
+
+    def invalidate_verified_subtask_evidence(
+        self,
+        task_id: str,
+        plan_item_id: int,
+        subtask_id: str,
+        checkpoint_id: int,
+        status: str,
+        summary: str,
+        completion_summary: str,
+        evidence_manifest: list[dict[str, str]],
+        verifier_id: str,
+        verifier_version: str,
+        verification_rule: str,
+        verifier_bundle_hash: str,
+        verifier_implementation_hash: str,
+        execution_checkpoint_id: int,
+        reason: str,
+    ) -> str:
+        if status not in {"fail", "uncertain"}:
+            raise ValueError("evidence invalidation must be fail or uncertain")
+        evidence_json = _checked_json(evidence_manifest, MAX_CHECKPOINT_BYTES, "evidence manifest")
+        evidence_hash = sha256_json(evidence_manifest)
+        verifier_run_id = f"verifier_{uuid.uuid4().hex}"
+        now = _now()
+        with self.transaction() as conn:
+            item = self._plan_call(conn, plan_item_id)
+            if str(item["task_id"]) != task_id or str(item["subtask_id"]) != subtask_id:
+                raise InvariantViolation(f"Plan item {plan_item_id} does not belong to task/subtask")
+            if item["verifier_bundle_hash"] != verifier_bundle_hash:
+                raise InvariantViolation(f"Verifier bundle hash mismatch for plan item {plan_item_id}")
+            if item["status"] != "completed":
+                raise InvariantViolation(
+                    f"plan item {plan_item_id} cannot invalidate from {item['status']}"
+                )
+            old = conn.execute(
+                "SELECT s.semantic_checkpoint_id, state.state AS lifecycle_state, "
+                "state.observed_manifest_json, state.observation_complete "
+                "FROM semantic_checkpoints s JOIN semantic_checkpoint_state_events state "
+                "ON state.state_event_id = (SELECT MAX(state_event_id) "
+                "FROM semantic_checkpoint_state_events WHERE semantic_checkpoint_id = s.semantic_checkpoint_id) "
+                "WHERE s.semantic_checkpoint_id = ? AND s.task_id = ? AND s.plan_item_id = ? "
+                "AND state.state = 'valid'",
+                (checkpoint_id, task_id, plan_item_id),
+            ).fetchone()
+            if old is None:
+                raise StaleState(f"Verified evidence checkpoint is no longer valid: {checkpoint_id}")
+            old_checkpoint = conn.execute(
+                "SELECT * FROM semantic_checkpoints WHERE semantic_checkpoint_id = ?",
+                (checkpoint_id,),
+            ).fetchone()
+            if old_checkpoint is None or any(
+                str(old_checkpoint[field]) != str(expected)
+                for field, expected in (
+                    ("subtask_id", subtask_id),
+                    ("verifier_id", verifier_id),
+                    ("verifier_version", verifier_version),
+                    ("verification_rule", verification_rule),
+                    ("verifier_bundle_hash", verifier_bundle_hash),
+                    ("verifier_implementation_hash", verifier_implementation_hash),
+                )
+            ):
+                raise InvariantViolation(
+                    f"Frozen verifier bundle changed for plan item {plan_item_id}"
+                )
+            execution_checkpoint = conn.execute(
+                "SELECT 1 FROM checkpoints WHERE checkpoint_id = ? AND task_id = ?",
+                (execution_checkpoint_id, task_id),
+            ).fetchone()
+            if execution_checkpoint is None:
+                raise InvariantViolation(f"Execution checkpoint is not owned by task {task_id}")
+            conn.execute(
+                "INSERT INTO verifier_runs("
+                "verifier_run_id, task_id, plan_item_id, subtask_id, status, summary, "
+                "completion_summary, verifier_id, verifier_version, verification_rule, "
+                "verifier_bundle_hash, verifier_implementation_hash, evidence_manifest_json, "
+                "evidence_hash, authoritative, execution_checkpoint_id, created_at, "
+                "observed_plan_item_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)",
+                (
+                    verifier_run_id, task_id, plan_item_id, subtask_id, status, summary,
+                    completion_summary, verifier_id, verifier_version, verification_rule,
+                    verifier_bundle_hash, verifier_implementation_hash, evidence_json,
+                    evidence_hash, execution_checkpoint_id, now, int(item["version"]) + 1,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO semantic_checkpoint_state_events("
+                "task_id, semantic_checkpoint_id, plan_item_id, state, reason, "
+                "observed_manifest_json, observation_complete, created_at) "
+                "VALUES (?, ?, ?, 'stale', ?, ?, ?, ?)",
+                (
+                    task_id, checkpoint_id, plan_item_id,
+                    f"evidence_refresh_{status}: {str(reason)[:256]}",
+                    old["observed_manifest_json"], old["observation_complete"], now,
+                ),
+            )
+            updated = conn.execute(
+                "UPDATE plan_items SET status = 'retryable', completion_summary = ?, "
+                "evidence_hash = NULL, version = version + 1, updated_at = ? "
+                "WHERE plan_item_id = ? AND status = 'completed' AND version = ?",
+                (completion_summary, now, plan_item_id, int(item["version"])),
+            )
+            if updated.rowcount != 1:
+                raise StaleState(f"Plan item changed during evidence invalidation: {plan_item_id}")
+
+            all_items = conn.execute(
+                "SELECT * FROM plan_items WHERE plan_id = ? ORDER BY plan_item_id",
+                (item["plan_id"],),
+            ).fetchall()
+            descendants: set[str] = set()
+            changed = {subtask_id}
+            while changed:
+                current = changed.pop()
+                for candidate in all_items:
+                    dependencies = _loads(candidate["blocked_by_json"], [])
+                    candidate_id = str(candidate["subtask_id"])
+                    if candidate_id not in descendants and current in dependencies:
+                        descendants.add(candidate_id)
+                        changed.add(candidate_id)
+            descendants.discard(subtask_id)
+            affected_descendants: list[str] = []
+            for candidate in all_items:
+                candidate_id = str(candidate["subtask_id"])
+                if candidate_id not in descendants:
+                    continue
+                candidate_id_num = int(candidate["plan_item_id"])
+                if candidate["status"] == "completed":
+                    current_checkpoint = conn.execute(
+                        "SELECT s.semantic_checkpoint_id, state.observed_manifest_json, "
+                        "state.observation_complete FROM semantic_checkpoints s "
+                        "JOIN semantic_checkpoint_state_events state ON state.state_event_id = ("
+                        "SELECT MAX(state_event_id) FROM semantic_checkpoint_state_events "
+                        "WHERE semantic_checkpoint_id = s.semantic_checkpoint_id) "
+                        "WHERE s.plan_item_id = ? AND state.state = 'valid'",
+                        (candidate_id_num,),
+                    ).fetchone()
+                    if current_checkpoint is None:
+                        raise InvariantViolation(
+                            f"completed dependent plan item {candidate_id_num} has no valid checkpoint"
+                        )
+                    conn.execute(
+                        "INSERT INTO semantic_checkpoint_state_events("
+                        "task_id, semantic_checkpoint_id, plan_item_id, state, reason, "
+                        "observed_manifest_json, observation_complete, created_at) "
+                        "VALUES (?, ?, ?, 'stale', 'dependency_invalidation', ?, ?, ?)",
+                        (
+                            task_id, current_checkpoint["semantic_checkpoint_id"], candidate_id_num,
+                            current_checkpoint["observed_manifest_json"],
+                            current_checkpoint["observation_complete"], now,
+                        ),
+                    )
+                if candidate["status"] != "pending":
+                    conn.execute(
+                        "UPDATE plan_items SET status = 'pending', evidence_hash = NULL, "
+                        "version = version + 1, updated_at = ? WHERE plan_item_id = ?",
+                        (now, candidate_id_num),
+                    )
+                affected_descendants.append(candidate_id)
+                conn.execute(
+                    "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                    (
+                        task_id,
+                        "plan_item_dependency_invalidated",
+                        _checked_json({
+                            "plan_item_id": candidate_id_num,
+                            "subtask_id": candidate_id,
+                            "from": candidate["status"],
+                            "dependency": subtask_id,
+                        }, MAX_EVENT_PAYLOAD_BYTES, "event payload"),
+                        now,
+                    ),
+                )
+            conn.execute(
+                "UPDATE plans SET status = 'active', updated_at = ? WHERE plan_id = ?",
+                (now, item["plan_id"]),
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'running', last_error = NULL, version = version + 1, "
+                "updated_at = ? WHERE task_id = ?",
+                (now, task_id),
+            )
+            payload = {
+                "plan_item_id": plan_item_id,
+                "subtask_id": subtask_id,
+                "checkpoint_id": checkpoint_id,
+                "observed_revision_id": conn.execute(
+                    "SELECT current_revision_id FROM plans WHERE plan_id = ?",
+                    (item["plan_id"],),
+                ).fetchone()[0],
+                "observed_item_version": int(item["version"]) + 1,
+                "verifier_run_id": verifier_run_id,
+                "status": status,
+                "authoritative": False,
+                "summary": summary,
+                "reason": str(reason)[:256],
+                "affected_descendants": affected_descendants,
+            }
+            for event_type in (
+                "verifier_run_recorded",
+                "verified_subtask_checkpoint_stale",
+                f"verified_subtask_evidence_refresh_{status}",
+            ):
+                conn.execute(
+                    "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+                    (task_id, event_type, _checked_json(payload, MAX_EVENT_PAYLOAD_BYTES, "event payload"), now),
+                )
+        return verifier_run_id
 
     def get_tool_call(self, task_id: str, tool_use_id: str) -> dict[str, Any] | None:
         row = self._fetchone(
@@ -1034,9 +3006,25 @@ class EventStore:
             if expected_version is not None and cursor.rowcount != 1:
                 raise StaleState(f"Tool call state changed before update: {tool_use_id}")
 
-    def start_tool_call(self, task_id: str, tool_use_id: str, effect: str, started_at: float | None = None) -> None:
+    def start_tool_call(self, task_id: str, tool_use_id: str, effect: str, started_at: float | None = None,
+                        *, read_budget: ControllerReadBudget | None = None) -> None:
         now = started_at or _now()
         with self.transaction() as conn:
+            if read_budget is not None:
+                if not isinstance(read_budget, ControllerReadBudget) or effect != 'read_only':
+                    raise ValueError('Controller budget is only valid for registered read attempts')
+                current = conn.execute('SELECT name,status,effect FROM tool_calls WHERE task_id=? AND tool_use_id=?',
+                                       (task_id, tool_use_id)).fetchone()
+                if current is None or current['status'] != 'planned':
+                    raise StaleState(f'Tool call is no longer runnable: {tool_use_id}')
+                if current['name'] not in read_budget.tool_names or current['effect'] != 'read_only':
+                    raise ValueError('Tool is outside the controller read budget')
+                placeholders = ','.join('?' for _ in read_budget.tool_names)
+                consumed = conn.execute(
+                    f'SELECT COALESCE(SUM(execution_attempts),0) FROM tool_calls WHERE task_id=? AND name IN ({placeholders})',
+                    (task_id, *read_budget.tool_names)).fetchone()[0]
+                if consumed >= read_budget.max_attempts:
+                    raise ControllerReadBudgetExhausted(read_budget.max_attempts, consumed)
             effect_increment = 0 if effect == "read_only" else 1
             cursor = conn.execute(
                 "UPDATE tool_calls SET status = 'running', started_at = ?, execution_status = 'running', "
@@ -1125,6 +3113,111 @@ class EventStore:
                 (task_id, tool_use_id, owner_id, int(owner_pid or os.getpid()), int(fencing_token), effect, now, deadline_at),
             )
             return int(cursor.lastrowid)
+
+    def list_untracked_shell_calls(self, repo_root: str) -> list[dict[str, Any]]:
+        """Legacy read-only classification cannot establish an interrupted shell's outcome."""
+        rows = self._fetchall(
+            "SELECT c.task_id,c.tool_use_id FROM tool_calls c JOIN tasks t ON t.task_id=c.task_id "
+            "WHERE t.repo_root=? AND c.name='bash' AND c.effect='read_only' "
+            "AND c.status IN ('running','needs_review') AND c.operation_id IS NULL",
+            (repo_root,),
+        )
+        return [dict(row) for row in rows]
+
+    def begin_workspace_cleanup(self, resource: dict[str, Any]) -> int:
+        """Predeclare external release before mutation, using the existing ledger."""
+        if (resource.get("kind") not in {"docker_workspace", "docker_validator"}
+                or not all(isinstance(resource.get(k), str) and resource[k]
+                           for k in ("source_id", "image", "session"))):
+            raise ValueError("A bound workspace resource is required")
+        if resource["kind"] == "docker_validator" and not resource.get("parent_source_id"):
+            raise ValueError("Validator parent source identity is required")
+        identity = self.current_lease_identity()
+        payload = _checked_json({"resource": resource}, MAX_EVENT_PAYLOAD_BYTES, "workspace resource")
+        now = _now()
+        with self.transaction() as conn:
+            self._operation_lease_conn(conn, identity["task_id"])
+            blockers = conn.execute(
+                "SELECT r.* FROM effect_reservations r JOIN tasks t ON t.task_id=r.task_id "
+                "WHERE t.repo_root=? AND r.state IN ('running','unknown')",
+                (identity["repo_root"],)).fetchall()
+            blocked = []
+            for row in blockers:
+                pending = _loads(row["details_json"], {}).get("resource", {})
+                # Releasing this already-frozen parent may proceed after its
+                # own validator cleanup failed. It does not clear that blocker
+                # or authorize a new task, validator, or source acquisition.
+                own_child = (resource["kind"] == "docker_workspace"
+                    and row["effect"] == "workspace_cleanup" and row["task_id"] == identity["task_id"]
+                    and row["owner_id"] == identity["owner_id"] and row["fencing_token"] == identity["fencing_token"]
+                    and pending.get("kind") == "docker_validator"
+                    and pending.get("parent_source_id") == resource["source_id"]
+                    and pending.get("engine_id") == resource.get("engine_id")
+                    and pending.get("session") == resource["session"])
+                if not own_child:
+                    blocked.append(self._decode_reservation(row))
+            if blocked:
+                raise EffectBlocked(identity["repo_root"], blocked)
+            cursor = conn.execute(
+                "INSERT INTO effect_reservations(task_id,tool_use_id,owner_id,owner_pid,fencing_token,"
+                "effect,state,started_at,details_json) VALUES (?,?,?,?,?,'workspace_cleanup','running',?,?)",
+                (identity["task_id"], "workspace-release-"+uuid.uuid4().hex, identity["owner_id"],
+                 os.getpid(), identity["fencing_token"], now, payload))
+            reservation = int(cursor.lastrowid)
+            self._emit_conn(conn, identity["task_id"], "workspace_cleanup_reserved",
+                            {"reservation_id": reservation, "resource": resource})
+            return reservation
+
+    def resolve_workspace_cleanup(self, reservation_id: int, observation: dict[str, Any], reason: str) -> None:
+        """Fenced CAS after a trusted operator probe confirms exact resource removal."""
+        if not reason.strip():
+            raise ValueError("An operator reason is required")
+        with self.transaction() as conn:
+            row = conn.execute("SELECT * FROM effect_reservations WHERE reservation_id=?",
+                               (int(reservation_id),)).fetchone()
+            if row is None or row["effect"] != "workspace_cleanup" or row["state"] != "unknown":
+                raise StaleState("Workspace cleanup is not awaiting reconciliation")
+            self._operation_lease_conn(conn, row["task_id"])
+            details = _loads(row["details_json"], {})
+            if (observation.get("outcome") != "removed"
+                    or observation.get("resource") != details.get("resource")
+                    or observation.get("method") != "docker-get-404"
+                    or not details["resource"].get("engine_id")
+                    or observation.get("engine_id") != details["resource"]["engine_id"]):
+                raise ValueError("Exact resource removal evidence is required")
+            evidence = _checked_json({"resource": details["resource"], "observation": observation,
+                                      "operator_reason": reason}, MAX_EVENT_PAYLOAD_BYTES, "cleanup evidence")
+            conn.execute("UPDATE effect_reservations SET state='completed',finished_at=?,details_json=? "
+                         "WHERE reservation_id=? AND state='unknown'", (_now(), evidence, int(reservation_id)))
+            self._emit_conn(conn, row["task_id"], "workspace_cleanup_reconciled",
+                            {"reservation_id": int(reservation_id), "outcome": "removed", "reason": reason})
+
+    def quarantine_legacy_shell(self, task_id: str, tool_use_id: str) -> None:
+        """Adopt an old untracked possible effect as UNKNOWN, without dispatching it."""
+        with self.transaction() as conn:
+            self._operation_lease_conn(conn, task_id)
+            call = conn.execute("SELECT * FROM tool_calls WHERE task_id=? AND tool_use_id=?",
+                                (task_id, tool_use_id)).fetchone()
+            if (call is None or call['name'] != 'bash' or call['effect'] != 'read_only'
+                    or call['status'] not in {'running', 'needs_review'} or call['operation_id'] is not None):
+                raise StaleState('Legacy shell call is no longer eligible for quarantine')
+            if self._lease_context is None:
+                raise LeaseLost('Legacy quarantine requires a bound lease')
+            _, owner, token = self._lease_context
+            existing = conn.execute("SELECT reservation_id FROM effect_reservations WHERE task_id=? AND tool_use_id=?",
+                                    (task_id, tool_use_id)).fetchone()
+            if existing is None:
+                now = _now()
+                conn.execute(
+                    "INSERT INTO effect_reservations(task_id,tool_use_id,owner_id,owner_pid,fencing_token,effect,state,started_at,finished_at,details_json) "
+                    "VALUES (?,?,?,?,?,'unknown_write','unknown',?,?,?)",
+                    (task_id, tool_use_id, owner, os.getpid(), token, call['started_at'] or now, now,
+                     _json({'reason':'legacy untracked shell outcome unknown','adopted_by':owner})),
+                )
+            conn.execute("UPDATE tool_calls SET effect='unknown_write',effect_key=COALESCE(effect_key,args_hash), "
+                         "effect_attempts=MAX(effect_attempts,execution_attempts),version=version+1 WHERE task_id=? AND tool_use_id=?",
+                         (task_id, tool_use_id))
+            self._emit_conn(conn, task_id, 'legacy_shell_quarantined', {'tool_use_id':tool_use_id})
 
     def get_effect_reservation(self, task_id: str, tool_use_id: str) -> dict[str, Any] | None:
         row = self._fetchone(
@@ -2301,6 +4394,1132 @@ class EventStore:
                 )
         return self.get_operation(operation_id)  # type: ignore[return-value]
 
+    # ------------------------------------------------------------------
+    # Background jobs + cron (Phase 2)
+    # ------------------------------------------------------------------
+
+    def _emit_conn(self, conn: sqlite3.Connection, task_id: str, event_type: str,
+                   payload: dict[str, Any]) -> int:
+        cursor = conn.execute(
+            "INSERT INTO events(task_id, type, payload_json, created_at) VALUES (?, ?, ?, ?)",
+            (
+                task_id,
+                event_type,
+                _checked_json(payload, MAX_EVENT_PAYLOAD_BYTES, "event payload"),
+                _now(),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def _job_lease_conn(self, conn: sqlite3.Connection, job_id: str) -> tuple[str, int]:
+        if self._lease_context is None:
+            raise LeaseLost("Job transition requires a bound lease")
+        self._assert_lease_conn(conn)
+        repo_root, owner_id, fencing_token = self._lease_context
+        job = conn.execute("SELECT repo_root FROM agent_jobs WHERE job_id = ?", (job_id,)).fetchone()
+        if job is None:
+            raise KeyError(f"Job not found: {job_id}")
+        if str(job["repo_root"]) != repo_root:
+            raise LeaseLost("Job repository does not match the bound lease")
+        return owner_id, int(fencing_token)
+
+    def enqueue_job(self, job_id: str, task_id: str, repo_root: str, kind: str,
+                    payload: dict[str, Any], *, lane_id: str | None = None,
+                    max_attempts: int = 1, available_at: float | None = None) -> dict[str, Any]:
+        now = _now()
+        payload_json = _checked_json(payload, MAX_EVENT_PAYLOAD_BYTES, "job payload")
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO agent_jobs(
+                    job_id, task_id, repo_root, lane_id, kind, payload_json, status,
+                    attempts, max_attempts, available_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)
+                """,
+                (
+                    job_id, task_id, repo_root, lane_id, kind, payload_json,
+                    max(1, int(max_attempts)), available_at if available_at is not None else now,
+                    now, now,
+                ),
+            )
+            self._emit_conn(conn, task_id, "job_enqueued", {
+                "job_id": job_id, "kind": kind, "status": "pending",
+            })
+        return self.get_job(job_id)  # type: ignore[return-value]
+
+    def get_job(self, job_id: str) -> dict[str, Any] | None:
+        row = self._fetchone("SELECT * FROM agent_jobs WHERE job_id = ?", (job_id,))
+        if row is None:
+            return None
+        item = dict(row)
+        item["payload"] = _loads(item.pop("payload_json"), {})
+        return item
+
+    def list_jobs(self, task_id: str | None = None,
+                  status: str | None = None) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._fetchall(
+            f"SELECT * FROM agent_jobs{where} ORDER BY created_at, job_id", tuple(params)
+        )
+        return [dict(row) for row in rows]
+
+    def claim_job(self, job_id: str, *, ttl: float = 30.0) -> dict[str, Any]:
+        now = _now()
+        with self.transaction() as conn:
+            job = conn.execute("SELECT * FROM agent_jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if job is None:
+                raise KeyError(f"Job not found: {job_id}")
+            owner_id, _ = self._job_lease_conn(conn, job_id)
+            if job["status"] not in {"pending", "retryable"}:
+                raise StaleState(f"Job is not claimable: {job_id} ({job['status']})")
+            if job["available_at"] is not None and float(job["available_at"]) > now:
+                raise StaleState(f"Job is not yet available: {job_id}")
+            attempts = int(job["attempts"])
+            if attempts >= int(job["max_attempts"]):
+                raise StaleState(f"Job has exhausted its attempts: {job_id}")
+            new_fencing = attempts + 1
+            updated = conn.execute(
+                "UPDATE agent_jobs SET status = 'claimed', attempts = ?, updated_at = ? "
+                "WHERE job_id = ? AND status IN ('pending', 'retryable') AND attempts = ?",
+                (new_fencing, now, job_id, attempts),
+            )
+            if updated.rowcount != 1:
+                raise StaleState(f"Job changed during claim: {job_id}")
+            run_id = "run_" + _sha256_text(f"{job_id}\0{new_fencing}\0{now}")[:40]
+            conn.execute(
+                """
+                INSERT INTO job_runs(
+                    run_id, job_id, owner_id, fencing_token, status,
+                    heartbeat_at, lease_expires_at, started_at
+                ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?)
+                """,
+                (run_id, job_id, owner_id, new_fencing, now, now + ttl, now),
+            )
+            self._emit_conn(conn, str(job["task_id"]), "job_claimed", {
+                "job_id": job_id, "run_id": run_id, "status": "claimed",
+            })
+            return {"job_id": job_id, "run_id": run_id, "owner_id": owner_id,
+                    "fencing_token": new_fencing, "status": "running"}
+
+    def heartbeat_job(self, run_id: str, *, ttl: float = 30.0) -> bool:
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            run = conn.execute("SELECT * FROM job_runs WHERE run_id = ?", (run_id,)).fetchone()
+            if run is None:
+                raise KeyError(f"Job run not found: {run_id}")
+            owner_id, fencing = self._job_lease_conn(conn, str(run["job_id"]))
+            if run["owner_id"] != owner_id or int(run["fencing_token"]) != fencing:
+                raise LeaseLost(f"Stale job owner for run: {run_id}")
+            if run["status"] != "running":
+                raise StaleState(f"Job run is not running: {run_id}")
+            conn.execute(
+                "UPDATE agent_jobs SET status = 'running', updated_at = ? "
+                "WHERE job_id = ? AND status = 'claimed'",
+                (now, run["job_id"]),
+            )
+            updated = conn.execute(
+                "UPDATE job_runs SET heartbeat_at = ?, lease_expires_at = ? "
+                "WHERE run_id = ? AND status = 'running' AND owner_id = ? AND fencing_token = ?",
+                (now, now + ttl, run_id, owner_id, int(fencing)),
+            )
+            return updated.rowcount == 1
+
+    def complete_job(self, run_id: str, *, result_digest: str | None = None) -> None:
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            run = conn.execute("SELECT * FROM job_runs WHERE run_id = ?", (run_id,)).fetchone()
+            if run is None:
+                raise KeyError(f"Job run not found: {run_id}")
+            job = conn.execute("SELECT * FROM agent_jobs WHERE job_id = ?", (run["job_id"],)).fetchone()
+            if job is None:
+                raise KeyError(f"Job not found: {run['job_id']}")
+            owner_id, fencing = self._job_lease_conn(conn, str(run["job_id"]))
+            if run["owner_id"] != owner_id or int(run["fencing_token"]) != fencing:
+                raise LeaseLost(f"Stale job owner for run: {run_id}")
+            updated = conn.execute(
+                "UPDATE job_runs SET status = 'completed', completed_at = ?, error = NULL, "
+                "result_digest = ? WHERE run_id = ? AND status = 'running' AND owner_id = ? "
+                "AND fencing_token = ?",
+                (now, result_digest, run_id, owner_id, int(fencing)),
+            )
+            if updated.rowcount != 1:
+                raise StaleState(f"Job run changed before completion: {run_id}")
+            conn.execute(
+                "UPDATE agent_jobs SET status = 'completed', updated_at = ? WHERE job_id = ?",
+                (now, run["job_id"]),
+            )
+            self._emit_conn(conn, str(job["task_id"]), "job_completed", {
+                "job_id": str(run["job_id"]), "run_id": run_id, "status": "completed",
+            })
+
+    def fail_job(self, run_id: str, *, error: str | None = None) -> None:
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            run = conn.execute("SELECT * FROM job_runs WHERE run_id = ?", (run_id,)).fetchone()
+            if run is None:
+                raise KeyError(f"Job run not found: {run_id}")
+            job = conn.execute("SELECT * FROM agent_jobs WHERE job_id = ?", (run["job_id"],)).fetchone()
+            if job is None:
+                raise KeyError(f"Job not found: {run['job_id']}")
+            owner_id, fencing = self._job_lease_conn(conn, str(run["job_id"]))
+            if run["owner_id"] != owner_id or int(run["fencing_token"]) != fencing:
+                raise LeaseLost(f"Stale job owner for run: {run_id}")
+            updated = conn.execute(
+                "UPDATE job_runs SET status = 'failed', completed_at = ?, error = ? "
+                "WHERE run_id = ? AND status = 'running' AND owner_id = ? AND fencing_token = ?",
+                (now, _safe_reason(error) if error else None, run_id, owner_id, int(fencing)),
+            )
+            if updated.rowcount != 1:
+                raise StaleState(f"Job run changed before failure: {run_id}")
+            attempts = int(job["attempts"])
+            new_status = "retryable" if attempts < int(job["max_attempts"]) else "failed"
+            conn.execute(
+                "UPDATE agent_jobs SET status = ?, available_at = ?, updated_at = ? WHERE job_id = ?",
+                (new_status, now, now, run["job_id"]),
+            )
+            self._emit_conn(conn, str(job["task_id"]), "job_failed", {
+                "job_id": str(run["job_id"]), "run_id": run_id, "status": new_status,
+            })
+
+    def recover_jobs(self, *, now: float | None = None) -> list[dict[str, Any]]:
+        now = _now() if now is None else now
+        recovered: list[dict[str, Any]] = []
+        with self.transaction(guard=False) as conn:
+            stale = conn.execute(
+                """
+                SELECT r.*, j.task_id, j.attempts, j.max_attempts
+                FROM job_runs r JOIN agent_jobs j ON j.job_id = r.job_id
+                WHERE r.status = 'running' AND r.lease_expires_at IS NOT NULL
+                    AND r.lease_expires_at <= ?
+                """,
+                (now,),
+            ).fetchall()
+            for run in stale:
+                attempts = int(run["attempts"])
+                new_status = "retryable" if attempts < int(run["max_attempts"]) else "failed"
+                conn.execute(
+                    "UPDATE job_runs SET status = 'failed', completed_at = ?, error = ? "
+                    "WHERE run_id = ? AND status = 'running'",
+                    (now, "owner_stale_lease_expired", run["run_id"]),
+                )
+                conn.execute(
+                    "UPDATE agent_jobs SET status = ?, available_at = ?, updated_at = ? "
+                    "WHERE job_id = ?",
+                    (new_status, now, now, run["job_id"]),
+                )
+                self._emit_conn(conn, str(run["task_id"]), "job_recovered", {
+                    "job_id": str(run["job_id"]), "run_id": str(run["run_id"]),
+                    "new_status": new_status,
+                })
+                recovered.append({
+                    "job_id": str(run["job_id"]), "run_id": str(run["run_id"]),
+                    "new_status": new_status,
+                })
+        return recovered
+
+    def list_job_runs(self, job_id: str | None = None) -> list[dict[str, Any]]:
+        if job_id is not None:
+            rows = self._fetchall(
+                "SELECT * FROM job_runs WHERE job_id = ? ORDER BY started_at, run_id", (job_id,)
+            )
+        else:
+            rows = self._fetchall("SELECT * FROM job_runs ORDER BY started_at, run_id")
+        return [dict(row) for row in rows]
+
+    def cancel_job(self, job_id: str, *, reason: str | None = None) -> None:
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            job = conn.execute("SELECT * FROM agent_jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if job is None:
+                raise KeyError(f"Job not found: {job_id}")
+            if job["status"] in {"completed", "failed", "cancelled"}:
+                raise StaleState(f"Job is already terminal: {job_id}")
+            if job["status"] in {"claimed", "running"}:
+                owner_id, fencing = self._job_lease_conn(conn, job_id)
+                updated = conn.execute(
+                    "UPDATE job_runs SET status = 'cancelled', completed_at = ? "
+                    "WHERE job_id = ? AND status = 'running' AND owner_id = ? AND fencing_token = ?",
+                    (now, job_id, owner_id, int(fencing)),
+                )
+                if updated.rowcount == 0:
+                    raise LeaseLost(f"Stale owner for job: {job_id}")
+            conn.execute(
+                "UPDATE agent_jobs SET status = 'cancelled', updated_at = ? WHERE job_id = ?",
+                (now, job_id),
+            )
+            self._emit_conn(conn, str(job["task_id"]), "job_cancelled", {
+                "job_id": job_id, "reason": _safe_reason(reason) if reason else None,
+            })
+
+    def create_cron_schedule(self, schedule_id: str, task_id: str, expression: str,
+                             job_kind: str, payload: dict[str, Any], *,
+                             enabled: bool = True,
+                             next_trigger_at: float | None = None) -> dict[str, Any]:
+        now = _now()
+        payload_json = _checked_json(payload, MAX_EVENT_PAYLOAD_BYTES, "cron payload")
+        with self.transaction(guard=False) as conn:
+            conn.execute(
+                """
+                INSERT INTO cron_schedules(
+                    schedule_id, task_id, expression, job_kind, payload_json, enabled,
+                    last_triggered_at, next_trigger_at
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
+                """,
+                (
+                    schedule_id, task_id, expression, job_kind, payload_json,
+                    1 if enabled else 0,
+                    next_trigger_at if next_trigger_at is not None else now + _cron_interval_seconds(expression),
+                ),
+            )
+        row = self._fetchone("SELECT * FROM cron_schedules WHERE schedule_id = ?", (schedule_id,))
+        item = dict(row)  # type: ignore[arg-type]
+        item["payload"] = _loads(item.pop("payload_json"), {})
+        return item
+
+    def list_cron_schedules(self, enabled_only: bool = False) -> list[dict[str, Any]]:
+        if enabled_only:
+            rows = self._fetchall("SELECT * FROM cron_schedules WHERE enabled = 1")
+        else:
+            rows = self._fetchall("SELECT * FROM cron_schedules")
+        return [dict(row) for row in rows]
+
+    def delete_cron_schedule(self, schedule_id: str) -> None:
+        with self.transaction(guard=False) as conn:
+            conn.execute("DELETE FROM cron_schedules WHERE schedule_id = ?", (schedule_id,))
+
+    def trigger_due_cron(self, *, now: float | None = None) -> list[str]:
+        now = _now() if now is None else now
+        triggered: list[str] = []
+        with self.transaction(guard=False) as conn:
+            schedules = conn.execute(
+                "SELECT c.*, t.repo_root FROM cron_schedules c JOIN tasks t ON t.task_id = c.task_id "
+                "WHERE c.enabled = 1 AND c.next_trigger_at IS NOT NULL AND c.next_trigger_at <= ?",
+                (now,),
+            ).fetchall()
+            for schedule in schedules:
+                job_id = f"job_{schedule['schedule_id']}_{int(now * 1000)}"
+                conn.execute(
+                    """
+                    INSERT INTO agent_jobs(
+                        job_id, task_id, repo_root, lane_id, kind, payload_json, status,
+                        attempts, max_attempts, available_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, NULL, ?, ?, 'pending', 0, 1, ?, ?, ?)
+                    """,
+                    (
+                        job_id, schedule["task_id"], schedule["repo_root"], schedule["job_kind"],
+                        schedule["payload_json"], now, now, now,
+                    ),
+                )
+                next_trigger = now + _cron_interval_seconds(str(schedule["expression"]))
+                conn.execute(
+                    "UPDATE cron_schedules SET last_triggered_at = ?, next_trigger_at = ? "
+                    "WHERE schedule_id = ?",
+                    (now, next_trigger, schedule["schedule_id"]),
+                )
+                self._emit_conn(conn, str(schedule["task_id"]), "cron_triggered", {
+                    "schedule_id": str(schedule["schedule_id"]), "job_id": job_id,
+                    "job_kind": str(schedule["job_kind"]),
+                })
+                triggered.append(job_id)
+        return triggered
+
+    def upsert_tool_registration(
+        self,
+        *,
+        registration_id: str,
+        tool_name: str,
+        adapter_kind: str,
+        schema: dict[str, Any],
+        effect_kind: str,
+        connection_id: str | None = None,
+        server_name: str | None = None,
+        source_tool_name: str | None = None,
+        description: str = "",
+        permission_requirements: dict[str, Any] | None = None,
+        timeout_seconds: float | None = None,
+        enabled: bool = True,
+        version: int = 1,
+    ) -> dict[str, Any]:
+        if adapter_kind not in {"builtin", "mcp"}:
+            raise ValueError(f"Invalid adapter kind: {adapter_kind!r}")
+        if (permission_requirements or {}).get("controller_binding") and (
+                adapter_kind != "builtin" or effect_kind != "read_only"):
+            raise ValueError("Controller read adapters cannot declare side effects")
+        if effect_kind not in {"read_only", "file_write", "idempotent", "unknown_write", "opaque"}:
+            raise ValueError(f"Invalid effect kind: {effect_kind!r}")
+        if timeout_seconds is not None and float(timeout_seconds) <= 0:
+            raise ValueError("Tool timeout must be positive")
+        now = _now()
+        schema_json = _checked_json(schema, MAX_EVENT_PAYLOAD_BYTES, "tool schema")
+        permission_json = _checked_json(
+            permission_requirements or {},
+            MAX_EVENT_PAYLOAD_BYTES,
+            "tool permission requirements",
+        )
+        with self.transaction(guard=False) as conn:
+            conn.execute(
+                """
+                INSERT INTO tool_registrations(
+                    registration_id, tool_name, adapter_kind, connection_id, server_name,
+                    source_tool_name, description, schema_json,
+                    effect_kind, permission_json, timeout_seconds, enabled, version,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tool_name) DO UPDATE SET
+                    registration_id = excluded.registration_id,
+                    adapter_kind = excluded.adapter_kind,
+                    connection_id = excluded.connection_id,
+                    server_name = excluded.server_name,
+                    source_tool_name = excluded.source_tool_name,
+                    description = excluded.description,
+                    schema_json = excluded.schema_json,
+                    effect_kind = excluded.effect_kind,
+                    permission_json = excluded.permission_json,
+                    timeout_seconds = excluded.timeout_seconds,
+                    enabled = excluded.enabled,
+                    version = excluded.version,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    registration_id,
+                    tool_name,
+                    adapter_kind,
+                    connection_id,
+                    server_name,
+                    source_tool_name,
+                    description,
+                    schema_json,
+                    effect_kind,
+                    permission_json,
+                    timeout_seconds,
+                    1 if enabled else 0,
+                    version,
+                    now,
+                    now,
+                ),
+            )
+        return self.get_tool_registration(tool_name)  # type: ignore[return-value]
+
+    def get_tool_registration(self, tool_name: str) -> dict[str, Any] | None:
+        row = self._fetchone(
+            "SELECT * FROM tool_registrations WHERE tool_name = ?",
+            (tool_name,),
+        )
+        if row is None:
+            return None
+        item = dict(row)
+        item["schema"] = _loads(item.pop("schema_json"), {})
+        item["permission_requirements"] = _loads(item.pop("permission_json"), {})
+        item["enabled"] = bool(item["enabled"])
+        return item
+
+    def list_tool_registrations(self, enabled_only: bool = False) -> list[dict[str, Any]]:
+        query = "SELECT * FROM tool_registrations"
+        if enabled_only:
+            query += " WHERE enabled = 1"
+        query += " ORDER BY tool_name"
+        rows = self._fetchall(query)
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["schema"] = _loads(item.pop("schema_json"), {})
+            item["permission_requirements"] = _loads(item.pop("permission_json"), {})
+            item["enabled"] = bool(item["enabled"])
+            result.append(item)
+        return result
+
+    def delete_tool_registration(self, tool_name: str) -> None:
+        with self.transaction(guard=False) as conn:
+            conn.execute("DELETE FROM tool_registrations WHERE tool_name = ?", (tool_name,))
+
+    def upsert_mcp_connection(
+        self,
+        *,
+        connection_id: str,
+        server_name: str,
+        endpoint: str,
+        transport: str = "stdio",
+        args: list[str] | None = None,
+        auth_profile: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if transport != "stdio":
+            raise ValueError(f"Unsupported MCP transport: {transport!r}")
+        now = _now()
+        args_json = _checked_json(args or [], MAX_EVENT_PAYLOAD_BYTES, "MCP args")
+        auth_profile_json = _checked_json(auth_profile or {}, MAX_EVENT_PAYLOAD_BYTES, "MCP auth profile")
+        with self.transaction(guard=False) as conn:
+            conn.execute(
+                """
+                INSERT INTO mcp_connections(
+                    connection_id, server_name, transport, endpoint, args_json,
+                    auth_profile_json, status, last_connected_at, last_error,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'configured', NULL, NULL, ?, ?)
+                ON CONFLICT(server_name) DO UPDATE SET
+                    connection_id = excluded.connection_id,
+                    transport = excluded.transport,
+                    endpoint = excluded.endpoint,
+                    args_json = excluded.args_json,
+                    auth_profile_json = excluded.auth_profile_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    connection_id,
+                    server_name,
+                    transport,
+                    endpoint,
+                    args_json,
+                    auth_profile_json,
+                    now,
+                    now,
+                ),
+            )
+        return self.get_mcp_connection(connection_id)  # type: ignore[return-value]
+
+    def get_mcp_connection(self, connection_id: str) -> dict[str, Any] | None:
+        row = self._fetchone(
+            "SELECT * FROM mcp_connections WHERE connection_id = ?",
+            (connection_id,),
+        )
+        if row is None:
+            return None
+        item = dict(row)
+        item["args"] = _loads(item.pop("args_json"), [])
+        item["auth_profile"] = _loads(item.pop("auth_profile_json"), {})
+        return item
+
+    def list_mcp_connections(self) -> list[dict[str, Any]]:
+        rows = self._fetchall("SELECT * FROM mcp_connections ORDER BY server_name")
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["args"] = _loads(item.pop("args_json"), [])
+            item["auth_profile"] = _loads(item.pop("auth_profile_json"), {})
+            result.append(item)
+        return result
+
+    def update_mcp_connection_status(
+        self,
+        connection_id: str,
+        status: str,
+        *,
+        last_connected_at: float | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        if status not in {"configured", "connected", "error", "disabled"}:
+            raise ValueError(f"Invalid MCP connection status: {status!r}")
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            conn.execute(
+                """
+                UPDATE mcp_connections
+                SET status = ?, last_connected_at = COALESCE(?, last_connected_at),
+                    last_error = ?, updated_at = ?
+                WHERE connection_id = ?
+                """,
+                (status, last_connected_at, last_error, now, connection_id),
+            )
+
+    # ------------------------------------------------------------------
+    # Durable subagents, team mailboxes, and plan approvals (Phase 3)
+    # ------------------------------------------------------------------
+
+    _SUBAGENT_RUN_STATUSES = {
+        "pending", "running", "completed", "failed", "needs_review", "cancelled",
+    }
+    _PLAN_APPROVAL_STATUSES = {"requested", "approved", "rejected", "superseded"}
+    _MAILBOX_MESSAGE_STATUSES = {"delivered", "read", "archived"}
+
+    @staticmethod
+    def _subagent_run_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        item = dict(row)
+        item["messages"] = _loads(item.pop("messages_json"), [])
+        return item
+
+    def create_subagent_run(self, run_id: str, parent_task_id: str | None, child_task_id: str,
+                            repo_root: str, role: str, owner_id: str,
+                            messages: list[dict]) -> dict[str, Any]:
+        now = _now()
+        messages_json = _checked_json(messages, MAX_CHECKPOINT_BYTES, "subagent messages")
+        with self.transaction(guard=False) as conn:
+            conn.execute(
+                """
+                INSERT INTO subagent_runs(
+                    subagent_run_id, parent_task_id, child_task_id, repo_root,
+                    lane_id, role, status, owner_id, version, messages_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'default', ?, 'pending', ?, 1, ?, ?, ?)
+                """,
+                (
+                    run_id, parent_task_id, child_task_id, repo_root, role,
+                    owner_id, messages_json, now, now,
+                ),
+            )
+            self._emit_conn(conn, parent_task_id or child_task_id, "subagent_run_created", {
+                "subagent_run_id": run_id,
+                "child_task_id": child_task_id,
+                "role": role,
+                "repo_root": repo_root,
+            })
+        run = self.get_subagent_run(run_id)
+        if run is None:
+            raise RuntimeError(f"Subagent run was not persisted: {run_id}")
+        return run
+
+    def get_subagent_run(self, run_id: str) -> dict[str, Any] | None:
+        return self._subagent_run_dict(
+            self._fetchone(
+                "SELECT * FROM subagent_runs WHERE subagent_run_id = ?",
+                (run_id,),
+            )
+        )
+
+    def list_subagent_runs(self, parent_task_id: str | None = None,
+                           status: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM subagent_runs"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if parent_task_id is not None:
+            clauses.append("parent_task_id = ?")
+            params.append(parent_task_id)
+        if status is not None:
+            if status not in self._SUBAGENT_RUN_STATUSES:
+                raise ValueError(f"Invalid subagent run status: {status!r}")
+            clauses.append("status = ?")
+            params.append(status)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at, subagent_run_id"
+        rows = self._fetchall(query, tuple(params))
+        return [item for item in (self._subagent_run_dict(row) for row in rows) if item is not None]
+
+    def claim_subagent_run(self, run_id: str, owner_id: str, fencing_token: str) -> dict[str, Any]:
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            row = conn.execute(
+                "SELECT * FROM subagent_runs WHERE subagent_run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Subagent run not found: {run_id}")
+            if row["status"] not in {"pending", "running"}:
+                raise StaleState(
+                    f"Subagent run is not claimable: {run_id} status={row['status']!r}"
+                )
+            if row["fencing_token"] is not None and (
+                str(row["fencing_token"]) != str(fencing_token)
+                or str(row["owner_id"]) != str(owner_id)
+            ):
+                lease = conn.execute(
+                    "SELECT owner_id, task_id, expires_at FROM leases WHERE repo_root = ?",
+                    (row["repo_root"],),
+                ).fetchone()
+                if (
+                    lease is None
+                    or str(lease["owner_id"]) != str(owner_id)
+                    or str(lease["task_id"]) != str(row["child_task_id"])
+                    or float(lease["expires_at"]) <= now
+                ):
+                    raise StaleState(f"Subagent run is fenced by another owner: {run_id}")
+            updated = conn.execute(
+                """
+                UPDATE subagent_runs
+                SET status = 'running', owner_id = ?, fencing_token = ?,
+                    updated_at = ?, version = version + 1
+                WHERE subagent_run_id = ?
+                """,
+                (owner_id, str(fencing_token), now, run_id),
+            )
+            if updated.rowcount != 1:
+                raise StaleState(f"Subagent run changed during claim: {run_id}")
+            self._emit_conn(conn, str(row["parent_task_id"] or row["child_task_id"]), "subagent_run_claimed", {
+                "subagent_run_id": run_id,
+                "owner_id": owner_id,
+                "fencing_token": str(fencing_token),
+            })
+        return self.get_subagent_run(run_id)  # type: ignore[return-value]
+
+    def update_subagent_run(self, run_id: str, status: str | None = None,
+                            messages: list[dict] | None = None,
+                            result_summary: str | None = None,
+                            error: str | None = None,
+                            expected_version: int | None = None,
+                            fencing_token: str | None = None) -> dict[str, Any]:
+        if status is not None and status not in self._SUBAGENT_RUN_STATUSES:
+            raise ValueError(f"Invalid subagent run status: {status!r}")
+        assignments: list[str] = []
+        values: list[Any] = []
+        now = _now()
+        if status is not None:
+            assignments.append("status = ?")
+            values.append(status)
+        if messages is not None:
+            assignments.append("messages_json = ?")
+            values.append(_checked_json(messages, MAX_CHECKPOINT_BYTES, "subagent messages"))
+        if result_summary is not None:
+            assignments.append("result_summary = ?")
+            values.append(result_summary)
+        if error is not None:
+            assignments.append("error = ?")
+            values.append(_safe_reason(error))
+        assignments.append("updated_at = ?")
+        values.append(now)
+        assignments.append("version = version + 1")
+        where = "subagent_run_id = ?"
+        params: list[Any] = []
+        params.extend(values)
+        params.append(run_id)
+        if expected_version is not None:
+            where += " AND version = ?"
+            params.append(int(expected_version))
+        if fencing_token is not None:
+            where += " AND fencing_token = ?"
+            params.append(str(fencing_token))
+        with self.transaction(guard=False) as conn:
+            cursor = conn.execute(
+                f"UPDATE subagent_runs SET {', '.join(assignments)} WHERE {where}",
+                params,
+            )
+            if cursor.rowcount != 1:
+                raise StaleState(f"Subagent run state changed before update: {run_id}")
+        return self.get_subagent_run(run_id)  # type: ignore[return-value]
+
+    def complete_subagent_run(self, run_id: str, result_summary: str,
+                              messages: list[dict], expected_version: int,
+                              fencing_token: str) -> dict[str, Any]:
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            row = conn.execute(
+                "SELECT status, parent_task_id, child_task_id FROM subagent_runs WHERE subagent_run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Subagent run not found: {run_id}")
+            if row["status"] != "running":
+                raise StaleState(
+                    f"Subagent run is not running: {run_id} status={row['status']!r}"
+                )
+            cursor = conn.execute(
+                """
+                UPDATE subagent_runs
+                SET status = 'completed', result_summary = ?, messages_json = ?,
+                    error = NULL, updated_at = ?, version = version + 1
+                WHERE subagent_run_id = ? AND version = ? AND fencing_token = ?
+                """,
+                (
+                    result_summary,
+                    _checked_json(messages, MAX_CHECKPOINT_BYTES, "subagent messages"),
+                    now, run_id, int(expected_version), str(fencing_token),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StaleState(f"Subagent run changed during completion: {run_id}")
+            self._emit_conn(conn, str(row["parent_task_id"] or row["child_task_id"]), "subagent_run_completed", {
+                "subagent_run_id": run_id,
+                "result_chars": len(result_summary),
+            })
+        return self.get_subagent_run(run_id)  # type: ignore[return-value]
+
+    def fail_subagent_run(self, run_id: str, error: str, expected_version: int,
+                          fencing_token: str) -> dict[str, Any]:
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            row = conn.execute(
+                "SELECT status, parent_task_id, child_task_id FROM subagent_runs WHERE subagent_run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Subagent run not found: {run_id}")
+            if row["status"] not in {"pending", "running"}:
+                raise StaleState(
+                    f"Subagent run cannot fail: {run_id} status={row['status']!r}"
+                )
+            cursor = conn.execute(
+                """
+                UPDATE subagent_runs
+                SET status = 'failed', error = ?, updated_at = ?, version = version + 1
+                WHERE subagent_run_id = ? AND version = ? AND fencing_token = ?
+                """,
+                (_safe_reason(error), now, run_id, int(expected_version), str(fencing_token)),
+            )
+            if cursor.rowcount != 1:
+                raise StaleState(f"Subagent run changed before failure: {run_id}")
+            self._emit_conn(conn, str(row["parent_task_id"] or row["child_task_id"]), "subagent_run_failed", {
+                "subagent_run_id": run_id,
+                "error": _safe_reason(error),
+            })
+        return self.get_subagent_run(run_id)  # type: ignore[return-value]
+
+    def cancel_subagent_run(self, run_id: str, reason: str,
+                            expected_version: int, fencing_token: str) -> dict[str, Any]:
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            row = conn.execute(
+                "SELECT status, parent_task_id, child_task_id FROM subagent_runs WHERE subagent_run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Subagent run not found: {run_id}")
+            if row["status"] not in {"pending", "running", "needs_review"}:
+                raise StaleState(
+                    f"Subagent run cannot be cancelled: {run_id} status={row['status']!r}"
+                )
+            cursor = conn.execute(
+                """
+                UPDATE subagent_runs
+                SET status = 'cancelled', error = ?, updated_at = ?, version = version + 1
+                WHERE subagent_run_id = ? AND version = ? AND fencing_token = ?
+                """,
+                (_safe_reason(reason), now, run_id, int(expected_version), str(fencing_token)),
+            )
+            if cursor.rowcount != 1:
+                raise StaleState(f"Subagent run changed before cancellation: {run_id}")
+            self._emit_conn(conn, str(row["parent_task_id"] or row["child_task_id"]), "subagent_run_cancelled", {
+                "subagent_run_id": run_id,
+                "reason": _safe_reason(reason),
+            })
+        return self.get_subagent_run(run_id)  # type: ignore[return-value]
+
+    def mark_subagent_needs_review(self, run_id: str, reason: str,
+                                   expected_version: int, fencing_token: str) -> dict[str, Any]:
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            row = conn.execute(
+                "SELECT status, parent_task_id, child_task_id FROM subagent_runs WHERE subagent_run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Subagent run not found: {run_id}")
+            if row["status"] != "running":
+                raise StaleState(
+                    f"Subagent run cannot enter review: {run_id} status={row['status']!r}"
+                )
+            cursor = conn.execute(
+                """
+                UPDATE subagent_runs
+                SET status = 'needs_review', error = ?, updated_at = ?,
+                    version = version + 1
+                WHERE subagent_run_id = ? AND version = ? AND fencing_token = ?
+                """,
+                (_safe_reason(reason), now, run_id, int(expected_version), str(fencing_token)),
+            )
+            if cursor.rowcount != 1:
+                raise StaleState(f"Subagent run changed before review: {run_id}")
+            self._emit_conn(conn, str(row["parent_task_id"] or row["child_task_id"]), "subagent_run_needs_review", {
+                "subagent_run_id": run_id,
+                "reason": _safe_reason(reason),
+            })
+        return self.get_subagent_run(run_id)  # type: ignore[return-value]
+
+    def ensure_mailbox(self, owner_task_id: str, owner_role: str,
+                       mailbox_id: str | None = None) -> dict[str, Any]:
+        mailbox_id = mailbox_id or f"mailbox-{owner_task_id}"
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO mailboxes(
+                    mailbox_id, owner_task_id, owner_role, version, created_at, updated_at
+                ) VALUES (?, ?, ?, 1, ?, ?)
+                """,
+                (mailbox_id, owner_task_id, owner_role, now, now),
+            )
+        return self.get_mailbox(owner_task_id)  # type: ignore[return-value]
+
+    def get_mailbox(self, owner_task_id: str) -> dict[str, Any] | None:
+        return self._row(
+            self._fetchone(
+                "SELECT * FROM mailboxes WHERE owner_task_id = ?",
+                (owner_task_id,),
+            )
+        )
+
+    def get_mailbox_by_id(self, mailbox_id: str) -> dict[str, Any] | None:
+        return self._row(
+            self._fetchone(
+                "SELECT * FROM mailboxes WHERE mailbox_id = ?",
+                (mailbox_id,),
+            )
+        )
+
+    def send_mailbox_message(self, message_id: str, mailbox_id: str,
+                             sender_task_id: str, recipient_task_id: str,
+                             payload: dict[str, Any]) -> dict[str, Any]:
+        payload_json = _checked_json(payload, MAX_EVENT_PAYLOAD_BYTES, "mailbox payload")
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            mailbox = conn.execute(
+                "SELECT mailbox_id FROM mailboxes WHERE mailbox_id = ?",
+                (mailbox_id,),
+            ).fetchone()
+            if mailbox is None:
+                raise KeyError(f"Mailbox not found: {mailbox_id}")
+            existing = conn.execute(
+                "SELECT payload_json FROM mailbox_messages WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["payload_json"] != payload_json:
+                    raise StaleState(f"Mailbox message id reused with different payload: {message_id}")
+                return self.get_mailbox_message(message_id)  # type: ignore[return-value]
+            conn.execute(
+                """
+                INSERT INTO mailbox_messages(
+                    message_id, mailbox_id, sender_task_id, recipient_task_id,
+                    payload_json, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'delivered', ?)
+                """,
+                (message_id, mailbox_id, sender_task_id, recipient_task_id, payload_json, now),
+            )
+            conn.execute(
+                "UPDATE mailboxes SET updated_at = ?, version = version + 1 WHERE mailbox_id = ?",
+                (now, mailbox_id),
+            )
+            self._emit_conn(conn, sender_task_id, "mailbox_message_sent", {
+                "message_id": message_id,
+                "mailbox_id": mailbox_id,
+                "recipient_task_id": recipient_task_id,
+            })
+        return self.get_mailbox_message(message_id)  # type: ignore[return-value]
+
+    @staticmethod
+    def _mailbox_message_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        item = dict(row)
+        item["payload"] = _loads(item.pop("payload_json"), {})
+        return item
+
+    def get_mailbox_message(self, message_id: str) -> dict[str, Any] | None:
+        return self._mailbox_message_dict(
+            self._fetchone(
+                "SELECT * FROM mailbox_messages WHERE message_id = ?",
+                (message_id,),
+            )
+        )
+
+    def list_mailbox_messages(self, mailbox_id: str,
+                              status: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM mailbox_messages WHERE mailbox_id = ?"
+        params: list[Any] = [mailbox_id]
+        if status is not None:
+            if status not in self._MAILBOX_MESSAGE_STATUSES:
+                raise ValueError(f"Invalid mailbox message status: {status!r}")
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY created_at, message_id"
+        rows = self._fetchall(query, tuple(params))
+        return [
+            item for item in (self._mailbox_message_dict(row) for row in rows) if item is not None
+        ]
+
+    def read_mailbox_messages(self, mailbox_id: str, recipient_task_id: str,
+                              limit: int = 50) -> list[dict[str, Any]]:
+        if limit < 1:
+            raise ValueError("Mailbox read limit must be positive")
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            mailbox = conn.execute(
+                "SELECT mailbox_id FROM mailboxes WHERE mailbox_id = ?",
+                (mailbox_id,),
+            ).fetchone()
+            if mailbox is None:
+                raise KeyError(f"Mailbox not found: {mailbox_id}")
+            rows = conn.execute(
+                """
+                SELECT * FROM mailbox_messages
+                WHERE mailbox_id = ? AND recipient_task_id = ? AND status = 'delivered'
+                ORDER BY created_at, message_id LIMIT ?
+                """,
+                (mailbox_id, recipient_task_id, int(limit)),
+            ).fetchall()
+            message_ids = [str(row["message_id"]) for row in rows]
+            if message_ids:
+                placeholders = ",".join("?" for _ in message_ids)
+                conn.execute(
+                    f"""
+                    UPDATE mailbox_messages
+                    SET status = 'read', read_at = ?
+                    WHERE message_id IN ({placeholders}) AND status = 'delivered'
+                    """,
+                    [now, *message_ids],
+                )
+                conn.execute(
+                    "UPDATE mailboxes SET updated_at = ?, version = version + 1 WHERE mailbox_id = ?",
+                    (now, mailbox_id),
+                )
+                rows = conn.execute(
+                    f"""
+                    SELECT * FROM mailbox_messages
+                    WHERE message_id IN ({placeholders})
+                    ORDER BY created_at, message_id
+                    """,
+                    tuple(message_ids),
+                ).fetchall()
+            return [
+                item for item in (
+                    self._mailbox_message_dict(row) for row in rows
+                ) if item is not None
+            ]
+
+    def archive_mailbox_message(self, message_id: str, expected_version: int) -> dict[str, Any]:
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            message = conn.execute(
+                "SELECT mailbox_id, status FROM mailbox_messages WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+            if message is None:
+                raise KeyError(f"Mailbox message not found: {message_id}")
+            if message["status"] != "read":
+                raise StaleState(
+                    f"Mailbox message is not readable: {message_id} status={message['status']!r}"
+                )
+            mailbox = conn.execute(
+                "SELECT version FROM mailboxes WHERE mailbox_id = ?",
+                (message["mailbox_id"],),
+            ).fetchone()
+            if mailbox is None or int(mailbox["version"]) != int(expected_version):
+                raise StaleState(f"Mailbox version changed before archive: {message_id}")
+            cursor = conn.execute(
+                """
+                UPDATE mailbox_messages
+                SET status = 'archived'
+                WHERE message_id = ? AND status = 'read'
+                """,
+                (message_id,),
+            )
+            if cursor.rowcount != 1:
+                raise StaleState(f"Mailbox message changed during archive: {message_id}")
+            conn.execute(
+                "UPDATE mailboxes SET updated_at = ?, version = version + 1 WHERE mailbox_id = ?",
+                (now, message["mailbox_id"]),
+            )
+        return self.get_mailbox_message(message_id)  # type: ignore[return-value]
+
+    def create_plan_approval(self, approval_id: str, subagent_run_id: str,
+                             plan_hash: str, requested_by: str) -> dict[str, Any]:
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            run = conn.execute(
+                "SELECT parent_task_id, child_task_id FROM subagent_runs WHERE subagent_run_id = ?",
+                (subagent_run_id,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"Subagent run not found: {subagent_run_id}")
+            conn.execute(
+                """
+                INSERT INTO plan_approvals(
+                    approval_id, subagent_run_id, plan_hash, status, requested_by,
+                    version, created_at, updated_at
+                ) VALUES (?, ?, ?, 'requested', ?, 1, ?, ?)
+                """,
+                (approval_id, subagent_run_id, plan_hash, requested_by, now, now),
+            )
+            self._emit_conn(conn, str(run["parent_task_id"] or run["child_task_id"]), "plan_approval_requested", {
+                "approval_id": approval_id,
+                "subagent_run_id": subagent_run_id,
+                "plan_hash": plan_hash,
+                "requested_by": requested_by,
+            })
+        return self.get_plan_approval(approval_id)  # type: ignore[return-value]
+
+    @staticmethod
+    def _plan_approval_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        return dict(row) if row is not None else None
+
+    def get_plan_approval(self, approval_id: str) -> dict[str, Any] | None:
+        return self._plan_approval_dict(
+            self._fetchone(
+                "SELECT * FROM plan_approvals WHERE approval_id = ?",
+                (approval_id,),
+            )
+        )
+
+    def list_plan_approvals(self, subagent_run_id: str | None = None,
+                            status: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM plan_approvals"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if subagent_run_id is not None:
+            clauses.append("subagent_run_id = ?")
+            params.append(subagent_run_id)
+        if status is not None:
+            if status not in self._PLAN_APPROVAL_STATUSES:
+                raise ValueError(f"Invalid plan approval status: {status!r}")
+            clauses.append("status = ?")
+            params.append(status)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at, approval_id"
+        rows = self._fetchall(query, tuple(params))
+        return [
+            item for item in (self._plan_approval_dict(row) for row in rows) if item is not None
+        ]
+
+    def transition_plan_approval(self, approval_id: str, new_status: str,
+                                 decided_by: str | None = None,
+                                 reason: str | None = None,
+                                 expected_version: int | None = None) -> dict[str, Any]:
+        if new_status not in {"approved", "rejected", "superseded"}:
+            raise ValueError(f"Invalid plan approval transition: {new_status!r}")
+        now = _now()
+        with self.transaction(guard=False) as conn:
+            row = conn.execute(
+                "SELECT * FROM plan_approvals WHERE approval_id = ?",
+                (approval_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Plan approval not found: {approval_id}")
+            run = conn.execute(
+                "SELECT parent_task_id, child_task_id FROM subagent_runs WHERE subagent_run_id = ?",
+                (row["subagent_run_id"],),
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"Subagent run not found: {row['subagent_run_id']}")
+            if row["status"] != "requested":
+                raise StaleState(
+                    f"Plan approval is not actionable: {approval_id} status={row['status']!r}"
+                )
+            if expected_version is not None and int(row["version"]) != int(expected_version):
+                raise StaleState(f"Plan approval state changed before transition: {approval_id}")
+            cursor = conn.execute(
+                """
+                UPDATE plan_approvals
+                SET status = ?, decided_by = ?, reason = ?, updated_at = ?,
+                    version = version + 1
+                WHERE approval_id = ? AND status = 'requested'
+                """,
+                (new_status, decided_by, reason, now, approval_id),
+            )
+            if cursor.rowcount != 1:
+                raise StaleState(f"Plan approval changed during transition: {approval_id}")
+            if new_status in {"approved", "rejected"}:
+                conn.execute(
+                    """
+                    UPDATE plan_approvals
+                    SET status = 'superseded', updated_at = ?, version = version + 1
+                    WHERE subagent_run_id = ? AND approval_id != ? AND status = 'requested'
+                    """,
+                    (now, row["subagent_run_id"], approval_id),
+                )
+            self._emit_conn(conn, str(run["parent_task_id"] or run["child_task_id"]), "plan_approval_decided", {
+                "approval_id": approval_id,
+                "status": new_status,
+                "decided_by": decided_by,
+            })
+        return self.get_plan_approval(approval_id)  # type: ignore[return-value]
+
     def scan_invariants(self, task_id: str | None = None) -> list[str]:
         """Return durable state inconsistencies without attempting silent repair."""
         violations: list[str] = []
@@ -2314,6 +5533,7 @@ class EventStore:
                     conn,
                     task_id,
                     allow_prepared_operations=True,
+                    allow_workspace_cleanup=True,
                 )
             )
             leases = conn.execute("SELECT * FROM leases").fetchall()
@@ -2361,9 +5581,688 @@ class EventStore:
                         violations.append(f"operation {operation['operation_id']}: tool call projection mismatch")
                     if call["effect"] == "read_only":
                         violations.append(f"operation {operation['operation_id']}: read-only call has operation")
+            self._scan_v6_invariants(conn, task_id, violations)
+            self._scan_plan_revision_invariants(conn, task_id, violations)
+            self._scan_replan_decision_invariants(conn, task_id, violations)
+            self._scan_verified_subtask_invariants(conn, task_id, violations)
+            self._scan_job_invariants(conn, task_id, violations)
+            self._scan_subagent_invariants(conn, task_id, violations)
         finally:
             conn.close()
         return violations
+
+    def _scan_replan_decision_invariants(
+        self, conn: sqlite3.Connection, task_id: str | None, violations: list[str]
+    ) -> None:
+        rows = conn.execute(
+            "SELECT * FROM replan_decisions" + (" WHERE task_id = ?" if task_id else "")
+            + " ORDER BY decision_id", (task_id,) if task_id else (),
+        ).fetchall()
+        structural = {"SPLIT", "ADD_ITEM", "CHANGE_DEPENDENCY", "TOMBSTONE_PENDING"}
+        for row in rows:
+            label = f"replan decision {row['decision_id']}"
+            if row["outcome"] not in {"accepted", "rejected"}:
+                violations.append(f"{label}: invalid outcome")
+            revision_id = row["result_revision_id"]
+            if row["outcome"] == "accepted" and row["decision_type"] in structural:
+                revision = conn.execute(
+                    "SELECT * FROM plan_revisions WHERE revision_id = ?", (revision_id,)
+                ).fetchone()
+                if (revision is None or revision["task_id"] != row["task_id"]
+                        or revision["parent_revision_id"] != row["base_revision_id"]
+                        or revision["trigger"] != "c1c_controller"):
+                    violations.append(f"{label}: accepted patch has no matching PlanRevision")
+                elif row["signal_id"] not in _loads(revision["evidence_refs_json"], []):
+                    violations.append(f"{label}: PlanRevision lacks signal evidence")
+            elif revision_id is not None:
+                violations.append(f"{label}: non-structural or rejected decision has a revision")
+            recorded = conn.execute(
+                "SELECT payload_json FROM events WHERE task_id = ? AND type = 'replan_decision_recorded'",
+                (row["task_id"],),
+            ).fetchall()
+            if not any(
+                (payload := _loads(event["payload_json"], {})).get("signal_id") == row["signal_id"]
+                and payload.get("base_revision_id") == row["base_revision_id"]
+                and payload.get("outcome") == row["outcome"]
+                for event in recorded
+            ):
+                violations.append(f"{label}: missing decision audit event")
+
+    def _scan_plan_revision_invariants(
+        self,
+        conn: sqlite3.Connection,
+        task_id: str | None,
+        violations: list[str],
+    ) -> None:
+        tasks = conn.execute(
+            "SELECT * FROM tasks" + (" WHERE task_id = ?" if task_id is not None else ""),
+            (task_id,) if task_id is not None else (),
+        ).fetchall()
+        for task in tasks:
+            latest = conn.execute(
+                "SELECT * FROM plans WHERE task_id = ? ORDER BY plan_id DESC LIMIT 1",
+                (task["task_id"],),
+            ).fetchone()
+            binding = task["execution_plan_revision_id"]
+            if latest is None:
+                if binding is not None:
+                    violations.append(f"task {task['task_id']}: execution revision without Plan")
+                continue
+            execution = conn.execute(
+                "SELECT * FROM plan_revisions WHERE revision_id = ?", (binding,),
+            ).fetchone()
+            if (execution is None or execution["plan_id"] != latest["plan_id"]
+                    or execution["task_id"] != task["task_id"]):
+                violations.append(f"task {task['task_id']}: missing or foreign execution revision binding")
+            elif int(execution["revision_number"]) > 0:
+                events = conn.execute(
+                    "SELECT payload_json FROM events WHERE task_id = ? AND type = 'plan_revision_activated'",
+                    (task["task_id"],),
+                ).fetchall()
+                if not any(_loads(event["payload_json"], {}).get("revision_id") == binding for event in events):
+                    violations.append(f"task {task['task_id']}: execution revision missing activation audit")
+        if task_id is None:
+            plans = conn.execute("SELECT * FROM plans ORDER BY plan_id").fetchall()
+        else:
+            plans = conn.execute(
+                "SELECT * FROM plans WHERE task_id = ? ORDER BY plan_id",
+                (task_id,),
+            ).fetchall()
+        for plan in plans:
+            plan_id = int(plan["plan_id"])
+            current_revision_id = plan["current_revision_id"]
+            revisions = conn.execute(
+                "SELECT * FROM plan_revisions WHERE plan_id = ? ORDER BY revision_number",
+                (plan_id,),
+            ).fetchall()
+            if not revisions:
+                violations.append(f"plan {plan_id}: missing PlanRevision history")
+                continue
+            expected_parent: str | None = None
+            decoded_by_id: dict[str, tuple[PlanRevisionItem, ...]] = {}
+            for expected_number, revision in enumerate(revisions):
+                revision_id = str(revision["revision_id"])
+                if str(revision["task_id"]) != str(plan["task_id"]):
+                    violations.append(f"PlanRevision {revision_id}: task mismatch")
+                if int(revision["revision_number"]) != expected_number:
+                    violations.append(f"PlanRevision {revision_id}: non-contiguous revision number")
+                actual_parent = (
+                    str(revision["parent_revision_id"])
+                    if revision["parent_revision_id"] is not None
+                    else None
+                )
+                if actual_parent != expected_parent:
+                    violations.append(f"PlanRevision {revision_id}: parent chain mismatch")
+                try:
+                    items = decode_snapshot(str(revision["snapshot_json"]))
+                    validate_snapshot(items)
+                    if plan_dag_hash(items) != str(revision["dag_hash"]):
+                        violations.append(f"PlanRevision {revision_id}: DAG hash mismatch")
+                    decoded_by_id[revision_id] = items
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    violations.append(f"PlanRevision {revision_id}: invalid snapshot: {exc}")
+                if not is_valid_sha256(str(revision["dag_hash"])):
+                    violations.append(f"PlanRevision {revision_id}: invalid DAG hash")
+                if not is_valid_sha256(str(revision["patch_hash"])):
+                    violations.append(f"PlanRevision {revision_id}: invalid patch hash")
+                expected_id = make_plan_revision_id(
+                    task_id=str(revision["task_id"]),
+                    plan_id=plan_id,
+                    parent_revision_id=actual_parent,
+                    revision_number=int(revision["revision_number"]),
+                    dag_digest=str(revision["dag_hash"]),
+                    patch_digest=str(revision["patch_hash"]),
+                )
+                if expected_id != revision_id:
+                    violations.append(f"PlanRevision {revision_id}: revision identity mismatch")
+                expected_parent = revision_id
+
+            latest_revision_id = str(revisions[-1]["revision_id"])
+            if current_revision_id != latest_revision_id:
+                violations.append(
+                    f"plan {plan_id}: current revision {current_revision_id!r} "
+                    f"does not match latest {latest_revision_id!r}"
+                )
+            current_items = decoded_by_id.get(str(current_revision_id))
+            if current_items is None:
+                violations.append(f"plan {plan_id}: current PlanRevision is missing or invalid")
+                continue
+            projection_rows = conn.execute(
+                "SELECT subtask_id, description, blocked_by_json, verifier_bundle_hash, "
+                "max_turns, tombstoned FROM plan_items WHERE plan_id = ? ORDER BY plan_item_id",
+                (plan_id,),
+            ).fetchall()
+            projection = self._plan_revision_items_from_rows(projection_rows)
+            if projection != current_items:
+                violations.append(f"plan {plan_id}: PlanItem projection differs from current revision")
+
+            revision_events = {
+                str(json.loads(event["payload_json"]).get("revision_id"))
+                for event in conn.execute(
+                    "SELECT payload_json FROM events WHERE task_id = ? "
+                    "AND type = 'plan_revision_created'",
+                    (str(plan["task_id"]),),
+                ).fetchall()
+            }
+            for revision in revisions[1:]:
+                revision_id = str(revision["revision_id"])
+                if revision_id not in revision_events:
+                    violations.append(f"PlanRevision {revision_id}: missing audit event")
+
+    def _scan_verified_subtask_invariants(
+        self,
+        conn: sqlite3.Connection,
+        task_id: str | None,
+        violations: list[str],
+    ) -> None:
+        if task_id is None:
+            items = conn.execute(
+                "SELECT i.*, p.task_id FROM plan_items i "
+                "JOIN plans p ON p.plan_id = i.plan_id"
+            ).fetchall()
+            runs = conn.execute("SELECT * FROM verifier_runs").fetchall()
+            semantic_rows = conn.execute("SELECT * FROM semantic_checkpoints").fetchall()
+            state_rows = conn.execute(
+                "SELECT * FROM semantic_checkpoint_state_events ORDER BY state_event_id"
+            ).fetchall()
+        else:
+            items = conn.execute(
+                "SELECT i.*, p.task_id FROM plan_items i "
+                "JOIN plans p ON p.plan_id = i.plan_id WHERE p.task_id = ?",
+                (task_id,),
+            ).fetchall()
+            runs = conn.execute(
+                "SELECT * FROM verifier_runs WHERE task_id = ?", (task_id,)
+            ).fetchall()
+            semantic_rows = conn.execute(
+                "SELECT * FROM semantic_checkpoints WHERE task_id = ?", (task_id,)
+            ).fetchall()
+            state_rows = conn.execute(
+                "SELECT * FROM semantic_checkpoint_state_events WHERE task_id = ? "
+                "ORDER BY state_event_id",
+                (task_id,),
+            ).fetchall()
+
+        item_by_id = {int(item["plan_item_id"]): item for item in items}
+        runs_by_item: dict[int, list[sqlite3.Row]] = {}
+        runs_by_id: dict[str, sqlite3.Row] = {}
+        semantic_by_id = {
+            int(semantic["semantic_checkpoint_id"]): semantic
+            for semantic in semantic_rows
+        }
+        latest_state_by_checkpoint: dict[int, sqlite3.Row] = {}
+        states_by_checkpoint: dict[int, list[sqlite3.Row]] = {}
+        for state in state_rows:
+            state_id = int(state["state_event_id"])
+            checkpoint_id = int(state["semantic_checkpoint_id"])
+            states_by_checkpoint.setdefault(checkpoint_id, []).append(state)
+            latest_state_by_checkpoint[checkpoint_id] = state
+            if state["state"] not in {"valid", "stale", "superseded"}:
+                violations.append(
+                    f"checkpoint_state_event {state_id}: invalid state {state['state']!r}"
+                )
+            if int(state["observation_complete"]) not in {0, 1}:
+                violations.append(f"checkpoint_state_event {state_id}: invalid observation flag")
+            if not str(state["reason"] or "").strip():
+                violations.append(f"checkpoint_state_event {state_id}: missing reason")
+            try:
+                observed_manifest = _loads(state["observed_manifest_json"], [])
+                if not isinstance(observed_manifest, list):
+                    raise ValueError("manifest is not a list")
+            except (TypeError, ValueError):
+                violations.append(f"checkpoint_state_event {state_id}: invalid observed manifest")
+            checkpoint = semantic_by_id.get(checkpoint_id)
+            if checkpoint is None:
+                violations.append(
+                    f"checkpoint_state_event {state_id}: missing semantic checkpoint {checkpoint_id}"
+                )
+                continue
+            if str(state["task_id"]) != str(checkpoint["task_id"]):
+                violations.append(f"checkpoint_state_event {state_id}: task mismatch")
+            if int(state["plan_item_id"]) != int(checkpoint["plan_item_id"]):
+                violations.append(f"checkpoint_state_event {state_id}: plan item mismatch")
+            if state["state"] == "superseded":
+                replacement = state["replacement_checkpoint_id"]
+                if replacement is None:
+                    violations.append(
+                        f"checkpoint_state_event {state_id}: superseded checkpoint has no replacement"
+                    )
+                elif int(replacement) == checkpoint_id:
+                    violations.append(
+                        f"checkpoint_state_event {state_id}: superseded checkpoint replaces itself"
+                    )
+
+        for run in runs:
+            run_id = str(run["verifier_run_id"])
+            runs_by_id[run_id] = run
+            item_id = int(run["plan_item_id"])
+            runs_by_item.setdefault(item_id, []).append(run)
+            if run["status"] not in {"pass", "fail", "uncertain"}:
+                violations.append(f"verifier_run {run_id}: invalid status {run['status']!r}")
+            if int(run["authoritative"]) not in {0, 1}:
+                violations.append(f"verifier_run {run_id}: invalid authoritative flag")
+            if int(run["authoritative"]) and run["status"] != "pass":
+                violations.append(f"verifier_run {run_id}: non-pass run is authoritative")
+            if not int(run["authoritative"]) and run["status"] == "pass":
+                violations.append(f"verifier_run {run_id}: pass run is non-authoritative")
+            if item_id not in item_by_id:
+                violations.append(f"verifier_run {run_id}: missing plan item {item_id}")
+                continue
+            item = item_by_id[item_id]
+            if str(item["task_id"]) != str(run["task_id"]):
+                violations.append(f"verifier_run {run_id}: task projection mismatch")
+            if str(item["subtask_id"]) != str(run["subtask_id"]):
+                violations.append(f"verifier_run {run_id}: subtask projection mismatch")
+            if item["verifier_bundle_hash"] != run["verifier_bundle_hash"]:
+                violations.append(f"verifier_run {run_id}: verifier bundle hash mismatch")
+            try:
+                manifest = _loads(run["evidence_manifest_json"], [])
+                if sha256_json(manifest) != str(run["evidence_hash"]):
+                    violations.append(f"verifier_run {run_id}: evidence hash mismatch")
+                if int(run["authoritative"]) and any(
+                    not is_valid_sha256(entry.get("sha256", ""))
+                    for entry in manifest
+                    if isinstance(entry, dict)
+                ):
+                    violations.append(f"verifier_run {run_id}: invalid authoritative SHA-256")
+            except (TypeError, ValueError):
+                violations.append(f"verifier_run {run_id}: invalid evidence manifest")
+            checkpoint = conn.execute(
+                "SELECT 1 FROM checkpoints WHERE checkpoint_id = ? AND task_id = ?",
+                (run["execution_checkpoint_id"], run["task_id"]),
+            ).fetchone()
+            if checkpoint is None:
+                violations.append(f"verifier_run {run_id}: missing execution checkpoint")
+
+        semantic_by_run: dict[str, list[sqlite3.Row]] = {}
+        for semantic in semantic_rows:
+            semantic_id = int(semantic["semantic_checkpoint_id"])
+            run_id = str(semantic["verifier_run_id"])
+            semantic_by_run.setdefault(run_id, []).append(semantic)
+            run = runs_by_id.get(run_id)
+            if run is None:
+                violations.append(
+                    f"verified_subtask_checkpoint {semantic_id}: missing verifier run {run_id}"
+                )
+                continue
+            state = latest_state_by_checkpoint.get(semantic_id)
+            if state is None:
+                violations.append(
+                    f"verified_subtask_checkpoint {semantic_id}: missing lifecycle state"
+                )
+            if not int(run["authoritative"]) or run["status"] != "pass":
+                violations.append(
+                    f"verified_subtask_checkpoint {semantic_id}: verifier run is not authoritative pass"
+                )
+            if int(semantic["plan_item_id"]) != int(run["plan_item_id"]):
+                violations.append(f"verified_subtask_checkpoint {semantic_id}: plan item mismatch")
+            if str(semantic["task_id"]) != str(run["task_id"]):
+                violations.append(f"verified_subtask_checkpoint {semantic_id}: task mismatch")
+            for field in (
+                "subtask_id",
+                "execution_checkpoint_id",
+                "completion_summary",
+                "verifier_id",
+                "verifier_version",
+                "verification_rule",
+                "verifier_bundle_hash",
+                "verifier_implementation_hash",
+                "evidence_hash",
+            ):
+                if semantic[field] != run[field]:
+                    violations.append(
+                        f"verified_subtask_checkpoint {semantic_id}: {field} mismatch"
+                    )
+            if semantic["evidence_manifest_json"] != run["evidence_manifest_json"]:
+                violations.append(
+                    f"verified_subtask_checkpoint {semantic_id}: evidence manifest mismatch"
+                )
+            checkpoint = conn.execute(
+                "SELECT 1 FROM checkpoints WHERE checkpoint_id = ? AND task_id = ?",
+                (semantic["execution_checkpoint_id"], semantic["task_id"]),
+            ).fetchone()
+            if checkpoint is None:
+                violations.append(
+                    f"verified_subtask_checkpoint {semantic_id}: missing execution checkpoint"
+                )
+
+        for item_id, item in item_by_id.items():
+            bundle_hash = item["verifier_bundle_hash"]
+            if not bundle_hash:
+                continue
+            item_runs = runs_by_item.get(item_id, [])
+            authoritative = [
+                run for run in item_runs
+                if int(run["authoritative"]) and run["status"] == "pass"
+            ]
+            linked = [
+                semantic for semantic in semantic_rows
+                if int(semantic["plan_item_id"]) == item_id
+            ]
+            current_valid = []
+            for semantic in linked:
+                state = latest_state_by_checkpoint.get(int(semantic["semantic_checkpoint_id"]))
+                if state is not None and state["state"] == "valid":
+                    current_valid.append(semantic)
+            if item["status"] == "completed":
+                if not authoritative:
+                    violations.append(
+                        f"plan_item {item_id}: completed without an authoritative verifier run"
+                    )
+                if len(current_valid) != 1:
+                    violations.append(
+                        f"plan_item {item_id}: completed has {len(current_valid)} current valid checkpoints"
+                    )
+            elif current_valid:
+                violations.append(
+                    f"plan_item {item_id}: {item['status']} has a current valid checkpoint"
+                )
+
+            if len(current_valid) > 1:
+                violations.append(
+                    f"plan_item {item_id}: multiple current valid checkpoints"
+                )
+
+        for checkpoint_id, states in states_by_checkpoint.items():
+            if len(states) == 0:
+                continue
+            original = semantic_by_id.get(checkpoint_id)
+            if original is None:
+                continue
+            if states[0]["state"] != "valid":
+                violations.append(
+                    f"verified_subtask_checkpoint {checkpoint_id}: lifecycle does not start valid"
+                )
+            terminal_seen = False
+            for state in states:
+                state_value = str(state["state"])
+                if terminal_seen:
+                    violations.append(
+                        f"verified_subtask_checkpoint {checkpoint_id}: lifecycle reopens after {state_value}"
+                    )
+                if state_value in {"stale", "superseded"}:
+                    terminal_seen = True
+            latest = states[-1]
+            if latest["state"] == "superseded":
+                replacement_id = latest["replacement_checkpoint_id"]
+                replacement = semantic_by_id.get(int(replacement_id)) if replacement_id is not None else None
+                if replacement is None:
+                    continue
+                if (
+                    str(replacement["task_id"]) != str(original["task_id"])
+                    or int(replacement["plan_item_id"]) != int(original["plan_item_id"])
+                    or str(replacement["verifier_bundle_hash"])
+                    != str(original["verifier_bundle_hash"])
+                ):
+                    violations.append(
+                        f"verified_subtask_checkpoint {checkpoint_id}: replacement mismatch"
+                    )
+                else:
+                    replacement_state = latest_state_by_checkpoint.get(int(replacement_id))
+                    if replacement_state is None or replacement_state["state"] != "valid":
+                        violations.append(
+                            f"verified_subtask_checkpoint {checkpoint_id}: replacement is not current valid"
+                        )
+
+        for run_id, linked in semantic_by_run.items():
+            if len(linked) > 1:
+                violations.append(
+                    f"verifier_run {run_id}: linked to {len(linked)} verified-subtask checkpoints"
+                )
+
+    def _scan_subagent_invariants(self, conn: sqlite3.Connection,
+                                  task_id: str | None, violations: list[str]) -> None:
+        if task_id is not None:
+            runs = conn.execute(
+                "SELECT * FROM subagent_runs WHERE parent_task_id = ? OR child_task_id = ?",
+                (task_id, task_id),
+            ).fetchall()
+        else:
+            runs = conn.execute("SELECT * FROM subagent_runs").fetchall()
+        for run in runs:
+            run_id = str(run["subagent_run_id"])
+            if run["status"] not in self._SUBAGENT_RUN_STATUSES:
+                violations.append(f"subagent_run {run_id}: invalid status {run['status']!r}")
+            if int(run["version"]) < 1:
+                violations.append(f"subagent_run {run_id}: invalid version {run['version']}")
+            if run["status"] == "running" and run["fencing_token"] is None:
+                violations.append(f"subagent_run {run_id}: running without fencing token")
+            if run["status"] in {"completed", "failed"} and run["fencing_token"] is None:
+                violations.append(f"subagent_run {run_id}: {run['status']} without fencing token")
+            child = conn.execute(
+                "SELECT 1 FROM tasks WHERE task_id = ?",
+                (run["child_task_id"],),
+            ).fetchone()
+            if child is None:
+                violations.append(f"subagent_run {run_id}: missing child task {run['child_task_id']!r}")
+            requested = conn.execute(
+                "SELECT COUNT(*) AS count FROM plan_approvals "
+                "WHERE subagent_run_id = ? AND status = 'requested'",
+                (run_id,),
+            ).fetchone()["count"]
+            if requested and run["status"] != "needs_review":
+                violations.append(
+                    f"subagent_run {run_id}: requested plan approval while status={run['status']!r}"
+                )
+
+        if task_id is not None:
+            messages = conn.execute(
+                "SELECT m.* FROM mailbox_messages m JOIN mailboxes b "
+                "ON b.mailbox_id = m.mailbox_id WHERE b.owner_task_id = ?",
+                (task_id,),
+            ).fetchall()
+        else:
+            messages = conn.execute("SELECT * FROM mailbox_messages").fetchall()
+        for message in messages:
+            message_id = str(message["message_id"])
+            if message["status"] not in self._MAILBOX_MESSAGE_STATUSES:
+                violations.append(
+                    f"mailbox_message {message_id}: invalid status {message['status']!r}"
+                )
+            if message["status"] == "delivered" and message["read_at"] is not None:
+                violations.append(f"mailbox_message {message_id}: delivered with read_at")
+            if message["status"] in {"read", "archived"} and message["read_at"] is None:
+                violations.append(f"mailbox_message {message_id}: {message['status']} without read_at")
+
+        if task_id is not None:
+            approvals = conn.execute(
+                "SELECT a.* FROM plan_approvals a JOIN subagent_runs r "
+                "ON r.subagent_run_id = a.subagent_run_id "
+                "WHERE r.parent_task_id = ? OR r.child_task_id = ?",
+                (task_id, task_id),
+            ).fetchall()
+        else:
+            approvals = conn.execute("SELECT * FROM plan_approvals").fetchall()
+        for approval in approvals:
+            approval_id = str(approval["approval_id"])
+            if approval["status"] not in self._PLAN_APPROVAL_STATUSES:
+                violations.append(
+                    f"plan_approval {approval_id}: invalid status {approval['status']!r}"
+                )
+            if int(approval["version"]) < 1:
+                violations.append(f"plan_approval {approval_id}: invalid version")
+            if approval["status"] != "requested" and approval["decided_by"] is None:
+                violations.append(
+                    f"plan_approval {approval_id}: {approval['status']} without decided_by"
+                )
+
+    def _scan_job_invariants(self, conn: sqlite3.Connection, task_id: str | None,
+                             violations: list[str]) -> None:
+        valid_job_statuses = {
+            "pending", "claimed", "running", "completed", "failed", "retryable", "cancelled"
+        }
+        valid_run_statuses = {"running", "completed", "failed", "cancelled"}
+        if task_id is not None:
+            jobs = conn.execute(
+                "SELECT * FROM agent_jobs WHERE task_id = ?", (task_id,)
+            ).fetchall()
+        else:
+            jobs = conn.execute("SELECT * FROM agent_jobs").fetchall()
+        for job in jobs:
+            job_id = str(job["job_id"])
+            if job["status"] not in valid_job_statuses:
+                violations.append(f"job {job_id}: invalid status {job['status']!r}")
+            attempts = int(job["attempts"])
+            max_attempts = int(job["max_attempts"])
+            if attempts < 0 or max_attempts < 1 or attempts > max_attempts:
+                violations.append(f"job {job_id}: attempts {attempts} out of range 0..{max_attempts}")
+            runs = conn.execute(
+                "SELECT * FROM job_runs WHERE job_id = ?", (job_id,)
+            ).fetchall()
+            active = [run for run in runs if run["status"] == "running"]
+            if len(active) > 1:
+                violations.append(f"job {job_id}: multiple active runs")
+            for run in runs:
+                if run["status"] not in valid_run_statuses:
+                    violations.append(f"job_run {run['run_id']}: invalid status {run['status']!r}")
+                if int(run["fencing_token"]) < 1:
+                    violations.append(f"job_run {run['run_id']}: invalid fencing token")
+                if run["status"] == "running" and run["lease_expires_at"] is not None \
+                        and float(run["lease_expires_at"]) <= _now():
+                    violations.append(f"job_run {run['run_id']}: active run has an expired lease")
+            if job["status"] in {"claimed", "running"} and not active:
+                violations.append(f"job {job_id}: {job['status']} without an active run")
+            elif job["status"] in {"pending", "retryable", "completed", "failed", "cancelled"} and active:
+                violations.append(f"job {job_id}: {job['status']} still has an active run")
+
+        if task_id is not None:
+            schedules = conn.execute(
+                "SELECT * FROM cron_schedules WHERE task_id = ?", (task_id,)
+            ).fetchall()
+        else:
+            schedules = conn.execute("SELECT * FROM cron_schedules").fetchall()
+        for schedule in schedules:
+            if schedule["enabled"] not in (0, 1):
+                violations.append(f"cron {schedule['schedule_id']}: invalid enabled flag")
+            last_at = schedule["last_triggered_at"]
+            next_at = schedule["next_trigger_at"]
+            if last_at is not None and next_at is not None and float(next_at) < float(last_at):
+                violations.append(
+                    f"cron {schedule['schedule_id']}: next_trigger before last_triggered"
+                )
+
+    def _scan_v6_invariants(self, conn: sqlite3.Connection, task_id: str | None,
+                            violations: list[str]) -> None:
+        valid_statuses = {
+            "pending", "in_progress", "verifying", "completed", "failed", "retryable"
+        }
+        if task_id is not None:
+            items = conn.execute(
+                "SELECT i.*, p.task_id, p.dag_hash AS plan_dag_hash "
+                "FROM plan_items i JOIN plans p ON p.plan_id = i.plan_id "
+                "WHERE p.task_id = ?",
+                (task_id,),
+            ).fetchall()
+        else:
+            items = conn.execute(
+                "SELECT i.*, p.task_id, p.dag_hash AS plan_dag_hash "
+                "FROM plan_items i JOIN plans p ON p.plan_id = i.plan_id"
+            ).fetchall()
+        deps_by_item: dict[int, list[Any]] = {}
+        for item in items:
+            deps_by_item[int(item["plan_item_id"])] = _loads(item["blocked_by_json"], [])
+            try:
+                max_turns = int(item["max_turns"])
+                consumed_turns = int(item["consumed_turns"])
+                if max_turns < 1 or consumed_turns < 0 or consumed_turns > max_turns:
+                    violations.append(
+                        f"plan_item {item['plan_item_id']}: turn count "
+                        f"{consumed_turns} is outside 0..{max_turns}"
+                    )
+            except (KeyError, TypeError, ValueError):
+                violations.append(f"plan_item {item['plan_item_id']}: invalid turn budget")
+            if item["status"] not in valid_statuses:
+                violations.append(
+                    f"plan_item {item['plan_item_id']}: invalid status {item['status']!r}"
+                )
+            elif item["status"] == "completed":
+                evidence = item["evidence_hash"]
+                if not evidence or not str(evidence).strip():
+                    violations.append(
+                        f"plan_item {item['plan_item_id']}: completed without evidence_hash"
+                    )
+        for item in items:
+            blockers = deps_by_item.get(int(item["plan_item_id"]), [])
+            for blocker in blockers:
+                dep = conn.execute(
+                    "SELECT status FROM plan_items WHERE plan_id = ? AND subtask_id = ?",
+                    (item["plan_id"], blocker),
+                ).fetchone()
+                if dep is None:
+                    violations.append(
+                        f"plan_item {item['plan_item_id']}: blocked_by references missing subtask {blocker!r}"
+                    )
+                elif (
+                    item["status"] in {"in_progress", "verifying", "completed", "retryable"}
+                    and dep["status"] != "completed"
+                    and not (
+                        item["plan_dag_hash"] is not None
+                        and item["status"] in {"in_progress", "verifying", "retryable"}
+                    )
+                ):
+                    violations.append(
+                        f"plan_item {item['plan_item_id']}: blocked_by {blocker!r} is not completed"
+                    )
+
+        if task_id is not None:
+            calls = conn.execute(
+                "SELECT model_call_id, source_checkpoint_id FROM model_calls WHERE task_id = ?",
+                (task_id,),
+            ).fetchall()
+            memories = conn.execute(
+                "SELECT memory_id, task_id, source_checkpoint_id FROM memories WHERE task_id = ?",
+                (task_id,),
+            ).fetchall()
+            summaries = conn.execute(
+                "SELECT summary_id, task_id, model_call_id FROM summaries WHERE task_id = ?",
+                (task_id,),
+            ).fetchall()
+        else:
+            calls = conn.execute(
+                "SELECT model_call_id, source_checkpoint_id FROM model_calls"
+            ).fetchall()
+            memories = conn.execute(
+                "SELECT memory_id, task_id, source_checkpoint_id FROM memories"
+            ).fetchall()
+            summaries = conn.execute(
+                "SELECT summary_id, task_id, model_call_id FROM summaries"
+            ).fetchall()
+        for call in calls:
+            source = call["source_checkpoint_id"]
+            if source is not None and conn.execute(
+                "SELECT 1 FROM checkpoints WHERE checkpoint_id = ?", (source,)
+            ).fetchone() is None:
+                violations.append(
+                    f"model_call {call['model_call_id']}: source_checkpoint_id {source} is missing"
+                )
+        valid_tasks = {
+            str(row["task_id"])
+            for row in conn.execute("SELECT task_id FROM tasks")
+        }
+        for memory in memories:
+            if memory["task_id"] not in valid_tasks:
+                violations.append(
+                    f"memory {memory['memory_id']}: references missing task {memory['task_id']!r}"
+                )
+            source = memory["source_checkpoint_id"]
+            if source is not None and conn.execute(
+                "SELECT 1 FROM checkpoints WHERE checkpoint_id = ?", (source,)
+            ).fetchone() is None:
+                violations.append(
+                    f"memory {memory['memory_id']}: references missing checkpoint {source}"
+                )
+        for summary in summaries:
+            if summary["task_id"] not in valid_tasks:
+                violations.append(
+                    f"summary {summary['summary_id']}: references missing task {summary['task_id']!r}"
+                )
+            model_call_id = summary["model_call_id"]
+            if model_call_id is not None and conn.execute(
+                "SELECT 1 FROM model_calls WHERE model_call_id = ?", (model_call_id,)
+            ).fetchone() is None:
+                violations.append(
+                    f"summary {summary['summary_id']}: references missing model_call {model_call_id}"
+                )
 
     def assert_invariants(self, task_id: str | None = None) -> None:
         violations = self.scan_invariants(task_id)
@@ -2437,7 +6336,8 @@ class EventStore:
                     if self._process_alive(int(reservation["owner_pid"])):
                         return None
                     conn.execute(
-                        "UPDATE effect_reservations SET state = 'unknown', finished_at = ?, details_json = ? "
+                        "UPDATE effect_reservations SET state = 'unknown', finished_at = ?, "
+                        "details_json = CASE WHEN effect='workspace_cleanup' THEN details_json ELSE ? END "
                         "WHERE reservation_id = ? AND state = 'running'",
                         (now, _json({"reason": "owner_crashed", "owner_id": reservation["owner_id"]}), reservation["reservation_id"]),
                     )
@@ -2501,7 +6401,8 @@ class EventStore:
             if lease is None or lease["owner_id"] != owner_id or int(lease["fencing_token"]) != int(fencing_token):
                 return
             conn.execute(
-                "UPDATE effect_reservations SET state = 'unknown', finished_at = ?, details_json = ? "
+                "UPDATE effect_reservations SET state = 'unknown', finished_at = ?, "
+                "details_json = CASE WHEN effect='workspace_cleanup' THEN details_json ELSE ? END "
                 "WHERE owner_id = ? AND fencing_token = ? AND state = 'running'",
                 (now, _json({"reason": "lease_released", "owner_id": owner_id}), owner_id, int(fencing_token)),
             )

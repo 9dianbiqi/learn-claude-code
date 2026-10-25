@@ -1,5 +1,153 @@
 # Changelog
 
+## v0.3.0.dev11 - C1c Recovery / Plan Revision Controller
+
+- Added a durable, signal-keyed recovery decision ledger and deterministic
+  controller for KEEP, RETRY, SPLIT, ADD_ITEM, CHANGE_DEPENDENCY,
+  TOMBSTONE_PENDING and FAIL. Structural decisions reuse C1a typed PlanPatches.
+- Added schema v15 migration and a transaction seam that commits a structural
+  decision with its PlanRevision, while C1b still owns activation and resume.
+- Pinned migration preflight inventory and version reads to one SQLite snapshot
+  so concurrent migration readers do not combine old tables with new metadata.
+- Added verifier/failure-signal integration, decision trace, fixed evaluation
+  scenarios and crash/restart tests without model-generated replanning.
+
+## v0.3.0.dev10 - Durable Plan Revision Resume
+
+- Added schema v14 task execution-revision binding. Migration binds the latest
+  Plan's revision 0, preserving any newer revision as pending activation.
+- Resume validates the exact current DAG and verifier configuration under the
+  repository lease, then atomically activates the execution revision and audits
+  the switch. Eligible failed plans reopen without resetting old item budgets.
+- Preserved immutable revision/checkpoint history, deterministic selection,
+  completed evidence, and existing tool-effect reconciliation across restarts.
+
+## v0.3.0.dev9 - Immutable Plan Revisions & CAS Plan Patches
+
+- Added append-only PlanRevision snapshots with stable Plan identity, parent
+  linkage, deterministic DAG/patch hashes, evidence references, and schema v13
+  migration/backfill.
+- Added the public `Runtime.apply_plan_patch` CAS seam with typed operations to
+  add, split, rewire, or tombstone eligible non-completed PlanItems while
+  preserving completed work and historical dependency edges.
+- Added crash-boundary, stale-writer, immutable-history, invariant, trace, and
+  migration tests without changing the self-contained teaching TaskManager.
+
+## v0.3.0.dev8 - Fixed-Budget Scoped Recovery
+
+- Added opt-in Verified-Scoped recovery for interrupted frozen-DAG tasks while
+  retaining complete durable checkpoint and model-call audit history.
+- Added deterministic scoped bundles containing the active resume unit,
+  transitive dependency snapshots, recent failure evidence, and relevant-path
+  state, with explicit fail-closed context-budget enforcement.
+- Added structured tool-message replay validation, scoped trace metrics, and
+  public recovery tests covering context continuity and omission failures.
+
+## v0.3.0.dev7 - Stale Evidence Recovery
+
+- Added resume-time evidence-manifest validation before completed verified
+  subtasks are trusted.
+- Added append-only valid, stale, and superseded checkpoint lifecycle history,
+  benign evidence refresh, breaking-change re-execution, and transitive
+  dependency invalidation through schema v12.
+- Added invariant, trace, migration, idempotency, and public F4 recovery tests.
+
+## v0.3.0.dev6 - Frozen DAG Orchestration & Deterministic Recovery
+
+- Added opt-in frozen verified-subtask DAG orchestration with deterministic
+  dependency selection, verifier-gated intermediate checkpoints, and F3-safe
+  recovery through the public `Runtime.run`/`resume` API.
+- Added durable per-node turn budgets and schema v11 migration support, with
+  fail-closed configuration/hash mismatch handling and budget exhaustion.
+
+## v0.3.0.dev5 - Atomic Verified Subtask Checkpoints
+
+- Added an opt-in verified-subtask path with frozen verifier configuration,
+  deterministic bundle identity, evidence manifests, and public run/resume
+  recovery.
+- Added checksum-verified schema v10 migration with append-only verifier runs,
+  verified-subtask checkpoints, atomic pass commits, and non-authoritative
+  fail/uncertain audit records.
+
+## v0.3.0.dev4 - Phase 3 Durable Subagents, Plan Approval & Team Mailbox
+
+- Stabilized and froze the reproducible v0.3 Exec-Full baseline at package
+  version `0.3.0.dev4` and schema version `v9`; execution checkpoints and
+  full-history resume remain authoritative, while the verified-subtask layer
+  is deferred to a later ticket.
+- Fixed the public plan-approval resume path so its fenced compare-and-swap
+  update binds the run identifier, version, and fencing token correctly;
+  genuinely stale writers remain rejected.
+- Added durable `subagent_runs`, `mailboxes`, `mailbox_messages`, and
+  `plan_approvals` tables via a checksum-verified v9 schema migration. Fresh
+  databases build directly to v9 and existing v4-v8 stores upgrade in place.
+- Added a durable child-agent execution model: a subagent is a full Runtime
+  task with its own checkpoint lineage, tool calls, operations, and effect
+  ledger entries, while `subagent_runs` keeps orchestration metadata with
+  fencing and CAS-protected state transitions.
+- Added `Runtime.spawn_subagent` with Codex-style `prompt`, `context_window`
+  (default 32000 tokens), `model` (inherited from the parent task), and
+  `tool_scope` parameters; context budget overflow fails closed and spawning
+  is capped at a depth of three task layers.
+- Added plan approval persistence: `request_plan_approval` writes an immutable
+  markdown plan file under `.agent_runtime/plans/`, records `plan_hash`, and
+  stops the child in `needs_review`; `approve_subagent_plan` resumes or cancels
+  the child with CAS-protected FSM transitions.
+- Added an internal `.agent_runtime.spawn_subagent` orchestration tool that
+  bypasses `PermissionEngine` and returns `run_id`, `child_task_id`, `status`,
+  `result_summary`, and aggregated `token_usage`.
+- Added team mailbox durability: idempotent send, atomic read, and
+  `delivered -> read -> archived` transitions that survive restart.
+- Added `subagent spawn|run|resume|list|approvals|approve|reject|show-plan` and
+  `subagent mailbox send|read` CLI commands.
+- Bumped the package version.
+
+## v0.3.0.dev3 - Phase 4 Tool Registry & MCP
+
+- Added a durable `ToolRegistry` as the single tool dispatch path; built-in
+  tools are registry entries and tool schemas flow into model context.
+- Added `tool_registrations` and `mcp_connections` metadata tables via a v8
+  schema migration with connection status, last-connected time, and error
+  history.
+- Added a real stdio MCP client that discovers tools, normalizes
+  `mcp__<server>__<tool>` names, infers read-only/idempotent/write hints from
+  tool annotations, and persists callable adapters.
+- MCP authentication uses an environment-variable reference
+  (`auth_token_env`); tokens are never written to the database.
+- `PermissionEngine` evaluates registered MCP tools and fails closed for
+  unregistered or unknown MCP tools.
+- Added `mcp add`, `mcp list`, and `mcp refresh` CLI lifecycle commands with
+  GitHub setup documentation.
+- Bumped the package version.
+
+## v0.3.0.dev2 - Phase 2 Background Jobs & Cron
+
+- Added durable `agent_jobs`, `job_runs`, and `cron_schedules` tables via a
+  checksum-verified v7 schema migration that cleanly upgrades v4/v5/v6 stores.
+- Added claim/heartbeat/complete/fail/cancel transitions with CAS and fencing
+  tokens, one-active-run enforcement, and restart recovery that fences stale
+  owners and returns borrowable jobs to `retryable`.
+- Added a periodic cron scheduler that emits durable `pending` jobs at a
+  schedule boundary instead of executing payloads inline.
+- Extended the invariant scanner to validate job/run/cron consistency and
+  exported job lifecycle metrics plus redacted job/run records to the trace.
+- Added `jobs list` and `cron list` CLI inspection commands.
+- Bumped the package version.
+
+## v0.3.0.dev1 - Phase 1 Durable Memory & Context Projector
+
+- Added durable `memories`, `memory_links`, `summaries`, `plans`, and
+  `plan_items` tables with a checksum-verified v6 schema migration.
+- Added a read-only `ContextProjector` that builds compact model-view messages
+  (plan, memories, summaries, review evidence) before each model call while
+  preserving full conversation history in `checkpoints.messages_json`.
+- Linked projected model calls to their source checkpoint and exported
+  projection/plan metrics to the trace summary and JSONL export.
+- Added plan-item lifecycle transitions (pending → in_progress → verifying →
+  completed, with failed → retryable) and evidence-gated completion.
+- Bumped the package version; DB `db-check` now targets the current schema
+  version instead of a hardcoded value.
+
 ## v0.2.1 - Release metadata
 
 - Set the durable Agent Runtime package version to `0.2.1`.

@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "release_branch": "codex/runtime-completion-release",
+  "release_base": "3702635261e2b46416d172796232a5a7f413415c",
+  "runtime_source_provenance": "68e4e51ca9cc4049f575d617762f89934e443baa plus accepted uncommitted successor",
+  "inherited_historical_commits": 0,
+  "accepted_archive": {
+    "filename": "phase2-successor-accepted-evidence-20261017.zip",
+    "sha256": "1dfeb86eef24e97d514434a8e7f21dfeecd2aeee39391c132e743bb985a9fa09",
+    "availability": "Local artifact; not included in Git or claimed publicly uploaded"
+  },
+  "release_evidence": {
+    "filename": "runtime-release-ready-evidence-20261017.zip",
+    "sha256_sidecar": "runtime-release-ready-evidence-20261017.zip.sha256",
+    "availability": "Local artifact; not included in Git or claimed publicly uploaded",
+    "windows_junit": "windows-final.xml",
+    "linux_junit": "linux-final-02.xml",
+    "preserved_initial_windows_junit": "windows-before.xml",
+    "preserved_initial_linux_junit": "linux311-full.xml"
+  },
+  "checks": {
+    "windows": {"passed": 567, "skipped": 2, "failed": 0},
+    "linux": {"passed": 569, "skipped": 0, "failed": 0},
+    "windows_fencing_iterations_passed": 30,
+    "mvp_assertions_passed_per_platform": 5,
+    "hardening_assertions_passed_per_platform": 9,
+    "docker_updated_scenarios_passed": 4,
+    "missing_local_image_rejected": true
+  },
+  "remote_ci": "Not run; no commit or push performed",
+  "target_model_api_calls": 0,
+  "official_harness_runs": 0
+}

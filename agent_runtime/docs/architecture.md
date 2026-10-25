@@ -110,13 +110,13 @@ Trace summaries derive metrics from durable model, tool, and event records:
 
 JSONL exports redact common credential keys and inline secret assignments.
 
-## Phase 1 schema migration
+## Schema migration
 
-Schema version 5 is created directly for fresh Runtime databases. Existing v4
-databases require the explicit db-migrate command; normal Runtime commands fail
-closed with SchemaUpgradeRequired. Versions above v5, versions below v4
-without a registered migration, business tables without schema_migrations, and
-checksum mismatches are all rejected.
+Schema version 6 is created directly for fresh Runtime databases. Existing v4
+and v5 databases require the explicit db-migrate command; normal Runtime
+commands fail closed with SchemaUpgradeRequired. Versions above v6, versions
+below v4 without a registered migration, business tables without
+schema_migrations, and checksum mismatches are all rejected.
 
 The migration sequence is:
 
@@ -166,6 +166,32 @@ operation without another write. If the file still has the before hash, only an
 explicit operator retry is allowed. An opaque Shell operation goes to
 needs_review. These rules reduce duplicate effects but intentionally do not
 claim generic Shell exactly-once execution.
+
+## Durable memory, context projector, plan store
+
+Schema v6 adds `memories`, `memory_links`, `summaries`, `plans`, and
+`plan_items` tables alongside the existing v5 ledger. The context projector is
+a pure reader that runs immediately before each model call. It loads the active
+plan, memories, summaries, and recent failure/review reasons, then hands the
+model a compact message list built from global instructions, the active
+unblocked plan item (when one exists), and durable context. If no durable
+metadata is present, it falls back to the full conversation.
+
+Projection is read-only: `checkpoints.messages_json` remains the authoritative
+conversation history, and a projected model call links back to its source
+checkpoint through `model_calls.source_checkpoint_id` with projection metrics
+in `model_calls.projection_json`. Recovery therefore reconstructs the full
+checkpoint state and never depends on a projected-only view, keeping tool and
+effect deduplication intact.
+
+Plan items follow the lifecycle
+
+    pending -> in_progress -> verifying -> completed
+                        \-> failed -> retryable
+
+An item becomes `completed` only after a verifier supplies evidence; model text
+alone is not completion evidence. Trace summaries and JSONL exports include
+projection token estimates and plan transition events.
 
 ## Scope boundary
 

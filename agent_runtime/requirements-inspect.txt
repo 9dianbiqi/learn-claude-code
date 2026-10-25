@@ -1,0 +1,3 @@
+# Optional offline adapter only; the core Runtime has no Inspect dependency.
+-r ../requirements.txt
+inspect-ai==0.3.283

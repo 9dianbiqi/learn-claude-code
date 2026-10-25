@@ -83,6 +83,7 @@ def run_suite(suite_path: str | Path, run_root: str | Path | None = None) -> dic
     suite_path = Path(suite_path)
     document = yaml.safe_load(suite_path.read_text(encoding="utf-8")) or {}
     suite_name = str(document.get("name", suite_path.stem))
+    suite_kind = str(document.get("kind", "runtime"))
     tasks = document.get("tasks", [])
     if not isinstance(tasks, list):
         raise ValueError("Eval suite tasks must be a list")
@@ -133,6 +134,11 @@ def run_suite(suite_path: str | Path, run_root: str | Path | None = None) -> dic
             shutil.rmtree(task_root)
         task_root.mkdir(parents=True)
         _write_fixture(task_root, dict(spec.get("fixture", {}).get("files", {})))
+        if suite_kind == "c1c_replanning":
+            from .c1c_eval import run_case
+
+            results.append(run_case(task_root, spec))
+            continue
         model = ScriptedModel([_response_from_entry(entry) for entry in spec.get("model", [])])
         fault = dict(spec.get("fault", {}))
 
@@ -210,7 +216,7 @@ def run_suite(suite_path: str | Path, run_root: str | Path | None = None) -> dic
     completed = sum(item["status"] == "completed" for item in results)
     recovery_items = [item for item in results if item["recovery_case"]]
     recovery_passed = sum(item["passed"] for item in recovery_items)
-    return {
+    report = {
         "suite": suite_name,
         "total": total,
         "passed": sum(item["passed"] for item in results),
@@ -235,6 +241,34 @@ def run_suite(suite_path: str | Path, run_root: str | Path | None = None) -> dic
         "stale_lease_execution_attempts": sum(item["trace"]["stale_lease_execution_attempts"] for item in results),
         "tasks": results,
     }
+    if suite_kind == "c1c_replanning":
+        decisions = [item for item in results if item.get("decision")]
+        report["decision_distribution"] = {
+            kind: sum(item["decision"] == kind for item in decisions)
+            for kind in sorted({item["decision"] for item in decisions})
+        }
+        report["unnecessary_revision_rate"] = (
+            sum(item["trace"]["replan_unnecessary_revision_count"] for item in decisions)
+            / len(decisions) if decisions else 0.0
+        )
+        report["invalid_patch_acceptance_count"] = sum(
+            bool(item.get("expected_rejection")) and item.get("decision_outcome") == "accepted"
+            for item in decisions
+        )
+        report["completed_reexecution_count"] = sum(
+            item["completed_reexecution_count"] for item in decisions
+        )
+        report["completed_reverification_count"] = sum(
+            item["completed_reverification_count"] for item in decisions
+        )
+        report["signal_distribution"] = {
+            signal_type: sum(
+                (item.get("signal_type") or "replan_observation") == signal_type
+                for item in decisions
+            )
+            for signal_type in sorted({item.get("signal_type") or "replan_observation" for item in decisions})
+        }
+    return report
 
 
 def write_report(report: dict[str, Any], output_path: str | Path) -> None:

@@ -193,10 +193,15 @@ def test_aborted_tool_call_cannot_enter_execute_path(tmp_path: Path):
     runtime.store.create_tool_call(task_id, "aborted-call", 0, "bash", args, canonical_args_hash("bash", args))
     runtime.store.update_tool_call(task_id, "aborted-call", status="aborted")
     with pytest.raises(RuntimeError, match="Terminal tool call"):
-        runtime._execute_call(task_id, 0, ToolCall("aborted-call", "bash", {"command": "echo x"}))
+        runtime._execute_call(task_id, 0, ToolCall("aborted-call", "bash", {"command": "echo x"}), [])
 
 
-def test_fencing_rejects_stale_owner_writes_and_tool_execution(tmp_path: Path):
+def test_fencing_rejects_stale_owner_writes_and_tool_execution(tmp_path: Path, monkeypatch):
+    # This test injects owner-a expiry explicitly. Freeze only the Store clock
+    # so host I/O jitter cannot also expire owner-b's unrelated 0.5-second lease.
+    # The fencing tokens, original TTLs and stale-owner assertion remain intact.
+    logical_now = time.time()
+    monkeypatch.setattr(store_module, '_now', lambda: logical_now)
     started = threading.Event()
     release_model = threading.Event()
 

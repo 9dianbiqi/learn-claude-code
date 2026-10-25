@@ -44,7 +44,17 @@ jobs:
         run: python -m compileall -q agent_runtime
 
       - name: Run Runtime tests
+        env:
+          LCC_BC_TEST_ARTIFACTS: .agent_runtime_ci/bc-process
         run: python -m pytest agent_runtime/tests -q --tb=short -p no:cacheprovider
+
+      - name: Audit scripted B/C evidence
+        if: always()
+        run: >-
+          python -m agent_runtime.experiments.bc_artifact_audit
+          --root .agent_runtime_ci/bc-process
+          --expected-commit ${{ github.sha }}
+          --output .agent_runtime_ci/bc-artifact-audit.json
 
       - name: Stress fencing regression on Windows
         if: runner.os == 'Windows'

@@ -1,0 +1,23 @@
+{
+  "scope": "Whole bounded Phase 2 ACCEPT WITH NOTES, 2026-10-12",
+  "archive": "D:\\opencv\\learn-claude-code\\.scratch\\phase2-frozen-20261012\\phase2-evidence.zip",
+  "archive_sha256": "3e83caf8ac2cbb362aca5a7c8349aeb009f449d7e59a081a54565e70bf5c048b",
+  "archive_bytes": 1231052,
+  "members": 283,
+  "member_manifest": "D:\\opencv\\learn-claude-code\\.scratch\\phase2-frozen-20261012\\members.json",
+  "member_manifest_sha256": "f6c0f43ccb8371232e430dea3555bfff474a2f8e52ed561c85daab7dd5fd8cce",
+  "verified": "Every zip member read back and SHA-256 checked",
+  "raw_roots": [
+    "phase2-correctness-20261007",
+    "phase2-increment2-20261008",
+    "phase2-increment3-20261010",
+    "phase2-increment4-20261010",
+    "phase2-final-review-20261010",
+    "phase2-final-review-20261012"
+  ],
+  "historical_raw_log_gap": "Preserved; judged nonblocking by final reviewer, not filled by archive",
+  "restore_boundary": "Archive preserves bytes, not original filesystem identities; do not auto-resume archived tasks",
+  "no_closure_test_runs": true,
+  "commit_hooks": "Disabled for seal commits to avoid implicit test execution; no hook pass claimed",
+  "review_raw_sha256": "79bf7d2edaff4c22f25d67aa0ec3866dfe7471f95b398909a53758b6e4f3c635"
+}

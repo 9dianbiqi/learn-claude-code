@@ -1051,3 +1051,19 @@ file effect can be completed when the post hash matches; a before-hash match
 requires an explicit retry. Shell remains opaque and enters needs_review after
 an ambiguous boundary. Phase 1 does not implement an OS sandbox or claim
 generic Shell exactly-once execution.
+
+## v0.3.0.dev1 Phase 1 - Durable Memory, Context Projector, Plan Store
+
+v0.3 Phase 1 upgrades the schema to v6 and adds `memories`, `memory_links`,
+`summaries`, `plans`, and `plan_items` as durable long-horizon state. The
+runtime wires a read-only `ContextProjector` immediately before each model
+call so the model sees a compact view of the active plan item, memories,
+summaries, and recent review/failure evidence while `checkpoints.messages_json`
+stays the authoritative conversation history.
+
+Projected model calls record `source_checkpoint_id` and projection metrics in
+`model_calls.projection_json`; trace summaries and JSONL exports now carry
+projection token estimates and plan transition events. Plan items follow
+pending -> in_progress -> verifying -> completed (with failed -> retryable) and
+only reach `completed` from verifier evidence. This phase adds no OS sandbox,
+MCP, subagents, background scheduling, or remote coordination.

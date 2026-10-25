@@ -27,7 +27,6 @@ class PermissionEngine:
     """Fail-closed allow/ask/deny policy evaluation."""
 
     _file_tools = {"read_file", "glob", "write_file", "edit_file"}
-    _known_tools = _file_tools | {"bash"}
     _internal_namespace = ".agent_runtime"
 
     _hard_deny = (
@@ -53,16 +52,20 @@ class PermissionEngine:
         r"\b(?:invoke-expression|iex|start-process)\b",
         r"(?:^|\s)(?:curl|wget)\b[^\r\n]*\|",
     )
-    _read_only_commands = (
-        r"git\s+(?:status|diff|log)(?:\s+.*)?",
-        r"rg\s+.+",
-        r"(?:get-childitem|dir|ls)(?:\s+.*)?",
-        r"(?:cat|type|more)\s+.+",
-        r"python\s+-m\s+pytest\s+--collect-only(?:\s+.*)?",
-    )
 
-    def __init__(self, repo_root: str | Path, policy_path: str | Path | None = None):
+    def __init__(
+        self,
+        repo_root: str | Path,
+        policy_path: str | Path | None = None,
+        tool_registry: Any | None = None,
+    ):
         self.repo_root = Path(repo_root).resolve()
+        self.tool_registry = tool_registry
+        self._known_tools = set(self._file_tools) | {"bash"}
+        if tool_registry is not None:
+            self._known_tools.update(
+                entry.tool_name for entry in tool_registry.list_tools() if entry.enabled
+            )
         self.rules = self._load_rules(policy_path)
 
     @staticmethod
@@ -107,10 +110,13 @@ class PermissionEngine:
         if tool_name in {"write_file", "edit_file"}:
             return "file_write"
         if tool_name == "bash":
-            command = self.normalize_command(args.get("command", ""))
-            if any(re.fullmatch(pattern, command) for pattern in self._read_only_commands):
-                return "read_only"
+            # Approval is not proof of replay safety. Flags, configuration and
+            # child programs can give even inspection commands opaque effects.
             return "unknown_write"
+        if self.tool_registry is not None:
+            entry = self.tool_registry.get(tool_name)
+            if entry is not None and entry.enabled:
+                return entry.effect_kind
         return "unknown_write"
 
     def evaluate(self, tool_name: str, args: dict[str, Any]) -> PermissionDecision:
@@ -211,7 +217,7 @@ class PermissionEngine:
             "glob": ("allow", "default.glob", "Read-only file listing"),
             "write_file": ("ask", "default.file-write", "Writing a repository file"),
             "edit_file": ("ask", "default.file-edit", "Editing a repository file"),
-            "bash": ("ask", "default.shell", "Shell command is not in the read-only allowlist"),
+            "bash": ("ask", "default.shell", "Shell command requires explicit approval"),
         }
         effect, rule_id, reason = defaults.get(tool_name, ("deny", "default.unknown-tool", "Unknown tool"))
         if composition:
