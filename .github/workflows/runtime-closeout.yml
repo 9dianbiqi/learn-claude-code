@@ -1,0 +1,50 @@
+name: Pending Runtime Closeout
+
+on:
+  push:
+    branches: [codex/runtime-closeout-20261023]
+    paths: [.github/workflows/runtime-closeout.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  remaining-linux-integration:
+    name: Pending integration / Linux / Python 3.11
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install existing optional integration requirements
+        run: python -m pip install -r agent_runtime/requirements-inspect.txt pytest
+      - name: Prepare evidence
+        run: python -c "from pathlib import Path; Path('.closeout_ci').mkdir(exist_ok=True)"
+      - name: Record dependency versions
+        run: python -m pip freeze > .closeout_ci/packages.txt
+      - name: Run only outstanding integration checks
+        run: >-
+          python -m pytest
+          agent_runtime/tests/test_controller_read_budget.py
+          agent_runtime/tests/test_inspect_model_bridge.py
+          agent_runtime/tests/test_inspect_runtime_solver.py
+          agent_runtime/tests/test_phase1_p0.py::test_fencing_rejects_stale_owner_writes_and_tool_execution
+          -q --tb=short -p no:cacheprovider
+          --basetemp=.closeout_ci/cases
+          --junitxml=.closeout_ci/junit.xml
+      - name: Preserve integration evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pending-closeout-linux
+          path: .closeout_ci/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
