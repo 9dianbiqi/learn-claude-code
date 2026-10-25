@@ -1,5 +1,7 @@
 # Controlled Inspect Runtime-as-Solver — validation
 
+> Publication follow-up (2026-10-23): this report preserves its original validation-time status. See [project closeout](project-closeout-20261023.md) for published commit/hosted CI status and the subsequent uncommitted integration. Historical “not committed/pushed” wording below is not the current publication state.
+
 Local candidate status: ACCEPT WITH NOTES, 2026-10-23.
 Started 2026-10-22; the evidence directory retains that start date.
 Branch `codex/inspect-runtime-solver`, base

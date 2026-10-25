@@ -14,6 +14,7 @@ from typing import Any, Callable, Iterator
 from .effects import EffectSemantics, OperationSpec, ReconcileEvidence, sha256_json
 from .migrations import SCHEMA_VERSION, SchemaManager, _legacy_projection_violations
 from .models import PlanPatch, PlanRevision, PlanRevisionItem, is_valid_sha256
+from .read_budget import ControllerReadBudget, ControllerReadBudgetExhausted
 from .plan_revisions import (
     PlanPatchError,
     apply_patch as derive_plan_revision,
@@ -3005,9 +3006,25 @@ class EventStore:
             if expected_version is not None and cursor.rowcount != 1:
                 raise StaleState(f"Tool call state changed before update: {tool_use_id}")
 
-    def start_tool_call(self, task_id: str, tool_use_id: str, effect: str, started_at: float | None = None) -> None:
+    def start_tool_call(self, task_id: str, tool_use_id: str, effect: str, started_at: float | None = None,
+                        *, read_budget: ControllerReadBudget | None = None) -> None:
         now = started_at or _now()
         with self.transaction() as conn:
+            if read_budget is not None:
+                if not isinstance(read_budget, ControllerReadBudget) or effect != 'read_only':
+                    raise ValueError('Controller budget is only valid for registered read attempts')
+                current = conn.execute('SELECT name,status,effect FROM tool_calls WHERE task_id=? AND tool_use_id=?',
+                                       (task_id, tool_use_id)).fetchone()
+                if current is None or current['status'] != 'planned':
+                    raise StaleState(f'Tool call is no longer runnable: {tool_use_id}')
+                if current['name'] not in read_budget.tool_names or current['effect'] != 'read_only':
+                    raise ValueError('Tool is outside the controller read budget')
+                placeholders = ','.join('?' for _ in read_budget.tool_names)
+                consumed = conn.execute(
+                    f'SELECT COALESCE(SUM(execution_attempts),0) FROM tool_calls WHERE task_id=? AND name IN ({placeholders})',
+                    (task_id, *read_budget.tool_names)).fetchone()[0]
+                if consumed >= read_budget.max_attempts:
+                    raise ControllerReadBudgetExhausted(read_budget.max_attempts, consumed)
             effect_increment = 0 if effect == "read_only" else 1
             cursor = conn.execute(
                 "UPDATE tool_calls SET status = 'running', started_at = ?, execution_status = 'running', "

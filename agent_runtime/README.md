@@ -1,5 +1,7 @@
 # Durable Agent Runtime
 
+Current development entry, branch ownership and release gates: [2026-10-23 closeout](docs/project-closeout-20261023.md).
+
 `agent_runtime` is a local execution layer for durable coding-agent tasks. It
 starts from the minimal agent-loop ideas taught by learn-claude-code, then adds
 the engineering mechanisms needed to recover, constrain, and audit a long-running

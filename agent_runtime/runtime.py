@@ -46,6 +46,7 @@ from .completion import CompletionContract, declared_stop_reason, profile_manife
 from .workspace_verifier import WorkspaceCleanupError
 from .workspace_cleanup import workspace_cleanup_authority
 from .recovery_advisor import RecoveryAdvisor, RecoverableReadError
+from .read_budget import ControllerReadBudget, ControllerReadBudgetExhausted
 
 
 DEFAULT_SUBAGENT_CONTEXT_WINDOW = 32000
@@ -130,7 +131,8 @@ class Runtime:
                  scoped_context_budget: int | None = None,
                  replan_policy: Callable[..., Any] | None = None,
                  completion_contract: CompletionContract | None = None,
-                 recovery_advisor: RecoveryAdvisor | None = None, tool_setup=None):
+                 recovery_advisor: RecoveryAdvisor | None = None, tool_setup=None,
+                 controller_read_attempt_limit: int | None = None):
         if verified_subtask is not None and verified_subtask_dag is not None:
             raise ValueError("verified_subtask and verified_subtask_dag are mutually exclusive")
         self.repo_root = Path(repo_root).resolve()
@@ -217,6 +219,12 @@ class Runtime:
                             if entry.enabled and entry.permission_requirements.get("controller_binding")}
         if controller_tools and (not self.tool_scope or not self.tool_scope <= controller_tools):
             raise ValueError("Controller read tools require an explicit container-only tool_scope")
+        self._controller_read_budget = None
+        if controller_read_attempt_limit is not None:
+            if (not controller_tools or completion_contract is None
+                    or any(not callable(self.tool_registry.get(name).adapter) for name in (self.tool_scope or ()))):
+                raise ValueError('Controller read budgets require live bound tools and a frozen completion contract')
+            self._controller_read_budget = ControllerReadBudget(controller_read_attempt_limit, tuple(controller_tools))
         self.permissions = PermissionEngine(
             self.repo_root,
             policy_path=policy_path,
@@ -278,6 +286,8 @@ class Runtime:
                                       "schema": entry.schema, "bound": entry.adapter is not None}
                                      for entry in sorted(entries, key=lambda item: item.tool_name)],
                 "tool_scope": sorted(self.tool_scope)}
+            if self._controller_read_budget is not None:
+                value['controller_read_budget'] = self._controller_read_budget.manifest()
             value["sha256"] = hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
             return value
         return profile
@@ -319,7 +329,7 @@ class Runtime:
         error = terminal_error(code, self.completion_contract)
         self.store.fail_plan_item_and_task(task_id, int(item["plan_item_id"]), messages,
             {"turn": turn, "active_subtask_id": item["subtask_id"], "termination_reason": code},
-            error, budget_exhausted=code == "BUDGET_EXHAUSTED", fault_injector=self._fault)
+            error, budget_exhausted=code in {"BUDGET_EXHAUSTED", ControllerReadBudgetExhausted.code}, fault_injector=self._fault)
         return RunResult(task_id, "failed", error=error)
 
     def _read_failure_feedback(self, task_id, call, exc):
@@ -1590,6 +1600,11 @@ class Runtime:
         except WorkspaceCleanupError as exc:
             self.store.append_event(task_id, "workspace_cleanup_requires_review", exc.report)
             raise
+        except ControllerReadBudgetExhausted as exc:
+            if self._controller_read_budget is not None:
+                return self._contract_failure(task_id, messages, turn, exc.code)
+            self.store.fail_task(task_id, messages, {"turn": turn}, str(exc))
+            return RunResult(task_id, "failed", error=str(exc))
         except (InjectedCrash, LeaseLost, InvariantViolation, PendingPlanConflict):
             raise
         except Exception as exc:
@@ -2260,6 +2275,17 @@ class Runtime:
                 self.store.append_event(task_id, "tool_deduplicated", {"tool_use_id": call.id})
                 return existing.get("output") or "Permission denied."
             if existing["status"] in {"failed", "aborted"}:
+                budget = self._controller_read_budget
+                if (budget is not None and existing['status'] == 'failed'
+                        and existing.get('effect') == 'read_only' and call.name in budget.tool_names
+                        and existing.get('error') == ControllerReadBudgetExhausted.code):
+                    try:
+                        exhausted = budget.recover_exhaustion(existing.get('output'))
+                    except (TypeError, ValueError) as exc:
+                        raise InvariantViolation('Persisted controller budget denial is malformed') from exc
+                    self.store.append_event(task_id, 'controller_read_budget_recovered',
+                        {'tool_use_id': call.id, 'maximum': exhausted.maximum, 'consumed': exhausted.consumed})
+                    raise exhausted
                 if (self.recovery_advisor is not None and existing["status"] == "failed"
                         and existing.get("effect") == "read_only" and existing.get("error") == "PATH_NOT_FOUND"
                         and existing.get("output")):
@@ -2334,7 +2360,19 @@ class Runtime:
             self.store.update_tool_call(task_id, call.id, before_state=before_state, expected_after=expected_after)
 
         if decision.risk == "read_only":
-            self.store.start_tool_call(task_id, call.id, decision.risk, started_at=time.time())
+            if self._controller_read_budget is None:
+                self.store.start_tool_call(task_id, call.id, decision.risk, started_at=time.time())
+            else:
+                try:
+                    self.store.start_tool_call(task_id, call.id, decision.risk, started_at=time.time(),
+                                              read_budget=self._controller_read_budget)
+                except ControllerReadBudgetExhausted as exc:
+                    self.store.update_tool_call(task_id, call.id, status='failed', error=exc.code,
+                        output=json.dumps({'code': exc.code, 'maximum': exc.maximum, 'consumed': exc.consumed}),
+                        execution_status='budget_exhausted', finished_at=time.time())
+                    self.store.append_event(task_id, 'controller_read_budget_exhausted',
+                        {'tool_use_id': call.id, 'maximum': exc.maximum, 'consumed': exc.consumed})
+                    raise
             self.store.append_event(task_id, "tool_started", {"tool_use_id": call.id, "name": call.name})
             self._fault("after_tool_started", task_id=task_id, tool_use_id=call.id)
             self._assert_lease_for_effect(task_id, call.id, "before_tool_effect")

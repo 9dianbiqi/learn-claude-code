@@ -1,5 +1,7 @@
 # Evaluation system v1 — local validation
 
+> Publication follow-up (2026-10-23): this report preserves its original validation-time status. See [project closeout](project-closeout-20261023.md) for published commit/hosted CI status and the subsequent uncommitted integration. Historical “not committed/pushed” wording below is not the current publication state.
+
 Status: Local evaluation-system milestone ACCEPT WITH NOTES, 2026-10-22.
 Branch: `codex/evaluation-system`; unchanged base
 `ba5a242019ec411e5138fa5ba028b529dd66c546`. No commit or push was performed.

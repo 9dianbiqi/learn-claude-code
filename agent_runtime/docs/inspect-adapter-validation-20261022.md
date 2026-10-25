@@ -1,5 +1,7 @@
 # Inspect offline adapter — local validation, 2026-10-22
 
+> Publication follow-up (2026-10-23): this report preserves its original validation-time status. See [project closeout](project-closeout-20261023.md) for published commit/hosted CI status and the subsequent uncommitted integration. Historical “not committed/pushed” wording below is not the current publication state.
+
 Status: local offline interoperability ACCEPT WITH NOTES. No new commit/push.
 Branch: `codex/inspect-offline-adapter`, base
 `cfd4017d4d769c82bbbfe5605151ab6e742d8e91`.

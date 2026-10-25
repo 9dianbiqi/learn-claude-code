@@ -1,5 +1,7 @@
 # Runtime clean release preparation
 
+> Publication follow-up (2026-10-23): this report preserves its original validation-time status. See [project closeout](project-closeout-20261023.md) for published commit/hosted CI status and the subsequent uncommitted integration. Historical “not committed/pushed” wording below is not the current publication state.
+
 Date: 2026-10-17. Status: **ready for a local commit and experimental-branch push**.
 No commit, push, merge or remote CI execution was performed by this preparation.
 
