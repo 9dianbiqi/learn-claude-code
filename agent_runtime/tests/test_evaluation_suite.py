@@ -131,6 +131,7 @@ def test_unknown_agent_outcome_prevents_acceptance():
 
 
 def test_model_engine_dispatches_with_explicit_execution(tmp_path, monkeypatch):
+    pytest.importorskip("inspect_ai")
     from agent_runtime import inspect_model_eval
     calls = []
     monkeypatch.setattr(inspect_model_eval, "run", lambda *a, **k: calls.append((a, k)) or {"ok": True})

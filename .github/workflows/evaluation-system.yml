@@ -34,6 +34,8 @@ jobs:
           python -m pytest
           agent_runtime/tests/test_swe_prepare.py
           agent_runtime/tests/test_swe_assets.py
+          agent_runtime/tests/test_container_edits.py
+          agent_runtime/tests/test_evaluation_suite.py
           -q --tb=short -p no:cacheprovider
           --basetemp=.evaluation_system_ci/cases
           --junitxml=.evaluation_system_ci/junit.xml
@@ -73,6 +75,8 @@ jobs:
           raise SystemExit(pytest.main([
               "agent_runtime/tests/test_swe_prepare.py",
               "agent_runtime/tests/test_swe_assets.py",
+              "agent_runtime/tests/test_container_edits.py",
+              "agent_runtime/tests/test_evaluation_suite.py",
               "-q", "--tb=short", "-p", "no:cacheprovider",
               "--basetemp=.evaluation_system_ci/core-cases",
               "--junitxml=.evaluation_system_ci/core-junit.xml",

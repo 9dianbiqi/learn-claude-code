@@ -168,6 +168,7 @@ def test_undeclared_controller_effect_remains_rejected(tmp_path):
 
 
 def test_binding_uses_existing_candidate_verifier(tmp_path):
+    pytest.importorskip("inspect_ai")
     from agent_runtime.container_edits import repair_binding
     from agent_runtime.workspace_verifier import WorkspaceVerifier
     from contextlib import nullcontext
