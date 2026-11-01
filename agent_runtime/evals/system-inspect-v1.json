@@ -1,0 +1,36 @@
+{
+  "schema_version": "inspect-runtime-plan-v1",
+  "run_id": "system-inspect-v1",
+  "cases": [
+    {
+      "id": "partial-multifile",
+      "prompt": "Read left.txt and right.txt. Change old to new in both files, then finish.",
+      "files": {"left.txt": "old", "right.txt": "old"},
+      "goal_files": {"left.txt": "new", "right.txt": "new"},
+      "max_turns": 4,
+      "model": [
+        {"tool": "read_file", "id": "r", "input": {"path": "left.txt"}},
+        {"tool": "edit_file", "id": "e", "input": {"path": "left.txt", "old_text": "old", "new_text": "new"}},
+        {"text": "Both files are fixed."}
+      ],
+      "checks": {"status": "failed", "files": {"left.txt": "new", "right.txt": "old"}}
+    },
+    {
+      "id": "multifile-recovery",
+      "prompt": "Read left.txt and right.txt. Change old to new in both files, then finish.",
+      "files": {"left.txt": "old", "right.txt": "old"},
+      "goal_files": {"left.txt": "new", "right.txt": "new"},
+      "max_turns": 6,
+      "fault_point": "after_tool_persist",
+      "fault_tool_id": "edit-left",
+      "model": [
+        {"tool": "read_file", "id": "read-left", "input": {"path": "left.txt"}},
+        {"tool": "edit_file", "id": "edit-left", "input": {"path": "left.txt", "old_text": "old", "new_text": "new"}},
+        {"tool": "read_file", "id": "read-right", "input": {"path": "right.txt"}, "expect_feedback": "Edited"},
+        {"tool": "edit_file", "id": "edit-right", "input": {"path": "right.txt", "old_text": "old", "new_text": "new"}},
+        {"text": "Both files updated after recovery."}
+      ],
+      "checks": {"status": "completed", "files": {"left.txt": "new", "right.txt": "new"}}
+    }
+  ]
+}

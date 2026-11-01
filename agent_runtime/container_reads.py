@@ -104,6 +104,7 @@ sys.stdout.buffer.write(output)
 
 
 class DockerReadBridge:
+    program = READ_PROGRAM
     names = ("container_read_file", "container_find_files", "container_search_symbols")
 
     def __init__(self, backend, output, *, max_calls=24):
@@ -116,7 +117,7 @@ class DockerReadBridge:
         self.identity = {"source_id": backend.source_id, "session": backend.session,
             "image": backend.image, "engine_id": backend.engine_id, "workspace": backend.path,
             "instance": backend.instance_id, "base_commit": backend.base_commit,
-            "program_sha256": hashlib.sha256(READ_PROGRAM.encode()).hexdigest(),
+            "program_sha256": hashlib.sha256(self.program.encode()).hexdigest(),
             "sensitive_policy": list(SENSITIVE_BASENAME_PATTERNS), "max_calls": max_calls,
             "protocol": "container-reads-v1"}
 
@@ -191,7 +192,7 @@ class DockerReadBridge:
         backend.heartbeat()
         source = backend._assert_source()
         if source.attrs['State']['Paused']: raise RuntimeError("Cannot read a frozen source")
-        program = ["/opt/miniconda3/envs/testbed/bin/python",'-I','-c',READ_PROGRAM,backend.path,
+        program = ["/opt/miniconda3/envs/testbed/bin/python",'-I','-c',self.program,backend.path,
                    json.dumps(request,sort_keys=True),json.dumps(SENSITIVE_BASENAME_PATTERNS)]
         exec_id = backend.client.api.exec_create(source.id,cmd=program,user='65534:65534',stdout=True,stderr=True)['Id']
         record['exec_id'] = exec_id

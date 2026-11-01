@@ -101,6 +101,8 @@ class InspectModelBridge:
     """
 
     name = "inspect-mock-runtime-bridge"
+    usage_kind = "synthetic_mock"
+    generation_timeout = 15
 
     def __init__(self, model, output: Path, case_id: str):
         if str(model) != "mockllm/runtime-bridge" or model.api.base_url is not None:
@@ -133,13 +135,13 @@ class InspectModelBridge:
                    "bridge_call": self.calls, "request_sha256": _hash(encoded), "runtime_request": request,
                    "ledger_request_sha256": _hash(json.dumps(pending["request"], sort_keys=True, ensure_ascii=False).encode()),
                    "projection": pending.get("projection"), "source_checkpoint_id": pending.get("source_checkpoint_id"),
-                   "usage_kind": "synthetic_mock", "ok": False}
+                   "usage_kind": self.usage_kind, "ok": False}
 
         async def generate():
             # A cancelled Inspect host scope must not strand from_thread.run's
             # synchronous waiter. Finish this bounded mock generation before join.
             with anyio.CancelScope(shield=True):
-                with anyio.fail_after(15):
+                with anyio.fail_after(self.generation_timeout):
                     return await self.model.generate(input=converted, tools=schemas, tool_choice="auto", cache=False)
 
         try:

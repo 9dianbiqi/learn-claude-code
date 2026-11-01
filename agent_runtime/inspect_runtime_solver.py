@@ -39,6 +39,35 @@ class ContainerCaseBinding:
     verifier_node: VerifiedSubtaskConfig
 
 
+def validate_mock_responses(model, allowed_names=None):
+    """Validate a frozen script before granting a container capability."""
+    if len(json.dumps(model).encode()) > 64 * 1024:
+        raise ValueError("mock responses exceed 64 KiB")
+    if not isinstance(model, list) or not 1 <= len(model) <= 16:
+        raise ValueError("1..16 frozen mock responses required")
+    for entry in model:
+        if not isinstance(entry, dict) or set(entry) - {"tool", "id", "input", "text", "usage", "expect_feedback"}:
+            raise ValueError("unsupported response fields")
+        if ("tool" in entry) == ("text" in entry):
+            raise ValueError("each response must contain exactly one tool or text")
+        if "text" in entry and not isinstance(entry["text"], str):
+            raise ValueError("response text must be a string")
+        if "tool" in entry:
+            _identifier(entry["id"])
+            if not isinstance(entry.get("input"), dict):
+                raise ValueError("tool input must be an object")
+        if "usage" in entry:
+            usage = entry["usage"]
+            if (not isinstance(usage, dict) or set(usage) != {"input_tokens", "output_tokens"}
+                    or any(type(v) is not int or not 0 <= v <= 128 for v in usage.values())):
+                raise ValueError("explicit synthetic usage must have two counts in 0..128")
+        if entry.get("expect_feedback") is not None and not isinstance(entry["expect_feedback"], str):
+            raise ValueError("feedback assertion must be text")
+        if allowed_names is not None and "tool" in entry and entry["tool"] not in allowed_names:
+            raise ValueError("container fixture may not request native tools")
+        _response_from_entry(entry)
+
+
 def validate_plan(plan: dict, bindings: dict | None = None) -> None:
     if not isinstance(plan, dict) or plan.get("schema_version") != "inspect-runtime-plan-v1":
         raise ValueError("unsupported Runtime solver plan schema")
@@ -68,7 +97,7 @@ def validate_plan(plan: dict, bindings: dict | None = None) -> None:
             if case.get("fault_point") != "after_tool_persist":
                 raise ValueError("tool fault selector requires after_tool_persist")
         kind = case.get("execution_kind", "local_fixture")
-        if kind not in {"local_fixture", "container_read"}:
+        if kind not in {"local_fixture", "container_read", "container_repair"}:
             raise ValueError("unknown execution kind")
         if kind == "local_fixture":
             _validate_script(case)
@@ -77,38 +106,19 @@ def validate_plan(plan: dict, bindings: dict | None = None) -> None:
             binding = (bindings or {}).get(ident)
             if not isinstance(binding, ContainerCaseBinding):
                 raise ValueError("container case requires a trusted controller binding")
-            if tuple(binding.bridge.names) != ("container_read_file", "container_find_files", "container_search_symbols"):
-                raise ValueError("existing container-only read bridge required")
+            allowed_names = ("container_read_file", "container_find_files", "container_search_symbols")
+            if kind == "container_repair":
+                allowed_names += ("container_edit_file",)
+            if tuple(binding.bridge.names) != allowed_names:
+                raise ValueError("matching container-only bridge required")
             if (not isinstance(binding.verifier_node, VerifiedSubtaskConfig)
                     or binding.verifier_node.subtask_id != "fixture"
                     or binding.verifier_node.max_turns != case["max_turns"]):
                 raise ValueError("container verifier node must bind the same durable turn limit")
         if len(json.dumps(case).encode()) > 64 * 1024:
             raise ValueError("case exceeds 64 KiB")
-        model = case.get("model")
-        if not isinstance(model, list) or not 1 <= len(model) <= 16:
-            raise ValueError("1..16 frozen mock responses required")
-        for entry in model:
-            if not isinstance(entry, dict) or set(entry) - {"tool", "id", "input", "text", "usage", "expect_feedback"}:
-                raise ValueError("unsupported response fields")
-            if ("tool" in entry) == ("text" in entry):
-                raise ValueError("each response must contain exactly one tool or text")
-            if "text" in entry and not isinstance(entry["text"], str):
-                raise ValueError("response text must be a string")
-            if "tool" in entry:
-                _identifier(entry["id"])
-                if not isinstance(entry.get("input"), dict):
-                    raise ValueError("tool input must be an object")
-            if "usage" in entry:
-                usage = entry["usage"]
-                if (not isinstance(usage, dict) or set(usage) != {"input_tokens", "output_tokens"}
-                        or any(type(v) is not int or not 0 <= v <= 128 for v in usage.values())):
-                    raise ValueError("explicit synthetic usage must have two counts in 0..128")
-            if entry.get("expect_feedback") is not None and not isinstance(entry["expect_feedback"], str):
-                raise ValueError("feedback assertion must be text")
-            if kind == "container_read" and "tool" in entry and entry["tool"] not in binding.bridge.names:
-                raise ValueError("container fixture may not request native tools")
-            _response_from_entry(entry)
+        validate_mock_responses(case.get("model"),
+                                binding.bridge.names if kind != "local_fixture" else None)
         goals = case.get("goal_files", {})
         if not isinstance(goals, dict) or (kind == "local_fixture" and not 1 <= len(goals) <= 8):
             raise ValueError("1..8 frozen fixture goals required")
@@ -153,7 +163,8 @@ def fixture_model(case: dict, counts: dict):
     return model
 
 
-def execute_case(case: dict, root: Path, model, binding: ContainerCaseBinding | None = None) -> dict:
+def execute_case(case: dict, root: Path, model, binding: ContainerCaseBinding | None = None,
+                 *, bridge_factory=InspectModelBridge) -> dict:
     """Worker-thread entry; each fresh case has exactly one durable Runtime task."""
     workspace = root / "workspace"
     workspace.mkdir(parents=True, exist_ok=False)
@@ -161,7 +172,7 @@ def execute_case(case: dict, root: Path, model, binding: ContainerCaseBinding | 
         path = workspace / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
-    bridge = InspectModelBridge(model, root / "bridge-calls", case["id"])
+    bridge = bridge_factory(model, root / "bridge-calls", case["id"])
     fault_triggered = False
 
     def verify(context):
@@ -181,7 +192,7 @@ def execute_case(case: dict, root: Path, model, binding: ContainerCaseBinding | 
     policy = None
     if binding:
         policy = root / "controller-policy.yaml"
-        policy.write_text("rules:\n  - effect: allow\n    tools: [container_read_file, container_find_files, container_search_symbols]\n", encoding="utf-8")
+        policy.write_text("rules:\n  - effect: allow\n    tools: " + json.dumps(list(binding.bridge.names)) + "\n", encoding="utf-8")
 
     def inject(point, tool_use_id=None, **_):
         nonlocal fault_triggered

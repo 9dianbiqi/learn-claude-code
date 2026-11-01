@@ -1,0 +1,4 @@
+# Optional local asset preparation/export; pins from archived harness lock.
+-r requirements-inspect.txt
+docker==7.1.0
+pyarrow==26.0.0

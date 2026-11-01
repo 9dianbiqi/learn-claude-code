@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -134,6 +134,15 @@ class ToolRegistry:
         entry = ToolRegistration("controller_"+name, name, "builtin", None, None, None,
             description, dict(schema), "read_only", {"controller_binding": dict(binding)},
             timeout_seconds, True, 1, now, now, adapter)
+        self._entries[name] = entry
+        return entry
+
+    def register_controller_write_tool(self, name, description, schema, *, binding, adapter, timeout_seconds):
+        """External effects stay unknown_write: uncertain delivery is never replayed."""
+        entry = self.register_controller_read_tool(name, description, schema,
+            binding=binding, adapter=adapter, timeout_seconds=timeout_seconds)
+        entry = replace(entry, effect_kind="unknown_write", permission_requirements={
+            "controller_binding": dict(binding), "controller_effect": "unknown_write"})
         self._entries[name] = entry
         return entry
 

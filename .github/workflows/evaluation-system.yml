@@ -1,0 +1,53 @@
+name: Evaluation System Incremental
+
+# Manual only: publication must not repeat accepted suites or experiments.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluation-system:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -r agent_runtime/requirements-inspect.txt pytest
+      - run: python -c "from pathlib import Path; Path('.evaluation_system_ci').mkdir()"
+      - name: Test only evaluation system additions
+        run: >-
+          python -m pytest
+          agent_runtime/tests/test_evaluation_suite.py
+          agent_runtime/tests/test_benchmark_dataset.py
+          agent_runtime/tests/test_inspect_model_eval.py
+          agent_runtime/tests/test_container_edits.py
+          agent_runtime/tests/test_inspect_model_container.py
+          agent_runtime/tests/test_inspect_swe_runner.py
+          agent_runtime/tests/test_swe_environment.py
+          agent_runtime/tests/test_swe_grading.py
+          agent_runtime/tests/test_swe_acceptance.py
+          agent_runtime/tests/test_evaluation_report.py
+          agent_runtime/tests/test_swe_prepare.py
+          agent_runtime/tests/test_swe_assets.py
+          agent_runtime/tests/test_swe_base_export.py
+          -q --tb=short -p no:cacheprovider
+          --basetemp=.evaluation_system_ci/cases
+          --junitxml=.evaluation_system_ci/junit.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: evaluation-system-${{ runner.os }}
+          path: .evaluation_system_ci/
+          include-hidden-files: true
+          retention-days: 14
