@@ -10,6 +10,7 @@ from unittest.mock import Mock
 
 import pytest
 
+pytest.importorskip("inspect_ai")
 from agent_runtime import swe_acceptance as acceptance
 from agent_runtime import swe_prepare as preparation
 from agent_runtime.tests.test_swe_acceptance import prepare

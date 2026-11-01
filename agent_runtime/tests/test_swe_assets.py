@@ -65,6 +65,7 @@ def add_assets(tmp_path, spec):
 
 
 def test_complete_supplied_assets_emit_loadable_config_without_running(tmp_path):
+    pytest.importorskip("inspect_ai")
     from agent_runtime.swe_acceptance import load_config, run
     path, spec = spec_file(tmp_path)
     add_assets(tmp_path, spec)
