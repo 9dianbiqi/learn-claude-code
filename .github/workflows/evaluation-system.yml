@@ -1,7 +1,10 @@
 name: Evaluation System Incremental
 
-# Manual only: publication must not repeat accepted suites or experiments.
+# Candidate-only automatic trigger; do not repeat old suites or experiments.
 on:
+  push:
+    branches: [codex/runtime-swe-candidate-20261102]
+    paths: [.github/workflows/evaluation-system.yml]
   workflow_dispatch:
 
 permissions:
