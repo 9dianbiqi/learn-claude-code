@@ -61,7 +61,9 @@ jobs:
         shell: python
         run: |
           import importlib.abc
+          import os
           import sys
+          sys.path.insert(0, os.getcwd())
           import pytest
           class NoInspect(importlib.abc.MetaPathFinder):
               def find_spec(self, fullname, path=None, target=None):
