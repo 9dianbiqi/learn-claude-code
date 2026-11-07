@@ -17,6 +17,7 @@ from .benchmark_dataset import verify, _fresh
 from .docker_workspace import DockerWorkspaceBackend
 from .evaluation import _dump, _json, _read
 from .swe_environment import checked_archive
+from .docker_transport import recv as transport_recv
 
 
 EXPORT_PROGRAM = """import subprocess,sys
@@ -37,7 +38,7 @@ def receive(stream, destination):
             while True:
                 if time.monotonic() > deadline:
                     raise TimeoutError("base archive transfer deadline")
-                chunk = connection.recv(65536)
+                chunk = transport_recv(connection, 65536)
                 if not chunk:
                     break
                 pending.extend(chunk)

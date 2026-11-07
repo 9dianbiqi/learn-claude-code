@@ -120,7 +120,10 @@ def provision(bundle, manifest_sha256, instance_id, *, client, image,
         backend = DockerWorkspaceBackend(client=client, source_id=source.id, session=session,
             image=image, workspace_path="/workspace", instance_id=instance_id,
             base_commit=matches[0]["base_commit"], base_archive=frozen_base,
-            base_archive_sha256=base_archive_sha256, probes=probes, output=output / "backend")
+            base_archive_sha256=base_archive_sha256, probes=probes, output=output / "backend",
+            # Real SWE trees require host extraction/diff/reconstruction plus
+            # isolated probes. Keep one bounded scope, recorded in verifier ID.
+            scope_timeout_seconds=180)
         state["stage"] = "uploading"
         record()
         load_tmpfs_archive(client, source.id, "/workspace", data)

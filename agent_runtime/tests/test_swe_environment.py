@@ -54,6 +54,7 @@ def test_lifecycle_uploads_and_removes_exact_owned_source(tmp_path, monkeypatch)
     source.remove.assert_called_once_with(force=True)
     backend.observe_removed.assert_called_once()
     env.load_tmpfs_archive.assert_called_once()
+    assert env.DockerWorkspaceBackend.call_args.kwargs["scope_timeout_seconds"] == 180
     options = kwargs["client"].containers.create.call_args.kwargs
     assert options["network_mode"] == "none" and options["read_only"]
     assert options["entrypoint"] == [] and "volumes" not in options

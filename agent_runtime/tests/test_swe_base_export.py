@@ -35,6 +35,27 @@ def frame(data, channel=1):
     return bytes([channel, 0, 0, 0]) + struct.pack(">I", len(data)) + data
 
 
+@pytest.mark.parametrize("truncated", [False, True])
+def test_named_pipe_eof_preserves_frame_completeness(tmp_path, truncated):
+    class PipeEnded(Exception):
+        winerror = 109
+    class Pipe(Socket):
+        def recv(self, maximum):
+            if len(self.data) == 1:
+                raise PipeEnded("pipe ended")
+            return super().recv(maximum)
+    Pipe.__module__ = "docker.transport.npipesocket"
+    content = tar_bytes("a" * 40)
+    payload = frame(content)
+    stream = Pipe(payload[:-1] if truncated else payload)
+    if truncated:
+        with pytest.raises(ValueError, match="incomplete"):
+            exporter.receive(stream, tmp_path / "archive")
+    else:
+        assert exporter.receive(stream, tmp_path / "archive") == _hash(content)
+    assert stream.closed
+
+
 def setup(tmp_path):
     config, dataset = fixture(tmp_path)
     prepare(config, dataset)

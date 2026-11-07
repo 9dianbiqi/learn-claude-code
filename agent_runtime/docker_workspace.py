@@ -73,6 +73,9 @@ with tarfile.open(fileobj=sys.stdout.buffer,mode='w|') as archive:
 '''
 
 
+from .docker_transport import recv as transport_recv
+
+
 def digest(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -102,11 +105,15 @@ def load_tmpfs_archive(client, container_id, destination, archive, check=lambda:
                 raise TimeoutError("Archive upload deadline")
             connection.sendall(archive[offset:offset+65536])
         connection.shutdown(socket.SHUT_WR)
-        while True:
+        # Docker's Windows NpipeSocket.shutdown closes both directions. Do not
+        # read that closed handle; exec_inspect below remains the completion
+        # authority (including nonzero/missing exit status). TCP/Unix sockets
+        # still drain receiver diagnostics after a genuine half-close.
+        while getattr(connection, "_closed", False) is not True:
             check()
             if time.monotonic() > deadline:
                 raise TimeoutError("Archive receiver deadline")
-            data = connection.recv(8192)
+            data = transport_recv(connection, 8192)
             if not data:
                 break
             received.extend(data)
@@ -418,7 +425,7 @@ class DockerWorkspaceBackend:
                 self._check()
                 if time.monotonic()>deadline:
                     raise TimeoutError("Workspace export deadline")
-                data = connection.recv(65536)
+                data = transport_recv(connection, 65536)
                 if not data:
                     break
                 pending.extend(data)
@@ -492,11 +499,15 @@ class DockerWorkspaceBackend:
                 target.chmod(0o755 if entry.mode & 0o111 else 0o644)
 
     def _git(self, args, cwd, data=None):
+        self._check()
+        remaining = self._deadline-time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Workspace verification scope deadline exceeded")
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
         env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                    GIT_CEILING_DIRECTORIES=str(cwd.parent))
         return subprocess.run(["git", *args], cwd=cwd, env=env, input=data,
-                              capture_output=True, timeout=max(.1, min(15, self._deadline-time.monotonic())))
+                              capture_output=True, timeout=min(15, remaining))
 
     def capture(self):
         self._check()
@@ -520,8 +531,26 @@ class DockerWorkspaceBackend:
             revision = digest(json.dumps(manifest, sort_keys=True).encode())
             if revision in self._cache:
                 return self._cache[revision][0]
+            # Diff only changed files. Full-tree Git stat/read traversal is
+            # disproportionately slow on Windows; keep the full clean base for
+            # apply/reconstruction and preserve paths and executable modes.
+            candidate_index = {item['path']: (item['sha256'], item['executable']) for item in manifest}
+            base_index = {str(p.relative_to(base)): (digest(p.read_bytes()), bool(p.stat().st_mode & 0o111))
+                          for p in base.rglob('*') if p.is_file()}
+            changed = [name for name in base_index.keys() | candidate_index.keys()
+                       if base_index.get(name) != candidate_index.get(name)]
+            diff_root = root/'diff'
+            for name, tree in (('a', base), ('b', candidate)):
+                target = diff_root/name
+                target.mkdir(parents=True)
+                for relative in changed:
+                    path = tree/relative
+                    if path.is_file():
+                        dest = target/relative
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(path, dest)
             diff = self._git(["diff", "--no-index", "--no-prefix", "--binary", "--no-renames",
-                              "--no-ext-diff", "--no-textconv", "--", "a", "b"], root)
+                              "--no-ext-diff", "--no-textconv", "--", "a", "b"], diff_root)
             if diff.returncode not in {0, 1} or len(diff.stdout) > 100000:
                 raise RuntimeError("Patch generation failed or exceeded bound")
             patch = diff.stdout.decode("utf-8", errors="strict")

@@ -7,6 +7,7 @@ import time
 import uuid
 
 from .docker_recovery import durable_write
+from .docker_transport import recv as transport_recv
 from .recovery_advisor import RecoverableReadError
 from .security import SENSITIVE_BASENAME_PATTERNS, is_sensitive_relative, glob_targets_sensitive
 
@@ -205,7 +206,7 @@ class DockerReadBridge:
             while True:
                 backend.heartbeat()
                 if time.monotonic()>deadline: raise TimeoutError('Container read deadline')
-                data=connection.recv(8192)
+                data=transport_recv(connection,8192)
                 if not data: break
                 pending.extend(data)
                 while len(pending)>=8:
