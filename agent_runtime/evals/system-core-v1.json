@@ -1,0 +1,17 @@
+{
+  "schema_version": "evaluation-plan-v1",
+  "run_id": "system-core-v1",
+  "cases": [{
+    "id": "two-file-edit",
+    "mode": "scripted_runtime",
+    "files": {"left.txt": "left-old", "right.txt": "right-old"},
+    "model": [
+      {"tool": "read_file", "id": "read-left", "input": {"path": "left.txt"}},
+      {"tool": "read_file", "id": "read-right", "input": {"path": "right.txt"}},
+      {"tool": "edit_file", "id": "edit-left", "input": {"path": "left.txt", "old_text": "left-old", "new_text": "left-new"}},
+      {"tool": "edit_file", "id": "edit-right", "input": {"path": "right.txt", "old_text": "right-old", "new_text": "right-new"}},
+      {"text": "Both files updated."}
+    ],
+    "checks": {"status": "completed", "files": {"left.txt": "left-new", "right.txt": "right-new"}}
+  }]
+}

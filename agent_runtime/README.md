@@ -2,6 +2,20 @@
 
 Current development entry, branch ownership and release gates: [2026-10-23 closeout](docs/project-closeout-20261023.md).
 
+Unified evaluation, Inspect model execution and SWE-bench data/export commands:
+[Evaluation system guide](docs/evaluation-system-20261026.md).
+
+Current [review and offline follow-through](docs/offline-followthrough-20261101.md),
+[ordinary-user SWE entry and preparation guide](docs/swe-operator-guide-20261101.md),
+and [technical brief](docs/runtime-technical-brief-20261101.md) describe the local
+successor and remaining real Docker/official gates. Existing evidence can be
+rendered without execution using `python -m agent_runtime.evaluation_report`.
+
+[Real single-instance assets](docs/swe-real-assets-20261102.md) now connect the
+local pinned Parquet snapshot to an explicit missing-asset draft and an opt-in,
+identity-checked base export from an existing image. No real export or official
+result is established by the new offline checks.
+
 `agent_runtime` is a local execution layer for durable coding-agent tasks. It
 starts from the minimal agent-loop ideas taught by learn-claude-code, then adds
 the engineering mechanisms needed to recover, constrain, and audit a long-running

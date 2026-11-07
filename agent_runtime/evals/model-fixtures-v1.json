@@ -1,0 +1,19 @@
+{
+  "schema_version": "inspect-model-eval-v1",
+  "run_id": "model-fixtures-v1",
+  "mode": "mock",
+  "model": "mockllm/runtime-bridge",
+  "limits": {"max_requests_per_case": 4, "max_output_tokens": 512, "request_timeout_seconds": 15},
+  "cases": [{
+    "id": "model-file-edit",
+    "prompt": "Read value.txt and replace old with new, then finish.",
+    "files": {"value.txt": "old"},
+    "goal_files": {"value.txt": "new"},
+    "max_turns": 4,
+    "model": [
+      {"tool": "read_file", "id": "read", "input": {"path": "value.txt"}},
+      {"tool": "edit_file", "id": "edit", "input": {"path": "value.txt", "old_text": "old", "new_text": "new"}},
+      {"text": "Updated value.txt"}
+    ]
+  }]
+}

@@ -1,0 +1,29 @@
+{
+  "schema_version": "evaluation-suite-v1",
+  "run_id": "system-suite-v1",
+  "jobs": [
+    {
+      "id": "core",
+      "engine": "evaluation",
+      "plan": "system-core-v1.json",
+      "sha256": "cbd5c8fef14932bcaa9d56081324d09354ed7b096fb853380d206a66c059f8ea"
+    },
+    {
+      "id": "archive",
+      "engine": "inspect_archive",
+      "source_job": "core"
+    },
+    {
+      "id": "runtime",
+      "engine": "inspect_runtime",
+      "plan": "system-inspect-v1.json",
+      "sha256": "c5f4176373c08d1e71fcb0798e8ac89d4fae668990661f12182adba1887b3507"
+    },
+    {
+      "id": "model",
+      "engine": "inspect_model",
+      "plan": "model-fixtures-v1.json",
+      "sha256": "8535c5f19dd91f2cdbcb4fae44cc55b7a9835662ec51aa4c350e24c35ca3287e"
+    }
+  ]
+}

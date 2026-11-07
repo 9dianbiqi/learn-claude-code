@@ -1,0 +1,109 @@
+name: Evaluation System Incremental
+
+# Candidate-only automatic trigger; do not repeat old suites or experiments.
+on:
+  push:
+    branches: [codex/runtime-swe-candidate-20261102]
+    paths:
+      - .github/workflows/evaluation-system.yml
+      - agent_runtime/docker_transport.py
+      - agent_runtime/docker_workspace.py
+      - agent_runtime/container_reads.py
+      - agent_runtime/swe_base_export.py
+      - agent_runtime/swe_environment.py
+      - agent_runtime/tests/test_docker_transport.py
+      - agent_runtime/tests/test_docker_workspace.py
+      - agent_runtime/tests/test_container_reads.py
+      - agent_runtime/tests/test_swe_base_export.py
+      - agent_runtime/tests/test_swe_environment.py
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  evaluation-system:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -r agent_runtime/requirements-inspect.txt pytest
+      - run: python -c "from pathlib import Path; Path('.evaluation_system_ci').mkdir()"
+      - name: Test changed runtime boundaries
+        if: github.event_name == 'push'
+        run: >-
+          python -m pytest
+          agent_runtime/tests/test_docker_transport.py
+          agent_runtime/tests/test_docker_workspace.py
+          agent_runtime/tests/test_container_reads.py
+          agent_runtime/tests/test_swe_base_export.py
+          agent_runtime/tests/test_swe_environment.py
+          agent_runtime/tests/test_swe_prepare.py
+          agent_runtime/tests/test_swe_assets.py
+          agent_runtime/tests/test_container_edits.py
+          agent_runtime/tests/test_evaluation_suite.py
+          -q --tb=short -p no:cacheprovider
+          --basetemp=.evaluation_system_ci/cases
+          --junitxml=.evaluation_system_ci/junit.xml
+      - name: Test only evaluation system additions
+        if: github.event_name == 'workflow_dispatch'
+        run: >-
+          python -m pytest
+          agent_runtime/tests/test_docker_transport.py
+          agent_runtime/tests/test_docker_workspace.py
+          agent_runtime/tests/test_container_reads.py
+          agent_runtime/tests/test_evaluation_suite.py
+          agent_runtime/tests/test_benchmark_dataset.py
+          agent_runtime/tests/test_inspect_model_eval.py
+          agent_runtime/tests/test_container_edits.py
+          agent_runtime/tests/test_inspect_model_container.py
+          agent_runtime/tests/test_inspect_swe_runner.py
+          agent_runtime/tests/test_swe_environment.py
+          agent_runtime/tests/test_swe_grading.py
+          agent_runtime/tests/test_swe_acceptance.py
+          agent_runtime/tests/test_evaluation_report.py
+          agent_runtime/tests/test_swe_prepare.py
+          agent_runtime/tests/test_swe_assets.py
+          agent_runtime/tests/test_swe_base_export.py
+          -q --tb=short -p no:cacheprovider
+          --basetemp=.evaluation_system_ci/cases
+          --junitxml=.evaluation_system_ci/junit.xml
+      - name: Verify core-only optional dependency behavior
+        shell: python
+        run: |
+          import importlib.abc
+          import os
+          import sys
+          sys.path.insert(0, os.getcwd())
+          import pytest
+          class NoInspect(importlib.abc.MetaPathFinder):
+              def find_spec(self, fullname, path=None, target=None):
+                  if fullname == "inspect_ai" or fullname.startswith("inspect_ai."):
+                      raise ModuleNotFoundError("Inspect intentionally absent in core compatibility check", name=fullname)
+          sys.meta_path.insert(0, NoInspect())
+          raise SystemExit(pytest.main([
+              "agent_runtime/tests/test_swe_prepare.py",
+              "agent_runtime/tests/test_swe_assets.py",
+              "agent_runtime/tests/test_container_edits.py",
+              "agent_runtime/tests/test_evaluation_suite.py",
+              "-q", "--tb=short", "-p", "no:cacheprovider",
+              "--basetemp=.evaluation_system_ci/core-cases",
+              "--junitxml=.evaluation_system_ci/core-junit.xml",
+          ]))
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: evaluation-system-${{ runner.os }}
+          path: .evaluation_system_ci/
+          include-hidden-files: true
+          retention-days: 14

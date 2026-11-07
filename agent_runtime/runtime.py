@@ -224,7 +224,11 @@ class Runtime:
             if (not controller_tools or completion_contract is None
                     or any(not callable(self.tool_registry.get(name).adapter) for name in (self.tool_scope or ()))):
                 raise ValueError('Controller read budgets require live bound tools and a frozen completion contract')
-            self._controller_read_budget = ControllerReadBudget(controller_read_attempt_limit, tuple(controller_tools))
+            read_tools = tuple(name for name in controller_tools
+                               if self.tool_registry.get(name).effect_kind == "read_only")
+            if not read_tools:
+                raise ValueError("Controller read budget requires read-only tools")
+            self._controller_read_budget = ControllerReadBudget(controller_read_attempt_limit, read_tools)
         self.permissions = PermissionEngine(
             self.repo_root,
             policy_path=policy_path,
