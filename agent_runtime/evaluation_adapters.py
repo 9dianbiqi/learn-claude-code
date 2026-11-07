@@ -307,6 +307,7 @@ def _inspect_cases(run: EvaluationRun, source: Source):
         raise ValueError("invalid planned Inspect cases")
     _unique_rows(planned)
     by_id = {r["id"]: r for r in rows}
+    row_indexes = {r["id"]: i for i, r in enumerate(rows)}
     configs = {c["id"]: c for c in planned}
     if configs and not set(by_id) <= configs.keys():
         raise ValueError("foreign Inspect result")
@@ -321,16 +322,27 @@ def _inspect_cases(run: EvaluationRun, source: Source):
         if model and row.get("fixture_success") is not None and row.get("runtime_case_pass") is not None:
             if _boolean(row["fixture_success"], "fixture_success") is not _boolean(row["runtime_case_pass"], "runtime_case_pass"):
                 raise ValueError("contradictory fixture outcome")
-        oracle_spec = config.get("goal_files") if model else config.get("checks")
-        oracle = _oracle(source, ("fixture-goal:" if model else "runtime-checks:") + digest(oracle_spec)
-                         if oracle_spec is not None else "v1-reported-" + objective, objective, oracle_spec is not None)
-        _case(run, source, row, index, objective, oracle, scope,
+        if (config.get("execution_kind") and row.get("execution_kind")
+                and config["execution_kind"] != row["execution_kind"]):
+            raise ValueError("Inspect execution kind contradicts plan")
+        if config.get("execution_kind", row.get("execution_kind")) == "container_repair":
+            oracle = _container_oracle(run, source, row, ident)
+        else:
+            oracle_spec = config.get("goal_files") if model else config.get("checks")
+            oracle = _oracle(source, ("fixture-goal:" if model else "runtime-checks:") + digest(oracle_spec)
+                             if oracle_spec is not None else "v1-reported-" + objective, objective, oracle_spec is not None)
+        _case(run, source, row, row_indexes.get(ident, "planned:" + ident), objective, oracle, scope,
               row.get("fixture_success") if model else row.get("runtime_case_pass"),
               execution_id=row.get("task_id"), metrics=_usage(row, scope, (source.evidence.evidence_id,)),
               reason="planned case has no recorded result" if ident not in by_id else None)
     totals = (report.get("fixture_outcomes") or {}).get("planned") if model else (report.get("runtime_cases") or {}).get("total")
-    if totals is None:
-        totals = report.get("planned_cases", len(configs) if configs else None)
+    declarations = [value for value in (totals, report.get("planned_cases"), len(configs) if "cases" in plan else None)
+                    if value is not None]
+    if declarations:
+        declarations = [_count(value, "planned cases") for value in declarations]
+        if len(set(declarations)) != 1:
+            raise ValueError("Inspect planned denominator declarations disagree")
+        totals = declarations[0]
     if totals is not None:
         total = _count(totals, "planned cases")
         observed = len(configs or by_id)
@@ -348,9 +360,52 @@ def _inspect_cases(run: EvaluationRun, source: Source):
         if total > observed:
             run.unallocated.append({"identity": source.evidence.sha256 + ":planned-gap", "objective": objective,
                 "scope": asdict(scope), "comparison": _comparison(source),
+                "evidence_id": source.evidence.evidence_id, "observed_cases": observed,
                 "count": total - observed, "reason": "planned IDs absent in old result"})
     else:
         run.limitations.append("PARTIAL: no complete planned denominator available")
+
+
+def _container_oracle(run: EvaluationRun, source: Source, row: dict, ident: str) -> Oracle:
+    bindings = source.json_file("bindings.json")
+    if bindings is not None and not isinstance(bindings, dict):
+        raise ValueError("container bindings must be an object")
+    binding = (bindings or {}).get(ident, {})
+    if not isinstance(binding, dict):
+        raise ValueError("container binding must be an object")
+    verifier = binding.get("verifier_id")
+    records_path = ident + "/verifier-runs.json"
+    records = source.json_file(records_path)
+    records = [] if records is None else records
+    if not isinstance(records, list):
+        raise ValueError("container verifier records must be a list")
+    relevant = [r for r in records if isinstance(r, dict) and row.get("task_id")
+                and r.get("task_id") == row["task_id"]]
+    if row.get("task_id") and len(relevant) != len(records):
+        raise ValueError("container verifier record task identity conflict")
+    if verifier and any(r.get("verifier_id") != verifier for r in relevant):
+        raise ValueError("container binding/verifier identity conflict")
+    refs = [source.evidence.evidence_id]
+    for path in ("bindings.json", records_path):
+        if path in source.files:
+            data = source.files[path]
+            evidence = Evidence("evidence-" + _hash(data), str(Path(source.entry["bundle"]) / path),
+                                _hash(data), "unversioned-verifier-binding", seal_sha256=source.evidence.seal_sha256)
+            run.evidence.append(evidence)
+            refs.append(evidence.evidence_id)
+    if not isinstance(verifier, str) or not verifier:
+        run.limitations.append("PARTIAL: container verifier binding unavailable; empty file goals are not its oracle")
+        return Oracle("v1-reported-container-verifier", "controller_verifier", "reported", tuple(refs))
+    if not relevant:
+        run.limitations.append("PARTIAL: container verifier invocation unavailable; binding identity is reported only")
+        return Oracle(verifier, "controller_verifier", "reported", tuple(refs))
+    if any(r.get("verifier_bundle_hash") is None for r in relevant):
+        run.limitations.append("PARTIAL: exact container verifier bundle hash unavailable")
+        return Oracle(verifier, "controller_verifier", "reported", tuple(refs))
+    bundles = {sha256(r.get("verifier_bundle_hash")) for r in relevant}
+    if len(bundles) != 1:
+        raise ValueError("container verifier bundle identity conflict")
+    return Oracle(verifier + ":bundle:" + next(iter(bundles)), "controller_verifier", "source_validated", tuple(refs))
 
 
 def _candidate(run: EvaluationRun, source: Source):
@@ -365,30 +420,67 @@ def _candidate(run: EvaluationRun, source: Source):
     run.limitations.append("PARTIAL: candidate schema omits execution attempt and exact verifier identity; flag remains reported")
 
 
+def _official_plan(source: Source, refs: dict) -> dict:
+    """Recover planned subjects from pinned inputs, independently of grading."""
+    if (not isinstance(refs, dict) or not {"invocation", "predictions"} <= refs.keys()
+            or set(refs) - {"invocation", "predictions", "report"} or not source.files):
+        raise ValueError("official provenance requires sealed invocation/predictions")
+    data = {key: source.files[_sealed_path(path)] for key, path in refs.items()}
+    invocation = _json(data["invocation"])
+    predictions = [_json(line) for line in data["predictions"].splitlines() if line.strip()]
+    if not predictions or any(not isinstance(r, dict) or any(not isinstance(r.get(key), str) or
+            (key != "model_patch" and not r[key]) for key in ("instance_id", "model_name_or_path", "model_patch"))
+            for r in predictions):
+        raise ValueError("invalid official planned predictions")
+    ids = [r["instance_id"] for r in predictions]
+    if len(set(ids)) != len(ids):
+        raise ValueError("official prediction denominator mismatch")
+    for field in ("dataset_manifest_sha256", "prediction_sha256", "harness_commit"):
+        if source.report.get(field) != invocation.get(field):
+            raise ValueError("official invocation identity mismatch")
+    sha256(source.report.get("dataset_manifest_sha256"))
+    if re.fullmatch(r"[0-9a-f]{40}", source.report.get("harness_commit", "")) is None:
+        raise ValueError("immutable Harness pin required")
+    if _hash(data["predictions"]) != source.report.get("prediction_sha256"):
+        raise ValueError("official prediction digest mismatch")
+    argv = invocation.get("argv", [])
+    if not isinstance(argv, list) or any(not isinstance(a, str) for a in argv):
+        raise ValueError("invalid official invocation argv")
+    execution = None
+    if "--run_id" in argv:
+        index = argv.index("--run_id") + 1
+        if index >= len(argv) or not argv[index] or argv[index].startswith("--"):
+            raise ValueError("official source run ID absent")
+        execution = argv[index]
+    if "--instance_ids" in argv:
+        selected = []
+        for arg in argv[argv.index("--instance_ids") + 1:]:
+            if arg.startswith("--"):
+                break
+            selected.append(arg)
+        if len(selected) != len(ids) or set(selected) != set(ids):
+            raise ValueError("official invocation planned denominator mismatch")
+    return {"data": data, "invocation": invocation, "predictions": predictions, "ids": ids, "execution": execution}
+
+
 def _official_run(run: EvaluationRun, source: Source):
     report = source.report
     refs = source.entry.get("official_artifacts")
     outcomes, execution = None, None
     scope = _scope(source, allow_official=True)
     oracle = Oracle("unavailable-official-invocation", "official_harness", "unavailable")
-    if refs is not None:
-        if not isinstance(refs, dict) or set(refs) != {"invocation", "predictions", "report"} or not source.files:
-            raise ValueError("official provenance requires sealed invocation/predictions/report")
-        data = {k: source.files[_sealed_path(v)] for k, v in refs.items()}
-        invocation, official = _json(data["invocation"]), _json(data["report"])
-        predictions = [_json(line) for line in data["predictions"].splitlines() if line.strip()]
-        ids = [r["instance_id"] for r in predictions]
-        if not ids or len(set(ids)) != len(ids):
-            raise ValueError("official prediction denominator mismatch")
-        for field in ("dataset_manifest_sha256", "prediction_sha256", "harness_commit"):
-            if report.get(field) != invocation.get(field):
-                raise ValueError("official invocation identity mismatch")
-        sha256(report["dataset_manifest_sha256"])
-        if re.fullmatch(r"[0-9a-f]{40}", report.get("harness_commit", "")) is None:
-            raise ValueError("immutable Harness pin required")
+    if refs is None and {"invocation.json", "predictions.jsonl"} <= source.files.keys():
+        refs = {"invocation": "invocation.json", "predictions": "predictions.jsonl"}
+    plan = _official_plan(source, refs) if refs is not None else None
+    ids = plan["ids"] if plan else []
+    if plan:
+        execution = plan["execution"] if report.get("status") in {"STARTED", "FAILED", "REPORTED"} else None
+        oracle = Oracle("official:" + report["harness_commit"] + ":" + report["dataset_manifest_sha256"],
+                        "official_harness", "unavailable", (source.evidence.evidence_id,))
+    if plan and "report" in plan["data"] and report.get("status") == "REPORTED":
+        data, predictions = plan["data"], plan["predictions"]
+        official = _json(data["report"])
         if (report.get("exit_code") != 0 or type(report.get("exit_code")) is not int
-                or report.get("status") != "REPORTED"
-                or _hash(data["predictions"]) != report.get("prediction_sha256")
                 or _hash(data["report"]) != report.get("report_sha256")):
             raise ValueError("official execution/report hash mismatch")
         from .swe_grading import read_report
@@ -398,17 +490,15 @@ def _official_run(run: EvaluationRun, source: Source):
         empty = {r["instance_id"] for r in predictions if not r["model_patch"]}
         if set(official["empty_patch_ids"]) != empty or outcomes != report.get("official_resolved"):
             raise ValueError("official outcomes disagree with predictions/result")
-        argv = invocation.get("argv", [])
-        if not isinstance(argv, list) or "--run_id" not in argv:
+        if not execution:
             raise ValueError("official source run ID absent")
-        execution = argv[argv.index("--run_id") + 1]
         declared = source.entry.get("scope", {})
         if declared.get("grading") == "official_harness" and declared.get("environment") == "real_container":
             scope = _scope(source, grading="official_harness")
             oracle = _oracle(source, "official:" + report["harness_commit"] + ":" + report["dataset_manifest_sha256"],
                              "official_harness", True)
         else:
-            outcomes, execution = None, None
+            outcomes = None
             scope = replace(scope, grading="unknown")
             run.limitations.append("PARTIAL: report chain is consistent but real official execution was not controller-declared")
     else:
@@ -418,8 +508,11 @@ def _official_run(run: EvaluationRun, source: Source):
     claimed = report.get("official_resolved")
     if claimed is not None and not isinstance(claimed, dict):
         raise ValueError("official outcomes must be per-instance or null")
-    if claimed:
-        for index, (ident, value) in enumerate(claimed.items()):
+    if plan and claimed and not set(claimed) <= set(ids):
+        raise ValueError("official claimed subjects are outside planned predictions")
+    if ids or claimed:
+        for index, ident in enumerate(ids or claimed):
+            value = claimed.get(ident) if claimed else None
             _boolean(value, "official_resolved")
             _case(run, source, {"instance_id": ident, **{"error": report.get("error")}}, index,
                   "official_resolution", oracle, scope, outcomes[ident] if outcomes is not None else None,

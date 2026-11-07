@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="14" skipped="0" tests="15" time="6.666" timestamp="2026-11-08T06:38:05.836899+08:00" hostname="LAPTOP-V4OKV3NA"><testcase classname="agent_runtime.tests.test_evaluation_m1_fixes" name="test_mixed_sealed_and_file_import_is_one_observation[False]" time="0.386"><failure message="assert 2 == 1">agent_runtime\tests\test_evaluation_m1_fixes.py:35: in test_mixed_sealed_and_file_import_is_one_observation
+    assert result["unique_case_observations"] == 1
+E   assert 2 == 1</failure></testcase><testcase classname="agent_runtime.tests.test_evaluation_m1_fixes" name="test_mixed_sealed_and_file_import_is_one_observation[True]" time="0.443"><failure message="assert 2 == 1">agent_runtime\tests\test_evaluation_m1_fixes.py:35: in test_mixed_sealed_and_file_import_is_one_observation
+    assert result["unique_case_observations"] == 1
+E   assert 2 == 1</failure></testcase><testcase classname="agent_runtime.tests.test_evaluation_m1_fixes" name="test_mixed_import_conflicting_frozen_config_still_blocks" time="0.390"><failure message="Failed: DID NOT RAISE &lt;class 'ValueError'&gt;">agent_runtime\tests\test_evaluation_m1_fixes.py:44: in test_mixed_import_conflicting_frozen_config_still_blocks
+    with pytest.raises(ValueError, match="conflict"):
+E   Failed: DID NOT RAISE &lt;class 'ValueError'&gt;</failure></testcase><testcase classname="agent_runtime.tests.test_evaluation_m1_fixes" name="test_identical_report_bytes_with_distinct_recorded_executions_stay_independent" time="0.667" /><testcase classname="agent_runtime.tests.test_evaluation_m1_fixes" name="test_conflicting_inspect_planned_fields_block[5-1]" time="0.026"><failure message="Failed: DID NOT RAISE &lt;class 'ValueError'&gt;">agent_runtime\tests\test_evaluation_m1_fixes.py:60: in test_conflicting_inspect_planned_fields_block
+    with pytest.raises(ValueError, match="planned denominator"):
+E   Failed: DID NOT RAISE &lt;class 'ValueError'&gt;</failure></testcase><testcase classname="agent_runtime.tests.test_evaluation_m1_fixes" name="test_conflicting_inspect_planned_fields_block[0-1]" time="0.030"><failure message="Failed: DID NOT RAISE &lt;class 'ValueError'&gt;">agent_runtime\tests\test_evaluation_m1_fixes.py:60: in test_conflicting_inspect_planned_fields_block
+    with pytest.raises(ValueError, match="planned denominator"):
+E   Failed: DID NOT RAISE &lt;class 'ValueError'&gt;</failure></testcase><testcase classname="agent_runtime.tests.test_evaluation_m1_fixes" name="test_conflicting_inspect_planned_fields_block[1-5]" time="0.030"><failure message="Failed: DID NOT RAISE &lt;class 'ValueError'&gt;">agent_runtime\tests\test_evaluation_m1_fixes.py:60: in test_conflicting_inspect_planned_fields_block
+    with pytest.raises(ValueError, match="planned denominator"):
+E   Failed: DID NOT RAISE &lt;class 'ValueError'&gt;</failure></testcase><testcase classname="agent_runtime.tests.test_evaluation_m1_fixes" name="test_official_failure_retains_pinned_planned_instances[False-FAILED]" time="0.141"><failure message="AssertionError: assert set() == {'repo__issue...epo__issue-1'}&#10;  &#10;  Extra items in the right set:&#10;  'repo__issue-1'&#10;  'repo__issue-0'&#10;  Use -v to get more diff">agent_runtime\tests\test_evaluation_m1_fixes.py:88: in test_official_failure_retains_pinned_planned_instances
+    assert {c.case_id for c in run.cases} == {"repo__issue-0", "repo__issue-1"}
+E   AssertionError: assert set() == {'repo__issue...epo__issue-1'}
+E     
+E     Extra items in the right set:
+E     'repo__issue-1'
+E     'repo__issue-0'
+E     Use -v to get more diff</failure></testcase><testcase classname="agent_runtime.tests.test_evaluation_m1_fixes" name="test_official_failure_retains_pinned_planned_instances[False-STARTED]" time="0.123"><failure message="AssertionError: assert set() == {'repo__issue...epo__issue-1'}&#10;  &#10;  Extra items in the right set:&#10;  'repo__issue-1'&#10;  'repo__issue-0'&#10;  Use -v to get more diff">agent_runtime\tests\test_evaluation_m1_fixes.py:88: in test_official_failure_retains_pinned_planned_instances
+    assert {c.case_id for c in run.cases} == {"repo__issue-0", "repo__issue-1"}
+E   AssertionError: assert set() == {'repo__issue...epo__issue-1'}
+E     
+E     Extra items in the right set:
+E     'repo__issue-1'
+E     'repo__issue-0'
+E     Use -v to get more diff</failure></testcase><testcase classname="agent_runtime.tests.test_evaluation_m1_fixes" name="test_official_failure_retains_pinned_planned_instances[True-FAILED]" time="0.111"><failure message="ValueError: official provenance requires sealed invocation/predictions/report">agent_runtime\tests\test_evaluation_m1_fixes.py:87: in test_official_failure_retains_pinned_planned_instances
+    run = adapt(load_source(failed_official_entry(tmp_path, status=status, explicit_refs=explicit_refs)))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+agent_runtime\evaluation_adapters.py:443: in adapt
+    _official_run(run, source)
+agent_runtime\evaluation_adapters.py:376: in _official_run
+    raise ValueError("official provenance requires sealed invocation/predictions/report")
+E   ValueError: official provenance requires sealed invocation/predictions/report</failure></testcase><testcase classname="agent_runtime.tests.test_evaluation_m1_fixes" name="test_official_failure_retains_pinned_planned_instances[True-STARTED]" time="0.116"><failure message="ValueError: official provenance requires sealed invocation/predictions/report">agent_runtime\tests\test_evaluation_m1_fixes.py:87: in test_official_failure_retains_pinned_planned_instances
+    run = adapt(load_source(failed_official_entry(tmp_path, status=status, explicit_refs=explicit_refs)))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+agent_runtime\evaluation_adapters.py:443: in adapt
+    _official_run(run, source)
+agent_runtime\evaluation_adapters.py:376: in _official_run
+    raise ValueError("official provenance requires sealed invocation/predictions/report")
+E   ValueError: official provenance requires sealed invocation/predictions/report</failure></testcase><testcase classname="agent_runtime.tests.test_evaluation_m1_fixes" name="test_container_oracle_uses_sealed_binding_and_verifier_record" time="0.191"><failure message="AssertionError: assert False&#10; +  where False = &lt;built-in method startswith of str object at 0x00000185B3E78030&gt;('frozen-container-probes')&#10; +    where &lt;built-in method startswith of str object at 0x00000185B3E78030&gt; = 'fixture-goal:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a'.startswith&#10; +      where 'fixture-goal:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a' = Oracle(oracle_id='fixture-goal:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a', kind='fixture_goal',...ority='source_validated', evidence_refs=('evidence-4950259ab10fe32c45d542094a2b157d8d52beb1bc5ee9f08b76cfb825908292',)).oracle_id">agent_runtime\tests\test_evaluation_m1_fixes.py:116: in test_container_oracle_uses_sealed_binding_and_verifier_record
+    assert oracle.oracle_id.startswith("frozen-container-probes")
+E   AssertionError: assert False
+E    +  where False = &lt;built-in method startswith of str object at 0x00000185B3E78030&gt;('frozen-container-probes')
+E    +    where &lt;built-in method startswith of str object at 0x00000185B3E78030&gt; = 'fixture-goal:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a'.startswith
+E    +      where 'fixture-goal:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a' = Oracle(oracle_id='fixture-goal:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a', kind='fixture_goal',...ority='source_validated', evidence_refs=('evidence-4950259ab10fe32c45d542094a2b157d8d52beb1bc5ee9f08b76cfb825908292',)).oracle_id</failure></testcase><testcase classname="agent_runtime.tests.test_evaluation_m1_fixes" name="test_container_empty_goals_do_not_invent_validated_oracle[False-False]" time="0.102"><failure message="AssertionError: assert 'source_validated' == 'reported'&#10;  &#10;  - reported&#10;  + source_validated">agent_runtime\tests\test_evaluation_m1_fixes.py:124: in test_container_empty_goals_do_not_invent_validated_oracle
+    assert case.oracle.authority == "reported"
+E   AssertionError: assert 'source_validated' == 'reported'
+E     
+E     - reported
+E     + source_validated</failure></testcase><testcase classname="agent_runtime.tests.test_evaluation_m1_fixes" name="test_container_empty_goals_do_not_invent_validated_oracle[True-False]" time="0.125"><failure message="AssertionError: assert 'source_validated' == 'reported'&#10;  &#10;  - reported&#10;  + source_validated">agent_runtime\tests\test_evaluation_m1_fixes.py:124: in test_container_empty_goals_do_not_invent_validated_oracle
+    assert case.oracle.authority == "reported"
+E   AssertionError: assert 'source_validated' == 'reported'
+E     
+E     - reported
+E     + source_validated</failure></testcase><testcase classname="agent_runtime.tests.test_evaluation_m1_fixes" name="test_container_empty_goals_do_not_invent_validated_oracle[False-True]" time="0.138"><failure message="AssertionError: assert 'source_validated' == 'reported'&#10;  &#10;  - reported&#10;  + source_validated">agent_runtime\tests\test_evaluation_m1_fixes.py:124: in test_container_empty_goals_do_not_invent_validated_oracle
+    assert case.oracle.authority == "reported"
+E   AssertionError: assert 'source_validated' == 'reported'
+E     
+E     - reported
+E     + source_validated</failure></testcase></testsuite></testsuites>

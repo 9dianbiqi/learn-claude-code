@@ -2,6 +2,11 @@
 agent_runtime/examples/evaluation-v2-m1-final/** -text whitespace=cr-at-eol
 agent_runtime/docs/evidence/evaluation-v2-m1/** -text whitespace=cr-at-eol
 agent_runtime/docs/evaluation-v2-m1-example-input.json -text whitespace=cr-at-eol
+agent_runtime/examples/evaluation-v2-m1-fixes-20261108/** -text whitespace=cr-at-eol
+agent_runtime/docs/evidence/evaluation-v2-m1-fixes-20261108/** -text whitespace=cr-at-eol
+agent_runtime/docs/evaluation-v2-m1-fixes-input-20261108.json -text whitespace=cr-at-eol
+# Preserve pytest's raw failure padding inside the sealed red-run artifact.
+agent_runtime/docs/evidence/evaluation-v2-m1-fixes-20261108/red.xml -whitespace
 # Producer fingerprints refer to these exact LF source bytes.
 agent_runtime/evaluation_contract.py text eol=lf
 agent_runtime/evaluation_adapters.py text eol=lf

@@ -1,0 +1,56 @@
+{
+  "schema_version": "evaluation-m1-review-fixes-validation-v1",
+  "fix_base": "0b0c021f995ba416bdb2be884cb4376d870fc039",
+  "working_directory": "D:\\opencv\\learn-claude-code\\.worktrees\\evaluation-system-v2-m1",
+  "input_entries": 13,
+  "sealed_bundles": 8,
+  "verified_members_across_bundles": 146,
+  "unique_source_files": 129,
+  "original_m1_artifact_files_git_byte_checked": 20,
+  "original_m1_aggregates_unchanged": true,
+  "duplicate_all_imports_aggregate_equal": true,
+  "case_observations": 11,
+  "attempt_records": 53,
+  "new_runtime_executions_for_example": 0,
+  "new_provider_requests": 0,
+  "new_official_evaluations": 0,
+  "example_seal_sha256": "4511d05eea2753128260c06609747c26ddc93ba9fda0c6999f2d8d9549718720",
+  "tests": [
+    {
+      "batch": "red",
+      "command": "python -m pytest agent_runtime/tests/test_evaluation_m1_fixes.py -q --tb=short -p no:cacheprovider --basetemp=C:/Users/Lenovo/AppData/Local/Temp/evaluation-m1-fixes-red-20261108 --junitxml=C:/Users/Lenovo/AppData/Local/Temp/evaluation-m1-fixes-red-20261108.xml",
+      "total": 15,
+      "passed": 1,
+      "failed": 14,
+      "skipped": [],
+      "junit_sha256": "32b100f828598501759b0d46c5240e8d94e40dd3c3afa6ad03ae9da67e28b449"
+    },
+    {
+      "batch": "unit",
+      "command": "python -m pytest agent_runtime/tests/test_evaluation_contract.py agent_runtime/tests/test_evaluation_m1_fixes.py -q --tb=short -p no:cacheprovider --basetemp=C:/Users/Lenovo/AppData/Local/Temp/evaluation-m1-fixes-acceptance-20261108 --junitxml=C:/Users/Lenovo/AppData/Local/Temp/evaluation-m1-fixes-acceptance-20261108.xml",
+      "total": 78,
+      "passed": 78,
+      "failed": 0,
+      "skipped": [],
+      "junit_sha256": "e98be6da3948e405f35b442a87092ee347af543bb9896246857a9dbd35a782db"
+    },
+    {
+      "batch": "regression",
+      "command": "D:/opencv/learn-claude-code/.scratch/inspect-offline-venv/Scripts/python.exe -m pytest agent_runtime/tests/test_evaluation.py agent_runtime/tests/test_evaluation_bundle.py agent_runtime/tests/test_evaluation_report.py agent_runtime/tests/test_evaluation_suite.py agent_runtime/tests/test_inspect_adapter.py agent_runtime/tests/test_inspect_runtime_solver.py agent_runtime/tests/test_inspect_model_eval.py agent_runtime/tests/test_inspect_swe_runner.py agent_runtime/tests/test_swe_grading.py -q --tb=short -p no:cacheprovider --basetemp=C:/Users/Lenovo/AppData/Local/Temp/evaluation-m1-fixes-regression-20261108 --junitxml=C:/Users/Lenovo/AppData/Local/Temp/evaluation-m1-fixes-regression-20261108.xml",
+      "total": 167,
+      "passed": 165,
+      "failed": 0,
+      "skipped": [
+        {
+          "name": "test_symlink_input_rejected",
+          "reason": "symlink privilege unavailable"
+        },
+        {
+          "name": "test_symlink_inventory_rejected",
+          "reason": "symlink privilege unavailable"
+        }
+      ],
+      "junit_sha256": "8b46abcc6199d815218085f8d7596e89d574475be6e1eb99913efdf1cab94eec"
+    }
+  ]
+}

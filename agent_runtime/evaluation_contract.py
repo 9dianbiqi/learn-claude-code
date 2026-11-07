@@ -217,17 +217,32 @@ def aggregate(runs: list[EvaluationRun]) -> dict:
     A schema/report fingerprint identifies a repeated import only. It never
     establishes that two different unidentified reports describe one execution.
     """
-    seen, selected, observations = {}, [], set()
+    seen, selected, pending = {}, [], []
     attempts: dict[str, str] = {}
+    attempt_records = {}
     for run in runs:
         for attempt in run.attempts:
             fingerprint = digest({"kind": attempt.kind, "source_id": attempt.source_id,
                                   "parent_id": attempt.parent_id, "raw": attempt.raw})
             if attempt.attempt_id in attempts and attempts[attempt.attempt_id] != fingerprint:
-                raise ValueError("conflicting evidence for attempt identity: " + attempt.attempt_id)
+                previous = attempt_records[attempt.attempt_id]
+                if (previous.kind != attempt.kind or previous.source_id != attempt.source_id
+                        or previous.raw != attempt.raw or
+                        (previous.parent_id is not None and attempt.parent_id is not None
+                         and previous.parent_id != attempt.parent_id)):
+                    raise ValueError("conflicting evidence for attempt identity: " + attempt.attempt_id)
+                if attempt.parent_id is None:
+                    continue
             attempts[attempt.attempt_id] = fingerprint
+            attempt_records[attempt.attempt_id] = attempt
         for case in run.cases:
-            key = case.source_identity.key if case.source_identity else "observation:" + case.observation_id
+            archive_run_alias = (case.source_identity is not None and case.raw.get("mode") == "agent_archive"
+                                 and case.source_identity.execution_id == case.raw.get("source_run_id")
+                                 and case.oracle.authority == "reported")
+            if case.source_identity is None or archive_run_alias:
+                pending.append(case)
+                continue
+            key = case.source_identity.key
             fingerprint = digest({"verdict": case.verdict, "scope": asdict(case.scope),
                                   "objective": case.objective, "oracle": case.oracle.oracle_id,
                                   "comparison": case.comparison.frozen,
@@ -239,8 +254,48 @@ def aggregate(runs: list[EvaluationRun]) -> dict:
                     raise ValueError("conflicting evidence for source execution identity: " + key)
                 continue
             seen[key] = fingerprint
-            observations.add(case.observation_id)
             selected.append(case)
+    refined = {}
+    authority_rank = {"source_validated": 2, "reported": 1, "unavailable": 0}
+    for case in selected:
+        identity = case.source_identity
+        alias = (case.observation_id, identity.execution_id, identity.case_id, identity.objective)
+        previous = refined.get(alias)
+        if previous:
+            better, weaker = sorted((previous, case), key=lambda c: authority_rank[c.oracle.authority], reverse=True)
+            if (authority_rank[better.oracle.authority] == authority_rank[weaker.oracle.authority]
+                    or not _compatible_observation(weaker, better)):
+                raise ValueError("conflicting oracle evidence for observation/execution identity")
+            refined[alias] = better
+        else:
+            refined[alias] = case
+    selected = list(refined.values())
+    identified = {}
+    for case in selected:
+        identified.setdefault(case.observation_id, []).append(case)
+    for case in pending:
+        aliases = identified.get(case.observation_id, [])
+        if aliases:
+            compatible = [known for known in aliases if _compatible_observation(case, known)]
+            if not compatible:
+                raise ValueError("conflicting evidence for observation/execution identity")
+            if len(compatible) != 1:
+                raise ValueError("ambiguous observation matches multiple independent executions")
+            # Same exact report row, enriched by the sealed execution evidence.
+            # The weaker import remains visible in runs but adds no sample.
+            continue
+        key = case.source_identity.key if case.source_identity else "observation:" + case.observation_id
+        fingerprint = digest({"verdict": case.verdict, "scope": asdict(case.scope),
+                              "comparison": case.comparison.frozen, "raw": case.raw,
+                              "oracle": case.oracle.oracle_id,
+                              "metrics": [{k: v for k, v in asdict(m).items() if k != "evidence_refs"}
+                                          for m in case.metrics]})
+        if key in seen:
+            if seen[key] != fingerprint:
+                raise ValueError("conflicting evidence for observation identity")
+            continue
+        seen[key] = fingerprint
+        selected.append(case)
     groups: dict[str, dict] = {}
 
     def group(objective, scope, comparison):
@@ -255,6 +310,11 @@ def aggregate(runs: list[EvaluationRun]) -> dict:
     for case in selected:
         group(case.objective, asdict(case.scope), case.comparison.frozen)["counts"][case.verdict] += 1
     gaps = {}
+    represented = {}
+    for run in runs:
+        if run.evidence:
+            evidence_id = run.evidence[0].evidence_id
+            represented[evidence_id] = max(represented.get(evidence_id, 0), len(run.cases))
     for run in runs:
         for gap in run.unallocated:
             fingerprint = digest({k: v for k, v in gap.items() if k != "identity"})
@@ -263,13 +323,46 @@ def aggregate(runs: list[EvaluationRun]) -> dict:
                     raise ValueError("conflicting evidence for planned denominator identity")
                 continue
             gaps[gap["identity"]] = fingerprint
-            cohort = group(gap["objective"], gap["scope"], gap.get("comparison", {}))
-            cohort["counts"]["unknown"] += gap["count"]
-            cohort["unidentified_planned"] += gap["count"]
+            named_extra = max(0, represented.get(gap.get("evidence_id"), 0) - gap.get("observed_cases", 0))
+            remaining = max(0, gap["count"] - named_extra)
+            if remaining:
+                cohort = group(gap["objective"], gap["scope"], gap.get("comparison", {}))
+                cohort["counts"]["unknown"] += remaining
+                cohort["unidentified_planned"] += remaining
+    used_case_attempts = {ref for case in selected for ref in case.attempt_refs}
+    unique_attempts = sum(a.kind != "case_execution" or key in used_case_attempts
+                          for key, a in attempt_records.items())
     return {"schema_version": "evaluation-cohorts-v2", "cohorts": [
                 {"cohort_id": key, "objective": row["objective"], "scope": row["scope"],
                  "comparison_context": row["comparison_context"],
                  "unidentified_planned": row["unidentified_planned"], **outcome_counts(row["counts"])}
                 for key, row in sorted(groups.items())],
-            "unique_case_observations": len(selected), "unique_attempt_records": len(attempts),
+            "unique_case_observations": len(selected), "unique_attempt_records": unique_attempts,
             "overall_success_rate": None}
+
+
+def _compatible_observation(observed: EvaluationCase, identified: EvaluationCase) -> bool:
+    """Check an exact-byte observation alias without conflating known repeats.
+
+    Unknown metadata may be enriched; explicit contradictory metadata may not.
+    Different report bytes never enter this comparison. Distinct strong execution
+    identities stay distinct even when their old reports happen to be identical.
+    """
+    if observed.objective != identified.objective or observed.raw != identified.raw:
+        return False
+    if observed.verdict != identified.verdict and observed.verdict != "unknown":
+        return False
+    for key, value in asdict(observed.scope).items():
+        other = getattr(identified.scope, key)
+        if value != "unknown" and other != "unknown" and value != other:
+            return False
+    for key in observed.comparison.frozen.keys() & identified.comparison.frozen.keys():
+        if observed.comparison.frozen[key] != identified.comparison.frozen[key]:
+            return False
+    known_metrics = {m.name: m for m in identified.metrics}
+    for metric in observed.metrics:
+        other = known_metrics.get(metric.name)
+        if other and metric.value is not None and other.value is not None:
+            if (metric.value, metric.unit) != (other.value, other.unit):
+                return False
+    return True
