@@ -1,0 +1,73 @@
+{
+  "schema_version": "evaluation-v2-input-v1",
+  "run_id": "evaluation-v2-m1-existing-evidence",
+  "entries": [
+    {
+      "id": "historical",
+      "path": "D:\\opencv\\learn-claude-code\\.scratch\\evaluation-historical-import-20261022-final\\evaluation\\report.json",
+      "sha256": "ec7223d50e34d738100327cb894ddcbd363f8ecb210620c271078ab27134a670",
+      "bundle": "D:\\opencv\\learn-claude-code\\.scratch\\evaluation-historical-import-20261022-final\\evaluation",
+      "seal_sha256": "b4c8a96f03e9342642f9181a2543097b1b71e6c7e0ee78b40acbd7ce2a6ca2b9"
+    },
+    {
+      "id": "historical-inspect",
+      "path": "D:\\opencv\\learn-claude-code\\.scratch\\inspect-historical-import-20261022-01\\adapter-result.json",
+      "sha256": "287e0c69d1cee7f8c958f0034739d8cad794c43ea5ac5b3dfc3b1951305aa891",
+      "bundle": "D:\\opencv\\learn-claude-code\\.scratch\\inspect-historical-import-20261022-01",
+      "seal_sha256": "7dbdaa79e4be3aeb9c993d5f72dc47a691abd3588ec33bf73988dbd60cecc261",
+      "projection_of": "historical"
+    },
+    {
+      "id": "runtime-baseline",
+      "path": "D:\\opencv\\learn-claude-code\\.scratch\\inspect-runtime-solver-smoke-01\\report.json",
+      "sha256": "cbe2d0b81870c22529460e9d79eb3ab157fa3565a6b2ada0cee1b50278e91407",
+      "bundle": "D:\\opencv\\learn-claude-code\\.scratch\\inspect-runtime-solver-smoke-01",
+      "seal_sha256": "be85c7549d99b58ff908f4b5de08f5caa77330485f5366e96c9b2d4fecefe1fb"
+    },
+    {
+      "id": "core-new",
+      "path": "D:\\opencv\\learn-claude-code\\.scratch\\evaluation-system-suite-20261026\\jobs\\core\\report.json",
+      "sha256": "52fefa96710332460815d8d82a5a12f647a1d951000929030978675a530aa3a7",
+      "bundle": "D:\\opencv\\learn-claude-code\\.scratch\\evaluation-system-suite-20261026\\jobs\\core",
+      "seal_sha256": "ae44e7533ad756dd585d40e611c62bffd6c5e7a087285bfa12e043e410b015ac"
+    },
+    {
+      "id": "runtime-new",
+      "path": "D:\\opencv\\learn-claude-code\\.scratch\\evaluation-system-suite-20261026\\jobs\\runtime\\report.json",
+      "sha256": "c9aa18ccb1570fb8a9b3f434cdd4b353ea2da2cecad52327aaf3249eabb801fc",
+      "bundle": "D:\\opencv\\learn-claude-code\\.scratch\\evaluation-system-suite-20261026\\jobs\\runtime",
+      "seal_sha256": "df1f14a2f603b05054e35e0ad0ea399a364d9b542dc705dd44c35292e514c898"
+    },
+    {
+      "id": "model-new",
+      "path": "D:\\opencv\\learn-claude-code\\.scratch\\model-eval-audit-tests-20261026\\test_model_bridge_end_to_end_a0\\output\\report.json",
+      "sha256": "1431327839ae9f2d0d172f5b4a17ccc30657db36158ddc24c769497362d38378",
+      "bundle": "D:\\opencv\\learn-claude-code\\.scratch\\model-eval-audit-tests-20261026\\test_model_bridge_end_to_end_a0\\output",
+      "seal_sha256": "848e318ab79b073ba4c45b1bf312008718afb887ecba0963af9eb4067b5bb841"
+    },
+    {
+      "id": "core-import-again",
+      "path": "D:\\opencv\\learn-claude-code\\.scratch\\evaluation-system-suite-20261026\\jobs\\core\\report.json",
+      "sha256": "52fefa96710332460815d8d82a5a12f647a1d951000929030978675a530aa3a7",
+      "bundle": "D:\\opencv\\learn-claude-code\\.scratch\\evaluation-system-suite-20261026\\jobs\\core",
+      "seal_sha256": "ae44e7533ad756dd585d40e611c62bffd6c5e7a087285bfa12e043e410b015ac"
+    },
+    {
+      "id": "real-scripted-candidate",
+      "path": "D:\\opencv\\learn-claude-code\\.scratch\\swe19346-candidate-20261106-05\\candidate\\result.json",
+      "sha256": "4b21b349d7fabb448ca421f645979bd2516255b241a3339d11f0355e41aebe87",
+      "bundle": "D:\\opencv\\learn-claude-code\\.scratch\\swe19346-candidate-20261106-05\\candidate",
+      "seal_sha256": "1369bac9a88ca02f47986b825dcd3043c6f87b4d401537638f199dec9268bd61",
+      "scope": {
+        "model_mode": "mock",
+        "environment": "real_container",
+        "subject_role": "scripted_candidate"
+      }
+    },
+    {
+      "id": "official-summary-only",
+      "path": "D:\\opencv\\learn-claude-code\\.scratch\\swe19346-official-20261106-01\\result.json",
+      "sha256": "6697586944d901c3d86c23885c97e5affccba77ee5111660b5ab598cb82e752e"
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+[
+  {
+    "path": "checks.json",
+    "sha256": "19a311964ce99822f5f27c3f8bec95e6bd4432c2c046cf3f023df24bd720691b"
+  },
+  {
+    "path": "regression.xml",
+    "sha256": "ee6adfcadbad57963bf4a9af77e73359fcf486100455c76a23e9c3d214b67800"
+  },
+  {
+    "path": "unit.xml",
+    "sha256": "c25d8978aeb9aaa1177e09b8359e8cf9040df0b1b9a6a53c57efac8cad951798"
+  },
+  {
+    "path": "verify.py",
+    "sha256": "4fbbf65467af8bb0b908c58114c344aa649298b7b33438b69fbaa78467eda8a3"
+  }
+]

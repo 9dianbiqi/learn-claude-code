@@ -1,0 +1,51 @@
+{
+  "schema_version": "evaluation-v2-m1-validation-v1",
+  "baseline": "71a605aa06de774700890b77fbe2dc2d4b1f34b0",
+  "working_directory": "D:\\opencv\\learn-claude-code\\.worktrees\\evaluation-system-v2-m1",
+  "source_bundles": 7,
+  "source_members_hash_verified": 129,
+  "source_pins_unchanged": true,
+  "read_only_reprojection_equal": true,
+  "duplicate_all_imports_aggregate_equal": true,
+  "example_seal_sha256": "175431a158892580a06300166f0566936f638a4896aa15f239d34da75050a703",
+  "case_observations": 10,
+  "source_identified_cases": 8,
+  "attempt_kinds": {
+    "case_execution": 8,
+    "model_generation": 26,
+    "tool_operation": 12,
+    "verifier_invocation": 6
+  },
+  "new_runtime_executions_for_example": 0,
+  "new_provider_requests": 0,
+  "new_official_evaluations": 0,
+  "tests": [
+    {
+      "batch": "unit",
+      "command": "python -m pytest agent_runtime/tests/test_evaluation_contract.py -q --tb=short -p no:cacheprovider --basetemp=C:/Users/Lenovo/AppData/Local/Temp/evaluation-v2-m1-unit-acceptance --junitxml=C:/Users/Lenovo/AppData/Local/Temp/evaluation-v2-m1-unit-acceptance.xml",
+      "junit_sha256": "c25d8978aeb9aaa1177e09b8359e8cf9040df0b1b9a6a53c57efac8cad951798",
+      "total": 50,
+      "passed": 50,
+      "failed": 0,
+      "skipped": []
+    },
+    {
+      "batch": "regression",
+      "command": "D:/opencv/learn-claude-code/.scratch/inspect-offline-venv/Scripts/python.exe -m pytest agent_runtime/tests/test_evaluation.py agent_runtime/tests/test_evaluation_bundle.py agent_runtime/tests/test_evaluation_report.py agent_runtime/tests/test_evaluation_suite.py agent_runtime/tests/test_inspect_adapter.py agent_runtime/tests/test_inspect_runtime_solver.py agent_runtime/tests/test_inspect_model_eval.py agent_runtime/tests/test_inspect_swe_runner.py agent_runtime/tests/test_swe_grading.py -q --tb=short -p no:cacheprovider --basetemp=C:/Users/Lenovo/AppData/Local/Temp/evaluation-v2-m1-regression-01 --junitxml=C:/Users/Lenovo/AppData/Local/Temp/evaluation-v2-m1-regression-01.xml",
+      "junit_sha256": "ee6adfcadbad57963bf4a9af77e73359fcf486100455c76a23e9c3d214b67800",
+      "total": 167,
+      "passed": 165,
+      "failed": 0,
+      "skipped": [
+        {
+          "name": "test_symlink_input_rejected",
+          "reason": "symlink privilege unavailable"
+        },
+        {
+          "name": "test_symlink_inventory_rejected",
+          "reason": "symlink privilege unavailable"
+        }
+      ]
+    }
+  ]
+}

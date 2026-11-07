@@ -1,0 +1,8 @@
+# Preserve exact sealed evidence bytes, including on core.autocrlf=true hosts.
+agent_runtime/examples/evaluation-v2-m1-final/** -text whitespace=cr-at-eol
+agent_runtime/docs/evidence/evaluation-v2-m1/** -text whitespace=cr-at-eol
+agent_runtime/docs/evaluation-v2-m1-example-input.json -text whitespace=cr-at-eol
+# Producer fingerprints refer to these exact LF source bytes.
+agent_runtime/evaluation_contract.py text eol=lf
+agent_runtime/evaluation_adapters.py text eol=lf
+agent_runtime/evaluation_v2.py text eol=lf
