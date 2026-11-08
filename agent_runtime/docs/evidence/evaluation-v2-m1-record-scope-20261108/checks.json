@@ -1,0 +1,56 @@
+{
+  "schema_version": "evaluation-m1-record-scope-validation-v1",
+  "fix_base": "c27b6b383e1faed53cb7de02d8f7ba64a0921621",
+  "working_directory": "D:\\opencv\\learn-claude-code\\.worktrees\\evaluation-system-v2-m1",
+  "input_entries": 13,
+  "sealed_bundles": 8,
+  "verified_members_across_bundles": 146,
+  "unique_source_files": 129,
+  "previous_artifact_files_git_byte_checked": 70,
+  "three_previous_aggregate_results_unchanged": true,
+  "duplicate_all_imports_aggregate_equal": true,
+  "case_observations": 11,
+  "attempt_records": 53,
+  "new_runtime_executions_for_example": 0,
+  "new_provider_requests": 0,
+  "new_official_evaluations": 0,
+  "example_seal_sha256": "d5e77e206876b1e92a36aec1ae5c516dbf7550283d468e27ec35c8b687be87ff",
+  "tests": [
+    {
+      "batch": "red",
+      "command": "python -m pytest agent_runtime/tests/test_evaluation_m1_multirecord.py -q --tb=line -p no:cacheprovider --basetemp=D:/CodexTemp/evaluation-m1-multirecord-red-02-20261108 --junitxml=D:/CodexTemp/evaluation-m1-multirecord-red-02-20261108.xml",
+      "total": 21,
+      "passed": 2,
+      "failed": 19,
+      "skipped": [],
+      "junit_sha256": "c341ed0840ac868b71b6133af72e754bad157521c0399c0b78ecb4b116b65921"
+    },
+    {
+      "batch": "unit",
+      "command": "python -m pytest agent_runtime/tests/test_evaluation_contract.py agent_runtime/tests/test_evaluation_m1_fixes.py agent_runtime/tests/test_evaluation_m1_authority.py agent_runtime/tests/test_evaluation_m1_multirecord.py -q --tb=short -p no:cacheprovider --basetemp=D:/CodexTemp/evaluation-m1-multirecord-green-01-20261108 --junitxml=D:/CodexTemp/evaluation-m1-multirecord-green-01-20261108.xml",
+      "total": 126,
+      "passed": 126,
+      "failed": 0,
+      "skipped": [],
+      "junit_sha256": "87c4608991798be43412cb07f71aac5842ada537bf31eb3793e0b74edb036e2f"
+    },
+    {
+      "batch": "regression",
+      "command": "D:/opencv/learn-claude-code/.scratch/inspect-offline-venv/Scripts/python.exe -m pytest agent_runtime/tests/test_evaluation.py agent_runtime/tests/test_evaluation_bundle.py agent_runtime/tests/test_evaluation_report.py agent_runtime/tests/test_evaluation_suite.py agent_runtime/tests/test_inspect_adapter.py agent_runtime/tests/test_inspect_runtime_solver.py agent_runtime/tests/test_inspect_model_eval.py agent_runtime/tests/test_inspect_swe_runner.py agent_runtime/tests/test_swe_grading.py -q --tb=short -p no:cacheprovider --basetemp=D:/CodexTemp/evaluation-m1-multirecord-regression-20261108 --junitxml=D:/CodexTemp/evaluation-m1-multirecord-regression-20261108.xml",
+      "total": 167,
+      "passed": 165,
+      "failed": 0,
+      "skipped": [
+        {
+          "name": "test_symlink_input_rejected",
+          "reason": "symlink privilege unavailable"
+        },
+        {
+          "name": "test_symlink_inventory_rejected",
+          "reason": "symlink privilege unavailable"
+        }
+      ],
+      "junit_sha256": "cc49b7310cc40ed029d743994994a86022b6e5fed976951b441f98315369dc0b"
+    }
+  ]
+}

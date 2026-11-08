@@ -1,0 +1,20 @@
+{
+  "schema_version": "swe-official-run-v1",
+  "status": "REPORTED",
+  "dataset_manifest_sha256": "3c79f5ff13633270e762db0f5740fdc4b82b82993d5115d62a51d3d7fdea18ee",
+  "prediction_sha256": "877f1f3b20ca72863e5e2db9fc27fd7d4ab3a2ee9e333001b88d810ad96d96da",
+  "harness_commit": "3f01bd622c0a22c00406139f69a234ef08225f22",
+  "new_provider_requests": 0,
+  "new_official_evaluations": 1,
+  "official_resolved": {
+    "sympy__sympy-19346": true
+  },
+  "manual_recovery_required": false,
+  "error": null,
+  "engine_id": "42aca9e1-38a1-4e2f-b8a2-e8e013c7446f",
+  "docker_host": "unix:///mnt/wsl/docker-desktop/shared-sockets/host-services/docker.proxy.sock",
+  "controller_python": "/mnt/d/opencv/learn-claude-code/.scratch/inspect-offline-linux-venv/bin/python",
+  "grader_python": "/mnt/d/opencv/learn-claude-code/.scratch/swebench-single-20261013/venv-linux/bin/python",
+  "exit_code": 0,
+  "report_sha256": "d388344575b538410e8c04ceaecc6cb2634127069e25b21fdb81efdd8249f6c0"
+}

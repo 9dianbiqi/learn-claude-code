@@ -369,6 +369,30 @@ def _inspect_cases(run: EvaluationRun, source: Source):
         run.limitations.append("PARTIAL: no complete planned denominator available")
 
 
+def _container_record_scope(records: list[dict]) -> bool:
+    """Inspect bindings use one fixed fixture node; never borrow another item.
+
+    Validate every explicit association before using export order as 'latest'.
+    Missing legacy associations remain incomplete, not an inferred match.
+    """
+    complete, item_ids = True, set()
+    for record in records:
+        subtask, item_id = record.get("subtask_id"), record.get("plan_item_id")
+        if subtask is None:
+            complete = False
+        elif subtask != "fixture":
+            raise ValueError("container verifier subtask identity conflict")
+        if item_id is None:
+            complete = False
+        elif type(item_id) is not int or item_id < 1:
+            raise ValueError("invalid container verifier plan-item identity")
+        else:
+            item_ids.add(item_id)
+    if len(item_ids) > 1:
+        raise ValueError("container verifier plan-item identity conflict")
+    return complete
+
+
 def _container_oracle(run: EvaluationRun, source: Source, row: dict, ident: str, *, require_success=False) -> Oracle:
     bindings = source.json_file("bindings.json")
     if bindings is not None and not isinstance(bindings, dict):
@@ -388,6 +412,7 @@ def _container_oracle(run: EvaluationRun, source: Source, row: dict, ident: str,
         raise ValueError("container verifier record task identity conflict")
     if verifier and any(r.get("verifier_id") != verifier for r in relevant):
         raise ValueError("container binding/verifier identity conflict")
+    scope_complete = _container_record_scope(relevant)
     refs = [source.evidence.evidence_id]
     for path in ("bindings.json", records_path):
         if path in source.files:
@@ -403,6 +428,18 @@ def _container_oracle(run: EvaluationRun, source: Source, row: dict, ident: str,
     if not relevant:
         run.limitations.append("PARTIAL: container verifier invocation unavailable; binding identity is reported only")
         return Oracle(verifier, "controller_verifier", "reported", tuple(refs), identity_components=components)
+    # Missing entries cannot erase a known hash, malformed value or conflict.
+    bundles = {sha256(r["verifier_bundle_hash"]) for r in relevant if r.get("verifier_bundle_hash") is not None}
+    if len(bundles) > 1:
+        raise ValueError("container verifier bundle identity conflict")
+    bundle_hash = next(iter(bundles)) if bundles else None
+    if bundle_hash:
+        components["bundle_sha256"] = bundle_hash
+    hashes_complete = all(r.get("verifier_bundle_hash") is not None for r in relevant)
+    if not scope_complete:
+        run.limitations.append("PARTIAL: container verifier subtask/plan-item association is incomplete")
+    if not hashes_complete:
+        run.limitations.append("PARTIAL: some container verifier bundle hashes are unavailable; known identity retained")
     for record in relevant:
         if record.get("status") is not None and record["status"] not in {"pass", "fail", "uncertain"}:
             raise ValueError("invalid container verifier status")
@@ -411,21 +448,16 @@ def _container_oracle(run: EvaluationRun, source: Source, row: dict, ident: str,
     success_evidence_incomplete = False
     if require_success:
         latest = relevant[-1]  # Persisted invocation order; never select the best attempt.
-        if latest.get("status") in {"fail", "uncertain"} or latest.get("authoritative") is False:
+        latest_scoped = (latest.get("subtask_id") == "fixture"
+                         and type(latest.get("plan_item_id")) is int and latest["plan_item_id"] > 0)
+        if latest_scoped and (latest.get("status") in {"fail", "uncertain"} or latest.get("authoritative") is False):
             raise ValueError("container verifier evidence contradicts fixture success")
-        if latest.get("status") != "pass" or latest.get("authoritative") is not True:
+        if not latest_scoped or latest.get("status") != "pass" or latest.get("authoritative") is not True:
             run.limitations.append("PARTIAL: authoritative container verifier success is not recorded")
             success_evidence_incomplete = True
-    if any(r.get("verifier_bundle_hash") is None for r in relevant):
-        run.limitations.append("PARTIAL: exact container verifier bundle hash unavailable")
-        return Oracle(verifier, "controller_verifier", "reported", tuple(refs), identity_components=components)
-    bundles = {sha256(r.get("verifier_bundle_hash")) for r in relevant}
-    if len(bundles) != 1:
-        raise ValueError("container verifier bundle identity conflict")
-    bundle_hash = next(iter(bundles))
-    return Oracle(verifier + ":bundle:" + bundle_hash, "controller_verifier",
-                  "reported" if success_evidence_incomplete else "source_validated", tuple(refs),
-                  identity_components={**components, "bundle_sha256": bundle_hash})
+    complete = scope_complete and hashes_complete and not success_evidence_incomplete
+    return Oracle(verifier + ":bundle:" + bundle_hash if bundle_hash else verifier, "controller_verifier",
+                  "source_validated" if complete else "reported", tuple(refs), identity_components=components)
 
 
 def _candidate(run: EvaluationRun, source: Source):

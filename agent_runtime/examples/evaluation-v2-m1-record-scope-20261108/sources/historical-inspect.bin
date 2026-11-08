@@ -1,0 +1,76 @@
+{
+  "schema_version": "inspect-offline-result-v1",
+  "processing_ok": true,
+  "inspect_version": "0.3.283",
+  "source_run_id": "historical-import-20261022",
+  "source_seal_sha256": "b4c8a96f03e9342642f9181a2543097b1b71e6c7e0ee78b40acbd7ce2a6ca2b9",
+  "source_aggregates": {
+    "runtime": {
+      "total": 0,
+      "passed": 0,
+      "failed": 0,
+      "unknown": 0,
+      "success_rate": null
+    },
+    "agent": {
+      "total": 1,
+      "passed": 0,
+      "failed": 1,
+      "unknown": 0,
+      "success_rate": 0.0
+    },
+    "environment": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0,
+      "unknown": 0,
+      "success_rate": 1.0
+    }
+  },
+  "source_processing_ok": true,
+  "new_provider_requests": 0,
+  "new_official_evaluations": 0,
+  "new_provider_input_tokens": 0,
+  "new_provider_output_tokens": 0,
+  "logs": [
+    {
+      "kind": "agent",
+      "samples": 1,
+      "metrics": {
+        "success_lower_bound": 0.0,
+        "failure_fraction": 1.0,
+        "unknown_fraction": 0.0,
+        "known_fraction": 1.0
+      },
+      "strict_source_aggregate": {
+        "total": 1,
+        "passed": 0,
+        "failed": 1,
+        "unknown": 0,
+        "success_rate": 0.0
+      },
+      "log": "logs/2026-10-22T14-56-24-00-00_offline-archive-agent_3jNAJDDqJ4BgZUd8G43Ngh.eval",
+      "sha256": "15d55b7535ae7c7dc460fa35f6add3aa2673fe3dfe2e7df7795359f722c27bf7"
+    },
+    {
+      "kind": "environment",
+      "samples": 1,
+      "metrics": {
+        "success_lower_bound": 1.0,
+        "failure_fraction": 0.0,
+        "unknown_fraction": 0.0,
+        "known_fraction": 1.0
+      },
+      "strict_source_aggregate": {
+        "total": 1,
+        "passed": 1,
+        "failed": 0,
+        "unknown": 0,
+        "success_rate": 1.0
+      },
+      "log": "logs/2026-10-22T14-56-24-00-00_offline-archive-environment_kPvpLuYrcbXeY9auUjJkCw.eval",
+      "sha256": "99d081a95c571c038d063ae99ad90efc4c6a4ca8025e3203bec088ac1d1162c1"
+    }
+  ],
+  "model_generation_attempts": 0
+}

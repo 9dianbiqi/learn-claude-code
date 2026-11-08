@@ -104,6 +104,7 @@ def container_entry(tmp_path, *, binding=True, records=True):
         files["bindings.json"] = {"repair": {"verifier_id": "frozen-container-probes"}}
     if records:
         files["repair/verifier-runs.json"] = [{"task_id": "task-container", "verifier_run_id": "v1",
+            "subtask_id": "fixture", "plan_item_id": 1,
             "verifier_id": "frozen-container-probes", "verifier_version": "1", "verifier_bundle_hash": "c" * 64,
             "authoritative": True, "status": "pass"}]
     return source(tmp_path, report, sealed=True, files=files)
