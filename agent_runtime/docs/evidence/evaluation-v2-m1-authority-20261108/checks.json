@@ -1,0 +1,56 @@
+{
+  "schema_version": "evaluation-m1-authority-validation-v1",
+  "fix_base": "323fec035aea8a281bab5c306fcdb2962535a6b6",
+  "working_directory": "D:\\opencv\\learn-claude-code\\.worktrees\\evaluation-system-v2-m1",
+  "input_entries": 13,
+  "sealed_bundles": 8,
+  "verified_members_across_bundles": 146,
+  "unique_source_files": 129,
+  "previous_artifact_files_git_byte_checked": 45,
+  "both_previous_aggregate_results_unchanged": true,
+  "duplicate_all_imports_aggregate_equal": true,
+  "case_observations": 11,
+  "attempt_records": 53,
+  "new_runtime_executions_for_example": 0,
+  "new_provider_requests": 0,
+  "new_official_evaluations": 0,
+  "example_seal_sha256": "9e154ccdd6650fa8cf86480233f7b71553c86b5fd714286033f0c956f671a9bf",
+  "tests": [
+    {
+      "batch": "red",
+      "command": "python -m pytest agent_runtime/tests/test_evaluation_m1_authority.py -q --tb=short -p no:cacheprovider --basetemp=D:/CodexTemp/evaluation-m1-authority-red-20261108 --junitxml=D:/CodexTemp/evaluation-m1-authority-red-20261108.xml",
+      "total": 7,
+      "passed": 0,
+      "failed": 7,
+      "skipped": [],
+      "junit_sha256": "df9756674eb9baaa35538a3f9514fda95ab6c41d1dd0a9641f722bd2cfbb4999"
+    },
+    {
+      "batch": "unit",
+      "command": "python -m pytest agent_runtime/tests/test_evaluation_contract.py agent_runtime/tests/test_evaluation_m1_fixes.py agent_runtime/tests/test_evaluation_m1_authority.py -q --tb=short -p no:cacheprovider --basetemp=D:/CodexTemp/evaluation-m1-authority-final-20261108 --junitxml=D:/CodexTemp/evaluation-m1-authority-final-20261108.xml",
+      "total": 105,
+      "passed": 105,
+      "failed": 0,
+      "skipped": [],
+      "junit_sha256": "d36b407c7ebd0e652eca6425dab448c310cb430075daae60c1f080e7af3ae39a"
+    },
+    {
+      "batch": "regression",
+      "command": "D:/opencv/learn-claude-code/.scratch/inspect-offline-venv/Scripts/python.exe -m pytest agent_runtime/tests/test_evaluation.py agent_runtime/tests/test_evaluation_bundle.py agent_runtime/tests/test_evaluation_report.py agent_runtime/tests/test_evaluation_suite.py agent_runtime/tests/test_inspect_adapter.py agent_runtime/tests/test_inspect_runtime_solver.py agent_runtime/tests/test_inspect_model_eval.py agent_runtime/tests/test_inspect_swe_runner.py agent_runtime/tests/test_swe_grading.py -q --tb=short -p no:cacheprovider --basetemp=D:/CodexTemp/evaluation-m1-authority-regression-20261108 --junitxml=D:/CodexTemp/evaluation-m1-authority-regression-20261108.xml",
+      "total": 167,
+      "passed": 165,
+      "failed": 0,
+      "skipped": [
+        {
+          "name": "test_symlink_input_rejected",
+          "reason": "symlink privilege unavailable"
+        },
+        {
+          "name": "test_symlink_inventory_rejected",
+          "reason": "symlink privilege unavailable"
+        }
+      ],
+      "junit_sha256": "3b3f005f61ff785f755ace0cacbd1c420360306f6163e89f58c752c944569514"
+    }
+  ]
+}

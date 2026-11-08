@@ -1,0 +1,58 @@
+{
+  "schema_version": "evaluation-report-v1",
+  "run_id": "system-core-v1",
+  "plan_sha256": "cbd5c8fef14932bcaa9d56081324d09354ed7b096fb853380d206a66c059f8ea",
+  "processing_ok": true,
+  "new_provider_requests": 0,
+  "new_official_evaluations": 0,
+  "results": [
+    {
+      "id": "two-file-edit",
+      "mode": "scripted_runtime",
+      "kind": "runtime",
+      "source_run_id": null,
+      "instance_id": null,
+      "historical": false,
+      "processing": "ok",
+      "runtime_status": "completed",
+      "runtime_case_pass": true,
+      "task_success": null,
+      "official_resolved": null,
+      "official_status": "not_evaluated",
+      "provider_input_tokens": null,
+      "provider_output_tokens": null,
+      "failure_category": "none",
+      "limitations": [
+        "scripted responses; no provider or Agent competence evidence"
+      ],
+      "model_calls_recorded": 5,
+      "tool_calls_recorded": 4,
+      "tool_execution_attempts": 4,
+      "invariant_violation_count": 0,
+      "fault_triggered": false
+    }
+  ],
+  "aggregates": {
+    "runtime": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0,
+      "unknown": 0,
+      "success_rate": 1.0
+    },
+    "agent": {
+      "total": 0,
+      "passed": 0,
+      "failed": 0,
+      "unknown": 0,
+      "success_rate": null
+    },
+    "environment": {
+      "total": 0,
+      "passed": 0,
+      "failed": 0,
+      "unknown": 0,
+      "success_rate": null
+    }
+  }
+}

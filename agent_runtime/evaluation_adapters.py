@@ -197,8 +197,8 @@ def _case(run, source, row, index, objective, oracle, scope, value, *, reason=No
         tuple(metrics), dict(row)))
 
 
-def _oracle(source, name, kind, validated=False):
-    return Oracle(name, kind, "source_validated" if validated else "reported", (source.evidence.evidence_id,))
+def _oracle(source, name, kind, validated=False, *, identity_status="explicit"):
+    return Oracle(name, kind, "source_validated" if validated else "reported", (source.evidence.evidence_id,), identity_status)
 
 
 def _comparison(source):
@@ -230,7 +230,8 @@ def _evaluation(run: EvaluationRun, source: Source):
             summary = source.json_file(row["id"] + "/runtime-summary.json") or {}
             execution = summary.get("task_id")
             oracle = _oracle(source, "runtime-checks:" + digest(config["checks"]) if "checks" in config else
-                             "v1-reported-runtime-checks", "runtime_oracle", bool(config))
+                             "v1-reported-runtime-checks", "runtime_oracle", "checks" in config,
+                             identity_status="explicit" if "checks" in config else "placeholder")
         elif mode == "agent_archive":
             objective, value = "task_success", row.get("task_success")
             # This schema has no independent positive task oracle.
@@ -246,7 +247,7 @@ def _evaluation(run: EvaluationRun, source: Source):
             role = "gold_control" if config.get("scope") == "gold_control" else "unknown"
             scope = replace(_scope(source, allow_official=True, subject_role=role), grading="unknown")
             execution = row.get("source_run_id")
-            oracle = Oracle("unavailable-official-receipt", "official_harness", "unavailable")
+            oracle = Oracle("unavailable-official-receipt", "official_harness", "unavailable", identity_status="placeholder")
             if config and source.files:
                 inputs = {}
                 for name, spec in config.get("artifacts", {}).items():
@@ -326,11 +327,13 @@ def _inspect_cases(run: EvaluationRun, source: Source):
                 and config["execution_kind"] != row["execution_kind"]):
             raise ValueError("Inspect execution kind contradicts plan")
         if config.get("execution_kind", row.get("execution_kind")) == "container_repair":
-            oracle = _container_oracle(run, source, row, ident)
+            oracle = _container_oracle(run, source, row, ident,
+                                       require_success=model and row.get("fixture_success") is True)
         else:
             oracle_spec = config.get("goal_files") if model else config.get("checks")
             oracle = _oracle(source, ("fixture-goal:" if model else "runtime-checks:") + digest(oracle_spec)
-                             if oracle_spec is not None else "v1-reported-" + objective, objective, oracle_spec is not None)
+                             if oracle_spec is not None else "v1-reported-" + objective, objective, oracle_spec is not None,
+                             identity_status="explicit" if oracle_spec is not None else "placeholder")
         _case(run, source, row, row_indexes.get(ident, "planned:" + ident), objective, oracle, scope,
               row.get("fixture_success") if model else row.get("runtime_case_pass"),
               execution_id=row.get("task_id"), metrics=_usage(row, scope, (source.evidence.evidence_id,)),
@@ -366,7 +369,7 @@ def _inspect_cases(run: EvaluationRun, source: Source):
         run.limitations.append("PARTIAL: no complete planned denominator available")
 
 
-def _container_oracle(run: EvaluationRun, source: Source, row: dict, ident: str) -> Oracle:
+def _container_oracle(run: EvaluationRun, source: Source, row: dict, ident: str, *, require_success=False) -> Oracle:
     bindings = source.json_file("bindings.json")
     if bindings is not None and not isinstance(bindings, dict):
         raise ValueError("container bindings must be an object")
@@ -395,17 +398,34 @@ def _container_oracle(run: EvaluationRun, source: Source, row: dict, ident: str)
             refs.append(evidence.evidence_id)
     if not isinstance(verifier, str) or not verifier:
         run.limitations.append("PARTIAL: container verifier binding unavailable; empty file goals are not its oracle")
-        return Oracle("v1-reported-container-verifier", "controller_verifier", "reported", tuple(refs))
+        return Oracle("v1-reported-container-verifier", "controller_verifier", "reported", tuple(refs), "placeholder")
+    components = {"verifier_id": verifier}
     if not relevant:
         run.limitations.append("PARTIAL: container verifier invocation unavailable; binding identity is reported only")
-        return Oracle(verifier, "controller_verifier", "reported", tuple(refs))
+        return Oracle(verifier, "controller_verifier", "reported", tuple(refs), identity_components=components)
+    for record in relevant:
+        if record.get("status") is not None and record["status"] not in {"pass", "fail", "uncertain"}:
+            raise ValueError("invalid container verifier status")
+        if record.get("authoritative") is not None and type(record["authoritative"]) is not bool:
+            raise ValueError("invalid container verifier authority")
+    success_evidence_incomplete = False
+    if require_success:
+        latest = relevant[-1]  # Persisted invocation order; never select the best attempt.
+        if latest.get("status") in {"fail", "uncertain"} or latest.get("authoritative") is False:
+            raise ValueError("container verifier evidence contradicts fixture success")
+        if latest.get("status") != "pass" or latest.get("authoritative") is not True:
+            run.limitations.append("PARTIAL: authoritative container verifier success is not recorded")
+            success_evidence_incomplete = True
     if any(r.get("verifier_bundle_hash") is None for r in relevant):
         run.limitations.append("PARTIAL: exact container verifier bundle hash unavailable")
-        return Oracle(verifier, "controller_verifier", "reported", tuple(refs))
+        return Oracle(verifier, "controller_verifier", "reported", tuple(refs), identity_components=components)
     bundles = {sha256(r.get("verifier_bundle_hash")) for r in relevant}
     if len(bundles) != 1:
         raise ValueError("container verifier bundle identity conflict")
-    return Oracle(verifier + ":bundle:" + next(iter(bundles)), "controller_verifier", "source_validated", tuple(refs))
+    bundle_hash = next(iter(bundles))
+    return Oracle(verifier + ":bundle:" + bundle_hash, "controller_verifier",
+                  "reported" if success_evidence_incomplete else "source_validated", tuple(refs),
+                  identity_components={**components, "bundle_sha256": bundle_hash})
 
 
 def _candidate(run: EvaluationRun, source: Source):
@@ -414,7 +434,7 @@ def _candidate(run: EvaluationRun, source: Source):
     scope = _scope(source, grading="controller_verifier")
     # A candidate flag alone is a reported local result, never official resolved.
     _case(run, source, row, 0, "candidate_validation", _oracle(source, "v1-workspace-candidate-verifier",
-          "controller_verifier"), scope, row.get("candidate_validated"),
+          "controller_verifier", identity_status="placeholder"), scope, row.get("candidate_validated"),
           verdict="blocked" if row.get("processing_ok") is False or row.get("manual_recovery_required") is True else None,
           metrics=_usage(row, scope, (source.evidence.evidence_id,)))
     run.limitations.append("PARTIAL: candidate schema omits execution attempt and exact verifier identity; flag remains reported")
@@ -468,7 +488,7 @@ def _official_run(run: EvaluationRun, source: Source):
     refs = source.entry.get("official_artifacts")
     outcomes, execution = None, None
     scope = _scope(source, allow_official=True)
-    oracle = Oracle("unavailable-official-invocation", "official_harness", "unavailable")
+    oracle = Oracle("unavailable-official-invocation", "official_harness", "unavailable", identity_status="placeholder")
     if refs is None and {"invocation.json", "predictions.jsonl"} <= source.files.keys():
         refs = {"invocation": "invocation.json", "predictions": "predictions.jsonl"}
     plan = _official_plan(source, refs) if refs is not None else None
@@ -477,6 +497,10 @@ def _official_run(run: EvaluationRun, source: Source):
         execution = plan["execution"] if report.get("status") in {"STARTED", "FAILED", "REPORTED"} else None
         oracle = Oracle("official:" + report["harness_commit"] + ":" + report["dataset_manifest_sha256"],
                         "official_harness", "unavailable", (source.evidence.evidence_id,))
+    declared = source.entry.get("scope", {})
+    official_attempt = (plan is not None and execution is not None
+                        and declared.get("grading") == "official_harness"
+                        and declared.get("environment") == "real_container")
     if plan and "report" in plan["data"] and report.get("status") == "REPORTED":
         data, predictions = plan["data"], plan["predictions"]
         official = _json(data["report"])
@@ -492,8 +516,7 @@ def _official_run(run: EvaluationRun, source: Source):
             raise ValueError("official outcomes disagree with predictions/result")
         if not execution:
             raise ValueError("official source run ID absent")
-        declared = source.entry.get("scope", {})
-        if declared.get("grading") == "official_harness" and declared.get("environment") == "real_container":
+        if official_attempt:
             scope = _scope(source, grading="official_harness")
             oracle = _oracle(source, "official:" + report["harness_commit"] + ":" + report["dataset_manifest_sha256"],
                              "official_harness", True)
@@ -502,9 +525,15 @@ def _official_run(run: EvaluationRun, source: Source):
             scope = replace(scope, grading="unknown")
             run.limitations.append("PARTIAL: report chain is consistent but real official execution was not controller-declared")
     else:
-        # Even a field named official_resolved does not grant official provenance.
-        scope = replace(scope, grading="unknown")
-        run.limitations.append("PARTIAL: official outcome is an unverified claim without sealed provenance bindings")
+        # Execution classification and grading authority are independent facts.
+        # Bound, controller-declared official attempts retain their planned cohort
+        # even when no authoritative outcome exists. A bare field grants neither.
+        if official_attempt:
+            scope = _scope(source, grading="official_harness")
+            run.limitations.append("Bound official attempt has no verified grading verdict; planned cohort is retained")
+        else:
+            scope = replace(scope, grading="unknown")
+            run.limitations.append("PARTIAL: official outcome is an unverified claim without sealed provenance bindings")
     claimed = report.get("official_resolved")
     if claimed is not None and not isinstance(claimed, dict):
         raise ValueError("official outcomes must be per-instance or null")
@@ -517,7 +546,8 @@ def _official_run(run: EvaluationRun, source: Source):
             _case(run, source, {"instance_id": ident, **{"error": report.get("error")}}, index,
                   "official_resolution", oracle, scope, outcomes[ident] if outcomes is not None else None,
                   execution_id=execution, verdict="blocked" if report.get("status") == "FAILED" else None,
-                  reason="verified official report" if outcomes is not None else "official provenance unavailable")
+                  reason=report.get("error") or ("verified official report" if outcomes is not None else
+                      "official attempt has no verified grading verdict" if official_attempt else "official provenance unavailable"))
     else:
         run.limitations.append("PARTIAL: official schema supplies no planned instance identities")
 

@@ -1,0 +1,82 @@
+{
+  "schema_version": "evaluation-report-v1",
+  "run_id": "historical-import-20261022",
+  "plan_sha256": "a788988bd440b72d409208173b83a9132af222172d43a7650c6a43f9dbb797b5",
+  "processing_ok": true,
+  "new_provider_requests": 0,
+  "new_official_evaluations": 0,
+  "results": [
+    {
+      "id": "historical-agent-empty-patch",
+      "mode": "agent_archive",
+      "kind": "agent",
+      "source_run_id": "swebench-agent-pilot-readonly-20261017-01",
+      "instance_id": "sympy__sympy-19346",
+      "historical": true,
+      "processing": "ok",
+      "runtime_status": "completed",
+      "runtime_case_pass": null,
+      "task_success": false,
+      "official_resolved": null,
+      "official_status": "not_evaluated",
+      "provider_input_tokens": 1363,
+      "provider_output_tokens": 128,
+      "failure_category": "task_semantic",
+      "limitations": [
+        "historical import; no new model call, invariant scan, or official evaluation",
+        "empty repair patch; runtime status is not task success"
+      ],
+      "model_calls_recorded": 3,
+      "tool_calls_recorded": 2,
+      "tool_execution_attempts": 2,
+      "invariant_violation_count": 0,
+      "patch_bytes": 0,
+      "patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "usage_complete": true
+    },
+    {
+      "id": "historical-gold-control",
+      "mode": "official_archive",
+      "kind": "environment",
+      "source_run_id": "sympy20590-gold-control-20261015-02",
+      "instance_id": "sympy__sympy-20590",
+      "historical": true,
+      "processing": "ok",
+      "runtime_status": null,
+      "runtime_case_pass": null,
+      "task_success": null,
+      "official_resolved": true,
+      "official_status": "resolved",
+      "provider_input_tokens": null,
+      "provider_output_tokens": null,
+      "failure_category": "none",
+      "limitations": [
+        "historical official evidence; harness was not rerun"
+      ],
+      "patch_bytes": 611
+    }
+  ],
+  "aggregates": {
+    "runtime": {
+      "total": 0,
+      "passed": 0,
+      "failed": 0,
+      "unknown": 0,
+      "success_rate": null
+    },
+    "agent": {
+      "total": 1,
+      "passed": 0,
+      "failed": 1,
+      "unknown": 0,
+      "success_rate": 0.0
+    },
+    "environment": {
+      "total": 1,
+      "passed": 1,
+      "failed": 0,
+      "unknown": 0,
+      "success_rate": 1.0
+    }
+  }
+}

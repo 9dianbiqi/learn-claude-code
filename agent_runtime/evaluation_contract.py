@@ -58,10 +58,22 @@ class Oracle:
     kind: str
     authority: str = "reported"
     evidence_refs: tuple[str, ...] = ()
+    identity_status: str = "explicit"
+    identity_components: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
         if not self.oracle_id or not self.kind or self.authority not in {"reported", "source_validated", "unavailable"}:
             raise ValueError("explicit oracle identity/kind/authority required")
+        if self.identity_status not in {"explicit", "placeholder"}:
+            raise ValueError("invalid oracle identity status")
+        if self.identity_status == "placeholder" and self.authority == "source_validated":
+            raise ValueError("placeholder oracle cannot be source validated")
+        if self.identity_status == "placeholder" and self.identity_components:
+            raise ValueError("placeholder oracle cannot carry explicit identity components")
+        if (not isinstance(self.identity_components, dict) or
+                any(not isinstance(k, str) or not k or not isinstance(v, str) or not v
+                    for k, v in self.identity_components.items())):
+            raise ValueError("oracle identity components must be explicit nonempty strings")
 
 
 @dataclass(frozen=True)
@@ -217,7 +229,7 @@ def aggregate(runs: list[EvaluationRun]) -> dict:
     A schema/report fingerprint identifies a repeated import only. It never
     establishes that two different unidentified reports describe one execution.
     """
-    seen, selected, pending = {}, [], []
+    seen, selected, pending, selected_index = {}, [], [], {}
     attempts: dict[str, str] = {}
     attempt_records = {}
     for run in runs:
@@ -252,19 +264,23 @@ def aggregate(runs: list[EvaluationRun]) -> dict:
             if key in seen:
                 if seen[key] != fingerprint:
                     raise ValueError("conflicting evidence for source execution identity: " + key)
+                previous = selected[selected_index[key]]
+                better, weaker = sorted((previous, case), key=lambda c: _oracle_strength(c.oracle), reverse=True)
+                if not _oracle_refines(weaker.oracle, better.oracle):
+                    raise ValueError("conflicting oracle evidence for source execution identity")
+                selected[selected_index[key]] = better
                 continue
             seen[key] = fingerprint
+            selected_index[key] = len(selected)
             selected.append(case)
     refined = {}
-    authority_rank = {"source_validated": 2, "reported": 1, "unavailable": 0}
     for case in selected:
         identity = case.source_identity
         alias = (case.observation_id, identity.execution_id, identity.case_id, identity.objective)
         previous = refined.get(alias)
         if previous:
-            better, weaker = sorted((previous, case), key=lambda c: authority_rank[c.oracle.authority], reverse=True)
-            if (authority_rank[better.oracle.authority] == authority_rank[weaker.oracle.authority]
-                    or not _compatible_observation(weaker, better)):
+            better, weaker = sorted((previous, case), key=lambda c: _oracle_strength(c.oracle), reverse=True)
+            if not _compatible_observation(weaker, better):
                 raise ValueError("conflicting oracle evidence for observation/execution identity")
             refined[alias] = better
         else:
@@ -350,6 +366,8 @@ def _compatible_observation(observed: EvaluationCase, identified: EvaluationCase
     """
     if observed.objective != identified.objective or observed.raw != identified.raw:
         return False
+    if not _oracle_refines(observed.oracle, identified.oracle):
+        return False
     if observed.verdict != identified.verdict and observed.verdict != "unknown":
         return False
     for key, value in asdict(observed.scope).items():
@@ -366,3 +384,23 @@ def _compatible_observation(observed: EvaluationCase, identified: EvaluationCase
             if (metric.value, metric.unit) != (other.value, other.unit):
                 return False
     return True
+
+
+def _oracle_refines(observed: Oracle, identified: Oracle) -> bool:
+    """Only a declared placeholder or compatible explicit components can refine.
+
+    A reported verdict may still carry a fully explicit verifier identity. Its
+    lower evidence authority does not permit replacing A with verifier B.
+    """
+    if observed.identity_status == "placeholder":
+        return True
+    if identified.identity_status != "explicit" or observed.kind != identified.kind:
+        return False
+    if observed.identity_components:
+        return all(identified.identity_components.get(k) == v for k, v in observed.identity_components.items())
+    return observed.oracle_id == identified.oracle_id
+
+
+def _oracle_strength(oracle: Oracle) -> tuple[int, bool, int]:
+    return ({"source_validated": 2, "reported": 1, "unavailable": 0}[oracle.authority],
+            oracle.identity_status == "explicit", len(oracle.identity_components))

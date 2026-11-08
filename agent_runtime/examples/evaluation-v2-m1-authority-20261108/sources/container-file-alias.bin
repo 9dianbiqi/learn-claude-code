@@ -1,0 +1,49 @@
+{
+  "schema_version": "inspect-model-result-v1",
+  "run_id": "sympy19346-scripted-acceptance-20261106",
+  "plan_sha256": "5c3a8847d0d196b53fc38da0e6e187bfa0420c7b49c63421556f3bda3cf4f0ce",
+  "model": "mockllm/runtime-bridge",
+  "model_mode": "mock",
+  "processing_ok": true,
+  "official_resolved": null,
+  "new_official_evaluations": 0,
+  "planned_cases": 1,
+  "results": [
+    {
+      "id": "repair",
+      "task_id": "task_496b94d793224e0b85e32764135f976c",
+      "runtime_status": "completed",
+      "error": null,
+      "runtime_case_pass": true,
+      "task_success": null,
+      "official_resolved": null,
+      "fault_triggered": false,
+      "bridge_calls": 3,
+      "consumed_turns": 3,
+      "execution_kind": "container_repair",
+      "fixture_success": true,
+      "model_mode": "mock",
+      "usage_kind": "mock",
+      "usage": {
+        "complete": true,
+        "known_calls": 3,
+        "missing_calls": 0,
+        "known_input_tokens": 3,
+        "input_tokens": 3,
+        "known_output_tokens": 3,
+        "output_tokens": 3
+      },
+      "log": "logs/2026-11-06T05-55-31-00-00_runtime-model-fixture_285Zj96eeGeKCSCqVWKK83.eval",
+      "log_sha256": "9d5491fbcb7d1330386a4513f38e43d2725f849a39e4f9cc0654b5c4b77cac19"
+    }
+  ],
+  "model_attempts": 3,
+  "new_provider_requests": 0,
+  "request_count_semantics": "bridge generation attempts; not confirmed HTTP deliveries or billing units",
+  "fixture_outcomes": {
+    "planned": 1,
+    "passed": 1,
+    "failed": 0,
+    "unknown": 0
+  }
+}

@@ -1,0 +1,66 @@
+[
+  {
+    "path": "input.json",
+    "sha256": "fd5fd412a1a161f3cb8ec9a442467d852c26055230045c84870fe63a9da1f3ed"
+  },
+  {
+    "path": "report.json",
+    "sha256": "ed2661c516565bd5a17bee9e7f9ffe8ca1e7d357c3fda3632098c633abf86d21"
+  },
+  {
+    "path": "report.md",
+    "sha256": "e8a5c6cb1ec5d0995644e18f2885f1919e8e9c9e7f5ed067611b16e4a4c37e18"
+  },
+  {
+    "path": "sources/container-file-alias.bin",
+    "sha256": "4eb0e5a39a7eadb82f28562199d0b1681535f88abf080bd2d9e7d1eca5bdc465"
+  },
+  {
+    "path": "sources/container-model-run.bin",
+    "sha256": "4eb0e5a39a7eadb82f28562199d0b1681535f88abf080bd2d9e7d1eca5bdc465"
+  },
+  {
+    "path": "sources/core-file-alias.bin",
+    "sha256": "52fefa96710332460815d8d82a5a12f647a1d951000929030978675a530aa3a7"
+  },
+  {
+    "path": "sources/core-import-again.bin",
+    "sha256": "52fefa96710332460815d8d82a5a12f647a1d951000929030978675a530aa3a7"
+  },
+  {
+    "path": "sources/core-new.bin",
+    "sha256": "52fefa96710332460815d8d82a5a12f647a1d951000929030978675a530aa3a7"
+  },
+  {
+    "path": "sources/historical-inspect.bin",
+    "sha256": "287e0c69d1cee7f8c958f0034739d8cad794c43ea5ac5b3dfc3b1951305aa891"
+  },
+  {
+    "path": "sources/historical.bin",
+    "sha256": "ec7223d50e34d738100327cb894ddcbd363f8ecb210620c271078ab27134a670"
+  },
+  {
+    "path": "sources/model-new.bin",
+    "sha256": "1431327839ae9f2d0d172f5b4a17ccc30657db36158ddc24c769497362d38378"
+  },
+  {
+    "path": "sources/official-summary-only.bin",
+    "sha256": "6697586944d901c3d86c23885c97e5affccba77ee5111660b5ab598cb82e752e"
+  },
+  {
+    "path": "sources/real-scripted-candidate.bin",
+    "sha256": "4b21b349d7fabb448ca421f645979bd2516255b241a3339d11f0355e41aebe87"
+  },
+  {
+    "path": "sources/runtime-baseline.bin",
+    "sha256": "cbe2d0b81870c22529460e9d79eb3ab157fa3565a6b2ada0cee1b50278e91407"
+  },
+  {
+    "path": "sources/runtime-file-alias.bin",
+    "sha256": "c9aa18ccb1570fb8a9b3f434cdd4b353ea2da2cecad52327aaf3249eabb801fc"
+  },
+  {
+    "path": "sources/runtime-new.bin",
+    "sha256": "c9aa18ccb1570fb8a9b3f434cdd4b353ea2da2cecad52327aaf3249eabb801fc"
+  }
+]

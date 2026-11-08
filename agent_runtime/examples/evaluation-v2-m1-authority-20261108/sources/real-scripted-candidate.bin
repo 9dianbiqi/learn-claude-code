@@ -1,0 +1,14 @@
+{
+  "schema_version": "inspect-swe-candidate-v1",
+  "instance_id": "sympy__sympy-19346",
+  "runtime_status": "completed",
+  "manual_recovery_required": false,
+  "processing_ok": true,
+  "candidate_validated": true,
+  "prediction_sha256": "877f1f3b20ca72863e5e2db9fc27fd7d4ab3a2ee9e333001b88d810ad96d96da",
+  "dataset_manifest_sha256": "3c79f5ff13633270e762db0f5740fdc4b82b82993d5115d62a51d3d7fdea18ee",
+  "official_resolved": null,
+  "new_provider_requests": 0,
+  "new_official_evaluations": 0,
+  "error": null
+}

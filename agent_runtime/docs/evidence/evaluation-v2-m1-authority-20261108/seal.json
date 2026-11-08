@@ -1,0 +1,22 @@
+[
+  {
+    "path": "checks.json",
+    "sha256": "73fbe925c127e9126498a024eef68077506fee68049e4673c46746945fd1a6a1"
+  },
+  {
+    "path": "red.xml",
+    "sha256": "df9756674eb9baaa35538a3f9514fda95ab6c41d1dd0a9641f722bd2cfbb4999"
+  },
+  {
+    "path": "regression.xml",
+    "sha256": "3b3f005f61ff785f755ace0cacbd1c420360306f6163e89f58c752c944569514"
+  },
+  {
+    "path": "unit.xml",
+    "sha256": "d36b407c7ebd0e652eca6425dab448c310cb430075daae60c1f080e7af3ae39a"
+  },
+  {
+    "path": "verify.py",
+    "sha256": "8480b509f014ded4d4b4961ffabc625bc97efc6894cfe7dac23275c36b130ecc"
+  }
+]

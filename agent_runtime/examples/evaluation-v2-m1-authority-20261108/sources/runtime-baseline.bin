@@ -1,0 +1,47 @@
+{
+  "schema_version": "inspect-runtime-result-v1",
+  "run_id": "inspect-runtime-controlled-v1",
+  "plan_sha256": "ff3241203e0a424702a7d82f78da7b600f70a2ef12aa1c4e4a7019c74130d6f6",
+  "processing_ok": true,
+  "new_provider_requests": 0,
+  "new_official_evaluations": 0,
+  "model_mode": "inspect_mock",
+  "task_success": null,
+  "official_resolved": null,
+  "results": [
+    {
+      "id": "edit-feedback",
+      "task_id": "task_b9296d780bbf4cdf8b8a15a6cfaf3308",
+      "runtime_status": "completed",
+      "error": null,
+      "runtime_case_pass": true,
+      "task_success": null,
+      "official_resolved": null,
+      "fault_triggered": false,
+      "bridge_calls": 3,
+      "consumed_turns": 3,
+      "execution_kind": "local_fixture",
+      "inspect_model_events": 3,
+      "runtime_model_records": 3,
+      "runtime_abandoned_records": 0,
+      "log": "logs/2026-10-22T15-49-45-00-00_controlled-runtime_BMVDNKz89MHTxWFEX8wNkT.eval",
+      "log_sha256": "5324831053c0a49cf57f11dc43541dee6246a844850dfea023b51d34d0913c11",
+      "synthetic_inspect_usage": {
+        "input_tokens": 3,
+        "output_tokens": 3
+      },
+      "provider_input_tokens": null,
+      "provider_output_tokens": null
+    }
+  ],
+  "runtime_cases": {
+    "total": 1,
+    "passed": 1
+  },
+  "mock_attempts": {
+    "edit-feedback": {
+      "calls": 3,
+      "outputs": 3
+    }
+  }
+}
